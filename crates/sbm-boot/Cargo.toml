@@ -1,0 +1,15 @@
+[package]
+name = "sbm-boot"
+description = "Host-testable Smart Boot Menu discovery, policy, and handoff logic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sbm-types.workspace = true
+sbm-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

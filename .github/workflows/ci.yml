@@ -9,13 +9,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify repository baseline (Cargo checks activate once Cargo.toml is added)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi,aarch64-unknown-uefi
+          components: rustfmt,clippy
+      - name: Format, host lint, and host tests
         run: |
-          test -f README.md && test -f AGENTS.md
-          if [ -f Cargo.toml ]; then
-            rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
-            cargo fmt --all -- --check
-            cargo clippy --all-targets -- -D warnings
-            cargo check --target x86_64-unknown-uefi
-            cargo check --target aarch64-unknown-uefi
-          fi
+          cargo fmt --all -- --check
+          cargo clippy -p sbm-boot -p sbm-gfx -p xtask --all-targets -- -D warnings
+          cargo test
+      - name: UEFI release lint and build
+        run: |
+          for target in aarch64-unknown-uefi x86_64-unknown-uefi; do
+            cargo clippy -p sbm-app -p sbm-fixture --release --target "$target" -- -D warnings
+            cargo build -p sbm-app -p sbm-fixture --release --target "$target"
+          done

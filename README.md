@@ -2,15 +2,27 @@
 
 Pre-OS fast-path native Rust (`#![no_std]` + `alloc`) graphical UEFI boot manager targeting `x86_64-unknown-uefi` and `aarch64-unknown-uefi` from shared source.
 
-> **Project Status:** Phase 0 initialized — ready for dedicated engineering agent implementation targeting **SBM 0.1**.
+> **Project Status:** SBM 0.1 fast path boots in QEMU on `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. Measurements are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md). The recovery and lab contracts are in [HANDOFF.md](HANDOFF.md).
 
-## Scope & Responsibilities
+## What 0.1 does
 
-- Graphical GOP boot menu (custom `#![no_std]` double-buffered software renderer, integer HiDPI scaling, keyboard-first input with bounded timer polling, serial/text fallback).
-- Automatic OS discovery on FAT32 ESP/XBOOTLDR (Windows Boot Manager, UAPI BLS Type #1 `.conf` & Type #2 UKI, Linux/BSD EFI loaders, `sbm-core` A/B recovery slots).
-- Deterministic EFI chainloading (`LoadImage`/`StartImage`) & ESP-backed atomic policy/attempt persistence (avoiding UEFI NVRAM wear/bricking).
-- Bounded opportunistic remote boot-policy fetch (`smoltcp` + TLS 1.3 over SNP, ≤ 4 s hard timeout, Ed25519 `CommandEnvelope` verification limited ONLY to `boot_select` — zero arbitrary RCE).
-- Secure Boot readiness (`.sbat` PE section, `NX_COMPAT`, `shim 16.1` compatibility).
+- Graphical GOP menu: software double buffer, light and dark themes, keyboard, mouse pointer, firmware / restart / shut down.
+- ESP discovery for Windows Boot Manager, GRUB, systemd-boot, BLS Type #1, a Linux EFI, and `sbm-core` A/B recovery slots. The menu skips its own path.
+- `LoadImage` / `StartImage` chainload. Recovery launches that UKI directly and writes `\EFI\sbm\handoff\current.json`.
+- Policy and attempt JSON on the ESP. The remote decision function is fail-closed and does not open a network.
+- `.sbat` section and `IMAGE_DLLCHARACTERISTICS_NX_COMPAT` on the release EFI.
+
+SNP, DHCP, TLS, and Ed25519 verification of a live server are not in this tree. IA32 is documented and not built.
+
+```
+rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
+cargo test
+cargo run -p xtask -- build
+cargo run -p xtask -- qemu aarch64
+cargo run -p xtask -- qemu x86_64
+```
+
+`cargo test` is the host suites. UEFI bins are release builds. QEMU is local; CI does not boot a guest.
 
 ## Canonical Documentation & Contracts
 

@@ -1,0 +1,20 @@
+[package]
+name = "sbm-app"
+description = "Native UEFI Smart Boot Menu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "sbm"
+path = "src/main.rs"
+
+[dependencies]
+sbm-boot = { path = "../sbm-boot" }
+sbm-gfx = { path = "../sbm-gfx" }
+sbm-protocol = { workspace = true }
+sbm-types = { workspace = true }
+uefi = { workspace = true }

@@ -19,6 +19,12 @@ Follow the universal Smart Boot Menu agent rules in [`smart-boot-menu/.github/AG
 
 Do NOT implement Linux disk/OS installation logic (`sbm-core`), Apple `m1n1` bootstrap (`sbm-as`), or copy `sbm-common` structs. Do NOT allow arbitrary remote code execution or destructive storage actions in UEFI.
 
+## Current milestone
+
+0.1 is the graphical menu, discovery, chainload, and the fail-closed remote decision function. It does not open SNP. Read [HANDOFF.md](HANDOFF.md) before changing the recovery JSON or the QEMU disk. Guest times from the 2026-11-26 run are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
+
+Host checks: `cargo fmt --all`, `cargo clippy -p sbm-boot -p sbm-gfx -p xtask --all-targets -- -D warnings`, `cargo test`. UEFI checks are `cargo clippy` and `cargo build` for `sbm-app` and `sbm-fixture` with `--release` on both UEFI targets. Do not set `profile.dev` `panic = "abort"`.
+
 ## Engineering & Performance Targets
 
 Startup-to-first-frame ≤ 250 ms; stripped EFI binary ≤ 1.5 MiB; peak heap ≤ 32 MiB; network hard cap ≤ 5 s (default 3 s, instant keypress cancel).
