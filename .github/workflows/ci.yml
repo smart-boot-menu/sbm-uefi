@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify repository baseline (Cargo checks activate once Cargo.toml is added)
+        run: |
+          test -f README.md && test -f AGENTS.md
+          if [ -f Cargo.toml ]; then
+            rustup target add x86_64-unknown-uefi aarch64-unknown-uefi
+            cargo fmt --all -- --check
+            cargo clippy --all-targets -- -D warnings
+            cargo check --target x86_64-unknown-uefi
+            cargo check --target aarch64-unknown-uefi
+          fi
