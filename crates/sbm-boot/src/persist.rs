@@ -1,5 +1,8 @@
 use alloc::vec::Vec;
-use sbm_protocol::{BootAttemptRecord, BootPolicy, EfiHandoffPayload, RecoveryManifest};
+use sbm_protocol::{
+    BootAttemptRecord, BootCommand, BootPolicy, BootSuccessReport, EfiHandoffPayload,
+    RecoveryManifest,
+};
 use sbm_types::SCHEMA_VERSION_V1;
 
 use crate::pathutil::normalize;
@@ -56,6 +59,16 @@ pub fn decode_handoff(bytes: &[u8]) -> Result<EfiHandoffPayload, CodecError> {
     let payload: EfiHandoffPayload = serde_json::from_slice(bytes).map_err(|_| CodecError)?;
     schema(payload.schema_version.as_str())?;
     Ok(payload)
+}
+
+pub fn decode_success(bytes: &[u8]) -> Result<BootSuccessReport, CodecError> {
+    let report: BootSuccessReport = serde_json::from_slice(bytes).map_err(|_| CodecError)?;
+    schema(report.schema_version.as_str())?;
+    Ok(report)
+}
+
+pub fn decode_command(bytes: &[u8]) -> Result<BootCommand, CodecError> {
+    serde_json::from_slice(bytes).map_err(|_| CodecError)
 }
 
 fn schema(version: &str) -> Result<(), CodecError> {

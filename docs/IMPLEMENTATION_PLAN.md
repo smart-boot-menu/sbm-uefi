@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-26
 **Milestone:** first bootable graphical menu (SBM 0.1 fast path)
-**Status:** this plan is implemented. Guest times, screenshots, and the lab disk setup are in [MEASUREMENTS.md](MEASUREMENTS.md) and [../HANDOFF.md](../HANDOFF.md).
+**Status:** the 0.1 menu in this plan is implemented. The follow-up local recovery contract, lab markers, and the separate networking plan are in [../HANDOFF.md](../HANDOFF.md). Guest times are in [MEASUREMENTS.md](MEASUREMENTS.md).
 
 ## Decisions
 

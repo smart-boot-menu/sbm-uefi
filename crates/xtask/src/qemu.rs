@@ -275,7 +275,38 @@ fn run_attempt(
     );
     fs::write(build.join(format!("measure-{}.txt", guest.name)), &summary)
         .map_err(|err| err.to_string())?;
+    fs::write(
+        build.join(format!("acceptance-{}.json", guest.name)),
+        summary_json(&summary),
+    )
+    .map_err(|err| err.to_string())?;
     Ok(Measured { summary })
+}
+
+fn summary_json(summary: &str) -> String {
+    let mut body = String::from("{\n");
+    let mut first = true;
+    for line in summary.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !first {
+            body.push_str(",\n");
+        }
+        first = false;
+        body.push_str("  \"");
+        body.push_str(key);
+        body.push_str("\": ");
+        if value == "true" || value == "false" || value.chars().all(|ch| ch.is_ascii_digit()) {
+            body.push_str(value);
+        } else {
+            body.push('"');
+            body.push_str(value);
+            body.push('"');
+        }
+    }
+    body.push_str("\n}\n");
+    body
 }
 
 fn disk_args(guest: &Guest, primary: bool) -> Vec<String> {

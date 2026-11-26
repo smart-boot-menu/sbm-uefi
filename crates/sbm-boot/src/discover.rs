@@ -7,13 +7,12 @@ use crate::bls::{bls_arch_ok, parse_bls};
 use crate::nvram::ParsedLoadOption;
 use crate::pathutil::{
     bls_target_id, efi_target_id, file_name, hex_encode, normalize, normalize_upper,
-    recovery_slot_key, recovery_target_id, sha256,
+    recovery_slot_key, recovery_target_id,
 };
-use crate::pe::{machine_matches, pe_machine};
+use crate::pe::{machine_matches, pe_machine, pe_section_span, section_text};
 use crate::persist::decode_manifest;
 use crate::volume::Volume;
 
-const HASH_LIMIT: u64 = 32 * 1024 * 1024;
 const LOAD_OPTION_ACTIVE: u32 = 0x1;
 const LOAD_OPTION_HIDDEN: u32 = 0x8;
 
@@ -89,17 +88,32 @@ pub fn add_load_options(
 }
 
 pub fn sort_discovered(targets: &mut [DiscoveredTarget]) {
-    targets.sort_by(|a, b| {
-        family_ord(a.target.os_family)
-            .cmp(&family_ord(b.target.os_family))
-            .then_with(|| {
-                a.target
-                    .display_name
-                    .to_ascii_lowercase()
-                    .cmp(&b.target.display_name.to_ascii_lowercase())
-            })
-            .then_with(|| a.target.id.as_str().cmp(b.target.id.as_str()))
-    });
+    targets.sort_by(|a, b| compare_targets(&a.target, &b.target));
+}
+
+pub fn compare_targets(a: &BootTarget, b: &BootTarget) -> core::cmp::Ordering {
+    family_ord(a.os_family)
+        .cmp(&family_ord(b.os_family))
+        .then_with(|| a.removable_media.cmp(&b.removable_media))
+        .then_with(|| {
+            a.display_name
+                .to_ascii_lowercase()
+                .cmp(&b.display_name.to_ascii_lowercase())
+        })
+        .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+}
+
+pub fn embedded_cmdline(vol: &dyn Volume, path: &str) -> Option<String> {
+    let header = vol.read_prefix(path, 16 * 1024).ok()?;
+    let (offset, size) = pe_section_span(&header, ".cmdline")?;
+    let size = usize::try_from(size).ok()?.min(4096);
+    let end = offset.saturating_add(size as u64);
+    let raw = if end <= header.len() as u64 {
+        header[offset as usize..end as usize].to_vec()
+    } else {
+        vol.read_at(path, offset, size).ok()?
+    };
+    section_text(&raw)
 }
 
 pub fn best_recovery(targets: &[DiscoveredTarget]) -> Option<&DiscoveredTarget> {
@@ -204,11 +218,26 @@ fn check_hash(vol: &dyn Volume, path: &str, expected: &str) -> Option<bool> {
         return None;
     }
     let meta = vol.metadata(path).ok()?;
-    if meta.is_dir || meta.size > HASH_LIMIT {
+    if meta.is_dir || meta.size > 2 * 1024 * 1024 * 1024 {
         return None;
     }
-    let data = vol.read(path).ok()?;
-    Some(hex_encode(&sha256(&data)).eq_ignore_ascii_case(expected))
+    let digest = hash_file(vol, path, meta.size)?;
+    Some(hex_encode(&digest).eq_ignore_ascii_case(expected))
+}
+
+fn hash_file(vol: &dyn Volume, path: &str, size: u64) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut offset = 0u64;
+    while offset < size {
+        let chunk = vol.read_at(path, offset, 64 * 1024).ok()?;
+        if chunk.is_empty() {
+            return None;
+        }
+        hasher.update(&chunk);
+        offset = offset.saturating_add(chunk.len() as u64);
+    }
+    Some(hasher.finalize().into())
 }
 
 fn scan_bls(vol: &dyn Volume, arch: CpuArch, skip: &[String], out: &mut Vec<DiscoveredTarget>) {
@@ -700,7 +729,7 @@ fn list_dir(vol: &dyn Volume, path: &str) -> Vec<crate::volume::DirEntry> {
 mod tests {
     use super::*;
     use crate::Volume;
-    use crate::pathutil::hex_encode;
+    use crate::pathutil::{hex_encode, sha256};
     use crate::pe::{MACHINE_AA64, MACHINE_X64, fake_pe};
     use crate::volume::MemoryVolume;
 
@@ -817,5 +846,24 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].target.removable_media);
         assert_eq!(found[0].target.display_name, "External drive");
+    }
+
+    #[test]
+    fn core_uki_name_follows_the_manifest() {
+        let vol = MemoryVolume::new(guid(), false, "ESP");
+        let uki = fake_pe(MACHINE_AA64);
+        let hash = hex_encode(&sha256(&uki));
+        vol.write(r"\EFI\sbm\recovery\slot-a\sbm-core-aarch64.efi", &uki)
+            .unwrap();
+        let manifest = format!(
+            r#"{{"schema_version":"1.0","active_slot":"slot-a","slots":[{{"slot_name":"slot-a","uki_efi_path":"\\EFI\\sbm\\recovery\\slot-a\\sbm-core-aarch64.efi","sha256":"{hash}","version":"0.1.0","healthy":true}}]}}"#
+        );
+        vol.write(r"\EFI\sbm\recovery\manifest.json", manifest.as_bytes())
+            .unwrap();
+        let found = discover_volume(&vol, CpuArch::Aarch64, &[]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target.id.as_str(), "sbm-core:slot-a");
+        assert_eq!(found[0].target.verified_signature, Some(true));
+        assert!(discover_volume(&vol, CpuArch::X86_64, &[]).is_empty());
     }
 }

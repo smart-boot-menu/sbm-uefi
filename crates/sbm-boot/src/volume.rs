@@ -30,6 +30,7 @@ pub trait Volume {
     fn exists(&self, path: &str) -> bool;
     fn read(&self, path: &str) -> Result<Vec<u8>, VolError>;
     fn read_prefix(&self, path: &str, max: usize) -> Result<Vec<u8>, VolError>;
+    fn read_at(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, VolError>;
     fn metadata(&self, path: &str) -> Result<FileMeta, VolError>;
     fn list(&self, path: &str) -> Result<Vec<DirEntry>, VolError>;
     fn write(&self, path: &str, data: &[u8]) -> Result<(), VolError>;
@@ -92,6 +93,16 @@ impl Volume for MemoryVolume {
             data.truncate(max);
         }
         Ok(data)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, VolError> {
+        let data = self.read(path)?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= data.len() {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(max).min(data.len());
+        Ok(data[start..end].to_vec())
     }
 
     fn metadata(&self, path: &str) -> Result<FileMeta, VolError> {

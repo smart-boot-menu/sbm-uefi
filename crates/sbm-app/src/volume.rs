@@ -92,6 +92,10 @@ impl Volume for UefiVolume {
         self.with_root(|root| read_file(root, path, Some(max)))
     }
 
+    fn read_at(&self, path: &str, offset: u64, max: usize) -> Result<Vec<u8>, VolError> {
+        self.with_root(|root| read_file_at(root, path, offset, max))
+    }
+
     fn metadata(&self, path: &str) -> Result<FileMeta, VolError> {
         let path = normalize(path);
         if path == "\\" {
@@ -274,6 +278,30 @@ fn read_file(root: &mut Directory, path: &str, max: Option<usize>) -> Result<Vec
     if want == 0 {
         return Ok(buffer);
     }
+    let read = file.read(&mut buffer).map_err(|_| VolError::Io)?;
+    buffer.truncate(read);
+    Ok(buffer)
+}
+
+fn read_file_at(
+    root: &mut Directory,
+    path: &str,
+    offset: u64,
+    max: usize,
+) -> Result<Vec<u8>, VolError> {
+    let path = normalize(path);
+    let name = cstr(&path)?;
+    let handle = root
+        .open(&name, FileMode::Read, FileAttribute::empty())
+        .map_err(|_| VolError::NotFound)?;
+    let FileType::Regular(mut file) = handle.into_type().map_err(|_| VolError::Io)? else {
+        return Err(VolError::Io);
+    };
+    file.set_position(offset).map_err(|_| VolError::Io)?;
+    if max == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buffer = alloc::vec![0u8; max];
     let read = file.read(&mut buffer).map_err(|_| VolError::Io)?;
     buffer.truncate(read);
     Ok(buffer)

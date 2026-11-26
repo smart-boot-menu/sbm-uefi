@@ -47,16 +47,21 @@ pub fn assemble(
     );
     write(&dir.join("loader/entries/fedora.conf"), conf.as_bytes())?;
     let hash = hex_encode(&sha256(fixture));
+    // Same filename mkosi.postoutput writes: sbm-core-<arch>.efi.
+    let uki_name = format!("sbm-core-{arch}.efi");
     for slot in ["slot-a", "slot-b"] {
         write(
-            &dir.join(format!("EFI/sbm/recovery/{slot}/sbm-core.efi")),
+            &dir.join(format!("EFI/sbm/recovery/{slot}/{uki_name}")),
             fixture,
         )?;
     }
     let manifest = RecoveryManifest {
         schema_version: SCHEMA_VERSION_V1.to_string(),
         active_slot: String::from("slot-a"),
-        slots: vec![slot("slot-a", &hash), slot("slot-b", &hash)],
+        slots: vec![
+            slot("slot-a", &uki_name, &hash),
+            slot("slot-b", &uki_name, &hash),
+        ],
     };
     let bytes = encode_manifest(&manifest)
         .map_err(|_| String::from("could not encode the recovery manifest"))?;
@@ -67,10 +72,10 @@ pub fn assemble(
     Ok(EspPaths { dir })
 }
 
-fn slot(name: &str, hash: &str) -> RecoverySlotDescriptor {
+fn slot(name: &str, uki_name: &str, hash: &str) -> RecoverySlotDescriptor {
     RecoverySlotDescriptor {
         slot_name: name.to_string(),
-        uki_efi_path: format!("\\EFI\\sbm\\recovery\\{name}\\sbm-core.efi"),
+        uki_efi_path: format!("\\EFI\\sbm\\recovery\\{name}\\{uki_name}"),
         sha256: hash.to_string(),
         version: String::from("0.1.0-fixture"),
         healthy: true,

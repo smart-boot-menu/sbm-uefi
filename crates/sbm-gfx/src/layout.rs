@@ -102,7 +102,8 @@ pub fn layout_menu(
         .saturating_mul(5)
         .min(content_h)
         .max(font.saturating_mul(3));
-    let min_card_w = font.saturating_mul(12).max(1);
+    // Sixteen title glyphs plus the icon, so "SBM Core Slot A" fits at 1024x768.
+    let min_card_w = font.saturating_mul(20).max(1);
     let mut cols = ((content_w.saturating_add(gap)) / min_card_w.saturating_add(gap)).max(1);
     while cols > 1 && content_w / cols < min_card_w {
         cols -= 1;

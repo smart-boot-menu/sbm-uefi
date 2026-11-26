@@ -2,7 +2,7 @@
 
 Pre-OS fast-path native Rust (`#![no_std]` + `alloc`) graphical UEFI boot manager targeting `x86_64-unknown-uefi` and `aarch64-unknown-uefi` from shared source.
 
-> **Project Status:** SBM 0.1 fast path boots in QEMU on `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. Measurements are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md). The recovery and lab contracts are in [HANDOFF.md](HANDOFF.md).
+> **Project Status:** SBM 0.1 fast path boots in QEMU on `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. Measurements are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md). The recovery contract, lab markers, and the separate networking plan are in [HANDOFF.md](HANDOFF.md).
 
 ## What 0.1 does
 

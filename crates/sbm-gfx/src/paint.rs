@@ -131,7 +131,7 @@ pub fn paint_menu(fb: &mut Framebuffer, cards: &[CardView], state: &MenuState) {
         );
     }
     let hint = fit_text(
-        "Arrows move    Enter boot    Tab actions    T theme    C recovery    D details",
+        "Arrows  Enter  Tab  T theme  C recovery  D details",
         layout.font,
         fb.width.saturating_sub(layout.font * 2),
     );
@@ -164,7 +164,7 @@ pub fn paint_error(fb: &mut Framebuffer, dark: bool, message: &str) {
         y = y.saturating_add(size + size / 4);
     }
     fb.text(
-        "Enter returns to the menu",
+        "Enter or Esc returns to the menu",
         size,
         y.saturating_add(size),
         size,
@@ -367,6 +367,7 @@ fn wrap_lines(text: &str, size: u32, max_width: u32) -> alloc::vec::Vec<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::draw::text_width;
 
     #[test]
     fn menu_pixels_follow_the_theme_and_selection() {
@@ -405,5 +406,28 @@ mod tests {
         light_state.message = "load error".into();
         paint_error(&mut light, false, &light_state.message);
         assert_eq!(light.pixel(0, 0).unwrap(), Theme::light().bg);
+    }
+
+    #[test]
+    fn six_titles_fit_at_1024x768() {
+        let layout = layout_menu(1024, 768, 6, 3, 0);
+        assert!(layout.cols <= 3, "cols {}", layout.cols);
+        assert_eq!(layout.cards.len(), 6);
+        for title in ["Windows", "Fedora Linux", "systemd-boot", "SBM Core Slot A"] {
+            for (_, rect) in &layout.cards {
+                let font = (rect.h / 5).max(8);
+                let icon = font.saturating_mul(2).min(rect.h.saturating_sub(font));
+                let text_w = rect
+                    .w
+                    .saturating_sub(font / 2)
+                    .saturating_sub(icon)
+                    .saturating_sub(font / 2)
+                    .saturating_sub(font / 2);
+                assert!(
+                    text_width(title, font) <= text_w,
+                    "{title} needs more than {text_w} at {font}px in {rect:?}"
+                );
+            }
+        }
     }
 }

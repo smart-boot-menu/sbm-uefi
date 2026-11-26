@@ -1,8 +1,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use sbm_protocol::{
-    BootAttemptRecord, BootAttemptStatus, BootPolicy, BootTimingMetrics, EfiHandoffPayload,
-    NetworkHandoffHint, OfflineBehavior, RecoveryLaunchMode,
+    BootAttemptRecord, BootAttemptStatus, BootCommand, BootPolicy, BootSuccessReport,
+    BootTimingMetrics, EfiHandoffPayload, NetworkHandoffHint, OfflineBehavior, RecoveryLaunchMode,
+    RecoverySlotPreference,
 };
 use sbm_types::{BootTarget, BootTargetId, PlatformCapabilities, SCHEMA_VERSION_V1};
 
@@ -11,8 +12,8 @@ use crate::pathutil::hex_encode;
 use crate::pathutil::sha256;
 
 pub use crate::persist::{
-    CodecError, atomic_write, decode_attempt, decode_handoff, decode_manifest, decode_policy,
-    encode_attempt, encode_handoff, encode_manifest, encode_policy,
+    CodecError, atomic_write, decode_attempt, decode_command, decode_handoff, decode_manifest,
+    decode_policy, decode_success, encode_attempt, encode_handoff, encode_manifest, encode_policy,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +77,73 @@ pub fn begin_attempt(
         consecutive_failures: effective_failures(previous).saturating_add(1),
         status: BootAttemptStatus::Started,
     }
+}
+
+pub fn confirm_attempt(record: &mut BootAttemptRecord, report: &BootSuccessReport) -> bool {
+    if report.schema_version != SCHEMA_VERSION_V1 {
+        return false;
+    }
+    let same_target = report.target_id == record.target_id;
+    let same_attempt = report.attempt_id == record.attempt_id || report.attempt_id == "local";
+    if !same_target || !same_attempt {
+        return false;
+    }
+    record.status = BootAttemptStatus::Confirmed;
+    record.consecutive_failures = 0;
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalRequest {
+    Boot(BootTargetId),
+    Recovery(RecoverySlotPreference),
+    Firmware,
+    Reboot,
+    Shutdown,
+}
+
+pub fn local_request(command: &BootCommand) -> LocalRequest {
+    match command {
+        BootCommand::BootTarget { target_id, .. } => LocalRequest::Boot(target_id.clone()),
+        BootCommand::BootRecovery { slot, .. } => LocalRequest::Recovery(*slot),
+        BootCommand::RebootToFirmwareSetup => LocalRequest::Firmware,
+        BootCommand::Reboot => LocalRequest::Reboot,
+        BootCommand::Shutdown => LocalRequest::Shutdown,
+    }
+}
+
+/// systemd-stub replaces the embedded `.cmdline` with EFI load options when
+/// Secure Boot is off, and ignores those options when Secure Boot is on and
+/// `.cmdline` exists. Repeating the embedded line keeps the UKI's own tokens
+/// in the first case and is ignored in the second.
+pub fn merge_load_options(
+    embedded: Option<&str>,
+    extra: Option<&str>,
+) -> (Option<String>, &'static str) {
+    let embedded = blank(embedded);
+    let extra = blank(extra);
+    match (embedded, extra) {
+        (Some(embedded), Some(extra)) if tokens_cover(embedded, extra) => {
+            (Some(embedded.to_string()), "embedded")
+        }
+        (Some(embedded), Some(extra)) => (
+            Some(alloc::format!("{embedded} {extra}")),
+            "embedded-repeated",
+        ),
+        (Some(embedded), None) => (Some(embedded.to_string()), "embedded"),
+        (None, Some(extra)) => (Some(extra.to_string()), "external"),
+        (None, None) => (None, "none"),
+    }
+}
+
+fn blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn tokens_cover(line: &str, extra: &str) -> bool {
+    extra
+        .split_whitespace()
+        .all(|token| line.split_whitespace().any(|have| have == token))
 }
 
 pub fn mark_one_shot_consumed(policy: &mut BootPolicy) {
@@ -466,6 +534,56 @@ mod tests {
             begin_attempt(Some(&record), &BootTargetId("os".into()), None, "b")
                 .consecutive_failures,
             1
+        );
+    }
+
+    #[test]
+    fn success_report_confirms_the_matching_attempt() {
+        let mut record = begin_attempt(
+            None,
+            &BootTargetId("sbm-core:slot-a".into()),
+            Some(10),
+            "uefi-1",
+        );
+        let report = decode_success(
+            br#"{"schema_version":"1.0","attempt_id":"uefi-1","target_id":"sbm-core:slot-a","confirmed_by":"sbm-core-uki","confirmed_at_unix":11}"#,
+        )
+        .unwrap();
+        assert!(confirm_attempt(&mut record, &report));
+        assert_eq!(record.status, BootAttemptStatus::Confirmed);
+        assert_eq!(record.consecutive_failures, 0);
+        let other = decode_success(
+            br#"{"schema_version":"1.0","attempt_id":"other","target_id":"efi:windows","confirmed_by":"sbm-core-uki","confirmed_at_unix":11}"#,
+        )
+        .unwrap();
+        assert!(!confirm_attempt(&mut record, &other));
+    }
+
+    #[test]
+    fn embedded_cmdline_is_repeated_before_external_tokens() {
+        let (line, mode) = merge_load_options(
+            Some("console=tty0 quiet"),
+            Some("sbm.handoff_sha256=abc sbm.esp_partuuid=guid"),
+        );
+        assert_eq!(mode, "embedded-repeated");
+        assert_eq!(
+            line.as_deref(),
+            Some("console=tty0 quiet sbm.handoff_sha256=abc sbm.esp_partuuid=guid")
+        );
+        let (line, mode) = merge_load_options(None, Some("sbm.handoff_sha256=abc"));
+        assert_eq!(mode, "external");
+        assert_eq!(line.as_deref(), Some("sbm.handoff_sha256=abc"));
+        let command = decode_command(
+            br#"{"action":"boot_target","target_id":"sbm-core:slot-a","one_shot":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            local_request(&command),
+            LocalRequest::Boot(BootTargetId("sbm-core:slot-a".into()))
+        );
+        assert_eq!(
+            local_request(&decode_command(br#"{"action":"shutdown"}"#).unwrap()),
+            LocalRequest::Shutdown
         );
     }
 }

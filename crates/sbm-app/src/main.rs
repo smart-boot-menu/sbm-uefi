@@ -13,10 +13,12 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use sbm_boot::{
-    ResolveInput, Volume, add_load_options, atomic_write, begin_attempt, build_handoff,
-    decode_attempt, decode_policy, discover_volume, encode_attempt, encode_handoff, encode_policy,
-    evaluate_remote, fresh_policy, handoff_sha256_hex, linux_load_options, mark_one_shot_consumed,
-    normalize, parse_load_option, resolve, selectable, visible,
+    DiscoveredTarget, LocalRequest, ResolveInput, Resolved, Volume, add_load_options, atomic_write,
+    begin_attempt, build_handoff, compare_targets, confirm_attempt, decode_attempt, decode_command,
+    decode_policy, decode_success, discover_volume, embedded_cmdline, encode_attempt,
+    encode_handoff, encode_policy, evaluate_remote, fresh_policy, handoff_sha256_hex,
+    linux_load_options, local_request, mark_one_shot_consumed, merge_load_options, normalize,
+    parse_load_option, recovery_for_slot, resolve, selectable, visible,
 };
 use sbm_gfx::{
     CardView, Framebuffer, Hit, Input, MenuState, Outcome, Screen, hit_test, layout_menu,
@@ -41,6 +43,8 @@ const VERSION: &str = "0.1.0";
 const POLICY_PATH: &str = "\\EFI\\sbm\\policy.json";
 const ATTEMPT_PATH: &str = "\\EFI\\sbm\\state\\last_attempt.json";
 const HANDOFF_PATH: &str = "\\EFI\\sbm\\handoff\\current.json";
+const SUCCESS_PATH: &str = "\\EFI\\sbm\\state\\boot-success.json";
+const COMMAND_PATH: &str = "\\EFI\\sbm\\handoff\\requested-command.json";
 
 #[used]
 #[unsafe(link_section = ".sbat")]
@@ -124,6 +128,7 @@ fn run() -> ! {
 
     let mut policy = load_policy(&disks);
     let mut attempt = load_attempt(&disks);
+    apply_success(&mut disks, &mut attempt);
     let early = poll_key();
     let decision = evaluate_remote(
         policy.allow_remote_boot_select,
@@ -160,6 +165,7 @@ fn run() -> ! {
     if let sbm_boot::RemoteDecision::Accept(applied) = &decision {
         apply_remote(&mut resolved, applied, &targets);
     }
+    apply_command(&mut disks, &targets, &mut resolved);
     let visible_index = visible_positions(&entries);
     let selected = resolved
         .highlight
@@ -180,6 +186,14 @@ fn run() -> ! {
     }
     let menu_ready_us = clock.elapsed_us();
     mark(&alloc::format!("menu_ready us={menu_ready_us}"));
+    firmware::lab_marker(
+        "menu-ready",
+        &alloc::format!(
+            "us={menu_ready_us} arch={} targets={}",
+            arch_name(arch),
+            visible_index.len()
+        ),
+    );
     let caps = platform(
         gop.is_some(),
         disks.iter().any(|disk| disk.volume.removable()),
@@ -407,6 +421,16 @@ fn launch(
             .map(|disk| disk.volume.partition_guid().to_string());
         options = linux_load_options(cmdline.as_deref(), hash.as_deref(), esp.as_deref());
     }
+    let embedded = disks
+        .get(disk)
+        .and_then(|item| embedded_cmdline(&item.volume, &path));
+    mark(if embedded.is_some() {
+        "uki cmdline=embedded"
+    } else {
+        "uki cmdline=absent"
+    });
+    let (options, option_mode) = merge_load_options(embedded.as_deref(), options.as_deref());
+    mark(&alloc::format!("load-options {option_mode}"));
     firmware::publish_selection(id.as_str());
     mark(&alloc::format!("chainload {name}"));
     let device_path = disks
@@ -426,14 +450,30 @@ fn launch(
     *attempt = Some(record);
     let _ = boot::set_watchdog_timer(0, 0, None);
     match outcome {
-        ChainOutcome::LoadFailed(status) => {
-            Err(alloc::format!("Could not load {name} ({status:?})"))
-        }
+        ChainOutcome::LoadFailed(status) => Err(boot_failure(&name, &path, status)),
         ChainOutcome::Returned(status) => {
             mark(&alloc::format!("chainload_returned status={status:?}"));
-            Ok(())
+            firmware::lab_marker("chainload-returned", &alloc::format!("status={status:?}"));
+            if status == Status::SUCCESS {
+                Ok(())
+            } else {
+                Err(boot_failure(&name, &path, status))
+            }
         }
     }
+}
+
+fn boot_failure(name: &str, path: &str, status: Status) -> String {
+    let hint = if status == Status::SECURITY_VIOLATION {
+        "Secure Boot rejected the file."
+    } else if status == Status::NOT_FOUND {
+        "The file is missing."
+    } else if status == Status::UNSUPPORTED {
+        "This firmware cannot start the file."
+    } else {
+        "The firmware returned an error."
+    };
+    alloc::format!("{name} ({path}) did not start. {hint} Status {status:?}.")
 }
 
 fn menu_input(
@@ -527,7 +567,14 @@ fn cards(entries: &[Found], visible_index: &[usize]) -> Vec<CardView> {
                 .unwrap_or("");
             CardView {
                 title: target.display_name.clone(),
-                subtitle: alloc::format!("{}  {file}", family_name(target.os_family)),
+                subtitle: alloc::format!(
+                    "{}  {file}",
+                    if target.removable_media {
+                        "Removable"
+                    } else {
+                        family_name(target.os_family)
+                    }
+                ),
                 hint: target
                     .icon_hint
                     .clone()
@@ -641,24 +688,7 @@ fn self_skip(host: &HostImage, arch: CpuArch) -> Vec<String> {
 }
 
 fn sort_entries(entries: &mut [Found]) {
-    entries.sort_by(|left, right| {
-        family_ord(left.item.target.os_family)
-            .cmp(&family_ord(right.item.target.os_family))
-            .then_with(|| {
-                left.item
-                    .target
-                    .display_name
-                    .to_ascii_lowercase()
-                    .cmp(&right.item.target.display_name.to_ascii_lowercase())
-            })
-            .then_with(|| {
-                left.item
-                    .target
-                    .id
-                    .as_str()
-                    .cmp(right.item.target.id.as_str())
-            })
-    });
+    entries.sort_by(|left, right| compare_targets(&left.item.target, &right.item.target));
 }
 
 fn visible_positions(entries: &[Found]) -> Vec<usize> {
@@ -740,16 +770,88 @@ fn family_name(family: OsFamily) -> &'static str {
     }
 }
 
-fn family_ord(family: OsFamily) -> u8 {
-    match family {
-        OsFamily::Windows => 0,
-        OsFamily::Linux => 1,
-        OsFamily::Bsd => 2,
-        OsFamily::MacOs => 3,
-        OsFamily::Other => 4,
-        OsFamily::Recovery => 5,
-        OsFamily::FirmwareUtility => 6,
+fn apply_success(disks: &mut [Disk], attempt: &mut Option<BootAttemptRecord>) {
+    let Some((index, bytes)) = read_any(disks, SUCCESS_PATH) else {
+        return;
+    };
+    let Ok(report) = decode_success(&bytes) else {
+        mark("attempt confirm rejected");
+        let _ = disks[index].volume.remove(SUCCESS_PATH);
+        return;
+    };
+    let Some(record) = attempt.as_mut() else {
+        mark("attempt confirm skipped");
+        return;
+    };
+    if !confirm_attempt(record, &report) {
+        mark("attempt confirm skipped");
+        return;
     }
+    mark(&alloc::format!("attempt confirmed {}", record.attempt_id));
+    if let Ok(encoded) = encode_attempt(record) {
+        persist(disks, ATTEMPT_PATH, &encoded, "attempt");
+    }
+    let _ = disks[index].volume.remove(SUCCESS_PATH);
+}
+
+fn apply_command(disks: &mut [Disk], targets: &[DiscoveredTarget], resolved: &mut Resolved) {
+    let Some((index, bytes)) = read_any(disks, COMMAND_PATH) else {
+        return;
+    };
+    let Ok(command) = decode_command(&bytes) else {
+        mark("command rejected");
+        let _ = disks[index].volume.remove(COMMAND_PATH);
+        return;
+    };
+    let _ = disks[index].volume.remove(COMMAND_PATH);
+    match local_request(&command) {
+        LocalRequest::Reboot => {
+            mark("command reboot");
+            firmware::reboot();
+        }
+        LocalRequest::Shutdown => {
+            mark("command shutdown");
+            firmware::shutdown();
+        }
+        LocalRequest::Firmware => {
+            mark("command firmware");
+            if firmware::reboot_to_firmware_ui().is_err() {
+                mark("command firmware unavailable");
+            }
+        }
+        LocalRequest::Boot(id) => {
+            mark(&alloc::format!("command boot {}", id.as_str()));
+            resolved.highlight = Some(id);
+            resolved.countdown_seconds = Some(0);
+        }
+        LocalRequest::Recovery(slot) => {
+            if let Some(target) = recovery_for_slot(targets, slot) {
+                mark(&alloc::format!(
+                    "command recovery {}",
+                    target.target.id.as_str()
+                ));
+                resolved.highlight = Some(target.target.id.clone());
+                resolved.countdown_seconds = Some(0);
+            } else {
+                mark("command recovery missing");
+            }
+        }
+    }
+}
+
+fn read_any(disks: &[Disk], path: &str) -> Option<(usize, Vec<u8>)> {
+    if let Some(index) = disks.iter().position(|disk| disk.boot)
+        && let Ok(bytes) = disks[index].volume.read(path)
+    {
+        return Some((index, bytes));
+    }
+    disks.iter().enumerate().find_map(|(index, disk)| {
+        if disk.boot {
+            None
+        } else {
+            disk.volume.read(path).ok().map(|bytes| (index, bytes))
+        }
+    })
 }
 
 fn arch_name(arch: CpuArch) -> &'static str {

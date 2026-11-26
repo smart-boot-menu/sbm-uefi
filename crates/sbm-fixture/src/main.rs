@@ -16,6 +16,12 @@ use uefi::{Handle, Status, boot, entry, helpers, system};
 
 static SERIAL_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// Unsigned `.cmdline` section, the same name systemd-stub reads.
+/// The menu repeats it and appends handoff tokens. This fixture does not.
+#[used]
+#[unsafe(link_section = ".cmdline")]
+static EMBEDDED_CMDLINE: [u8; 13] = *b"console=tty0\0";
+
 #[entry]
 fn main() -> Status {
     let _ = helpers::init();

@@ -60,10 +60,22 @@ pub fn cpu_arch() -> CpuArch {
 }
 
 pub fn mark(text: &str) {
-    let line = alloc::format!("SBM_MARK {text}\n");
+    emit(&alloc::format!("SBM_MARK {text}\n"));
+}
+
+pub fn lab_marker(name: &str, fields: &str) {
+    let line = if fields.is_empty() {
+        alloc::format!("SBM-LAB-MARKER: {name}\n")
+    } else {
+        alloc::format!("SBM-LAB-MARKER: {name} {fields}\n")
+    };
+    emit(&line);
+}
+
+fn emit(line: &str) {
     let bytes = line.as_bytes();
     if !write_serial(bytes) {
-        let _ = stdout_line(&line);
+        let _ = stdout_line(line);
     }
     debugcon(bytes);
 }
