@@ -86,6 +86,65 @@ struct Attempt {
     display: &'static str,
 }
 
+struct LabHold {
+    bin: PathBuf,
+    id: String,
+}
+
+impl Drop for LabHold {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.bin)
+            .args(["resources", "release", "--id", &self.id])
+            .status();
+    }
+}
+
+fn lab_bin(workspace: &Path) -> Result<PathBuf, String> {
+    if let Ok(value) = std::env::var("SBM_LAB_BIN") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    for name in ["release", "debug"] {
+        let path = workspace.join("../sbm-lab/target").join(name).join("sbm-lab");
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err("sbm-lab is not built; cargo build --release -p sbm-lab before starting QEMU".into())
+}
+
+fn lab_reserve(workspace: &Path) -> Result<LabHold, String> {
+    let bin = lab_bin(workspace)?;
+    let output = Command::new(&bin)
+        .args([
+            "resources",
+            "reserve",
+            "--workload",
+            "efi",
+            "--memory",
+            "1024",
+            "--cpus",
+            "1",
+            "--repo",
+        ])
+        .arg(workspace)
+        .output()
+        .map_err(|err| format!("sbm-lab resources reserve: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sbm-lab refused the QEMU reservation:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return Err(format!("unexpected reservation id {id:?}"));
+    }
+    Ok(LabHold { bin, id })
+}
+
 struct Running {
     child: Option<Child>,
 }
@@ -172,10 +231,26 @@ fn run_attempt(
     }
     let err_file = File::create(&err_path).map_err(|err| err.to_string())?;
     command.stdout(Stdio::null()).stderr(Stdio::from(err_file));
+    let hold = lab_reserve(workspace)?;
     let child = command
         .spawn()
         .map_err(|err| format!("spawn {}: {err}", guest.qemu))?;
+    let qemu_pid = child.id();
     let mut running = Running { child: Some(child) };
+    let attached = Command::new(&hold.bin)
+        .args([
+            "resources",
+            "attach",
+            "--id",
+            &hold.id,
+            "--pid",
+            &qemu_pid.to_string(),
+        ])
+        .status()
+        .map_err(|err| format!("attach reservation: {err}"))?;
+    if !attached.success() {
+        return Err("could not attach the QEMU pid to the sbm-lab reservation".into());
+    }
     let ready = wait_log(
         &serial_path,
         &debug_path,
