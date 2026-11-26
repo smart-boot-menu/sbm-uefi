@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::parse::{count_exact, count_prefix, log_text, metric, require_targets};
+
 static NOTED_QEMU: AtomicU32 = AtomicU32::new(0);
 static CANCEL_HANDLERS: Once = Once::new();
 
@@ -42,20 +44,18 @@ fn tie_qemu_to_parent(command: &mut Command) {
         use std::os::unix::process::CommandExt;
         unsafe {
             command.pre_exec(|| {
-                let rc = unsafe {
-                    libc::prctl(
-                        libc::PR_SET_PDEATHSIG,
-                        libc::SIGKILL as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                        0 as libc::c_ulong,
-                    )
-                };
+                let rc = libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGKILL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                );
                 if rc != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if unsafe { libc::getppid() } == 1 {
-                    unsafe { libc::raise(libc::SIGKILL) };
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGKILL);
                 }
                 Ok(())
             });
@@ -66,8 +66,6 @@ fn tie_qemu_to_parent(command: &mut Command) {
         let _ = command;
     }
 }
-
-use crate::parse::{count_exact, count_prefix, log_text, metric, require_targets};
 
 pub struct Guest {
     pub name: &'static str,
