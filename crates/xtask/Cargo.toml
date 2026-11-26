@@ -13,6 +13,7 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+libc = "0.2"
 sbm-boot = { path = "../sbm-boot" }
 sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }

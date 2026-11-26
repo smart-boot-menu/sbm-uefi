@@ -3,8 +3,69 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Once;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+static NOTED_QEMU: AtomicU32 = AtomicU32::new(0);
+static CANCEL_HANDLERS: Once = Once::new();
+
+extern "C" fn cancel_qemu(sig: libc::c_int) {
+    let pid = NOTED_QEMU.load(Ordering::SeqCst);
+    if pid > 1 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+pub fn install_cancel_handlers() {
+    CANCEL_HANDLERS.call_once(|| unsafe {
+        libc::signal(libc::SIGINT, cancel_qemu as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            cancel_qemu as *const () as libc::sighandler_t,
+        );
+    });
+}
+
+fn note_qemu(pid: u32) {
+    NOTED_QEMU.store(pid, Ordering::SeqCst);
+}
+
+fn tie_qemu_to_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                let rc = unsafe {
+                    libc::prctl(
+                        libc::PR_SET_PDEATHSIG,
+                        libc::SIGKILL as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    )
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if unsafe { libc::getppid() } == 1 {
+                    unsafe { libc::raise(libc::SIGKILL) };
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+}
 
 use crate::parse::{count_exact, count_prefix, log_text, metric, require_targets};
 
@@ -107,7 +168,10 @@ fn lab_bin(workspace: &Path) -> Result<PathBuf, String> {
         }
     }
     for name in ["release", "debug"] {
-        let path = workspace.join("../sbm-lab/target").join(name).join("sbm-lab");
+        let path = workspace
+            .join("../sbm-lab/target")
+            .join(name)
+            .join("sbm-lab");
         if path.is_file() {
             return Ok(path);
         }
@@ -152,8 +216,12 @@ struct Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            let pid = child.id();
             let _ = child.kill();
             let _ = child.wait();
+            if NOTED_QEMU.load(Ordering::SeqCst) == pid {
+                NOTED_QEMU.store(0, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -232,10 +300,12 @@ fn run_attempt(
     let err_file = File::create(&err_path).map_err(|err| err.to_string())?;
     command.stdout(Stdio::null()).stderr(Stdio::from(err_file));
     let hold = lab_reserve(workspace)?;
+    tie_qemu_to_parent(&mut command);
     let child = command
         .spawn()
         .map_err(|err| format!("spawn {}: {err}", guest.qemu))?;
     let qemu_pid = child.id();
+    note_qemu(qemu_pid);
     let mut running = Running { child: Some(child) };
     let attached = Command::new(&hold.bin)
         .args([

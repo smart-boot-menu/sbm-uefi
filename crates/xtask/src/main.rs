@@ -13,6 +13,7 @@ use crate::pe::set_nx_compat;
 use crate::qemu::{AARCH64, Guest, X86_64};
 
 fn main() {
+    qemu::install_cancel_handlers();
     if let Err(err) = run() {
         eprintln!("{err}");
         std::process::exit(1);
