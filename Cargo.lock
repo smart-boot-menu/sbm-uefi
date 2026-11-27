@@ -447,6 +447,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "noto-sans-mono-bitmap"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09b7b72dee69e4110d1b91fb8d497c1b74a54082da5738dff84136142c4f767b"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,6 +623,9 @@ dependencies = [
 [[package]]
 name = "sbm-gfx"
 version = "0.1.0"
+dependencies = [
+ "noto-sans-mono-bitmap",
+]
 
 [[package]]
 name = "sbm-media"

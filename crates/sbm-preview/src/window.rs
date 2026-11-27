@@ -12,7 +12,7 @@ use sbm_gfx::Framebuffer;
 use sbm_menu::{Key, Pointer};
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::session::CoreExit;
-use sbm_preview::{DISPLAY_PRESETS, Effect, Machine, Session, core, write_image};
+use sbm_preview::{DISPLAY_PRESETS, Effect, LayoutMode, Machine, Session, core, write_image};
 
 use crate::Options;
 
@@ -88,13 +88,20 @@ impl View {
 pub fn run(opts: &Options) -> Result<(), String> {
     let scenarios = scenario::list(&scenario::scenario_dir())?;
     let mut current = scenario::resolve(&opts.scenario)?;
-    let mut session = Session::power_on(Machine::new(Scenario::load(&current)?), opts.dark);
+    let initial_layout = opts.layouts.first().copied().unwrap_or(LayoutMode::Classic);
+    let mut session = Session::power_on_with(
+        Machine::new(Scenario::load(&current)?),
+        opts.dark,
+        initial_layout,
+        opts.discovery,
+    );
     let mut view = View::open(opts.size, opts.fixed)?;
     let mut preset = None::<usize>;
     let mut shots = 0u32;
     let mut dirty = true;
     let mut mouse_last = None::<(u32, u32)>;
     let mut mouse_down = false;
+    let mut scroll_dragging = false;
     let mut last = Instant::now();
     let mut first_frame = true;
     let mut pending = session.take_pending();
@@ -131,7 +138,14 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     };
                     current = scenarios[next].clone();
                     let dark = session.state.dark;
-                    session = Session::power_on(Machine::new(Scenario::load(&current)?), dark);
+                    let layout = session.layout;
+                    let discovery = session.discovery;
+                    session = Session::power_on_with(
+                        Machine::new(Scenario::load(&current)?),
+                        dark,
+                        layout,
+                        discovery,
+                    );
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -143,13 +157,56 @@ pub fn run(opts: &Options) -> Result<(), String> {
                         Some(_) => None,
                     };
                     view.fixed = preset.map(|index| DISPLAY_PRESETS[index]);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::F4 => {
+                    let next = if shift {
+                        session.layout.prev()
+                    } else {
+                        session.layout.next()
+                    };
+                    session.set_layout(next);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Key1 | MKey::Key2 | MKey::Key3 | MKey::Key4 if session.sim.is_none() => {
+                    let next = match key {
+                        MKey::Key1 => LayoutMode::Classic,
+                        MKey::Key2 => LayoutMode::Bento,
+                        MKey::Key3 => LayoutMode::Schematic,
+                        _ => LayoutMode::Storage,
+                    };
+                    session.set_layout(next);
+                    set_title(&mut view, &session);
                     dirty = true;
                 }
                 MKey::F5 => {
                     let dark = session.state.dark;
-                    session = Session::power_on(Machine::new(Scenario::load(&current)?), dark);
+                    let layout = session.layout;
+                    let discovery = session.discovery;
+                    session = Session::power_on_with(
+                        Machine::new(Scenario::load(&current)?),
+                        dark,
+                        layout,
+                        discovery,
+                    );
                     effects.push(session.take_pending());
+                    set_title(&mut view, &session);
                     dirty = true;
+                }
+                MKey::F6 => {
+                    let mut next = session.discovery;
+                    next.mode = next.mode.next();
+                    session.set_discovery(next);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::PageUp if session.sim.is_none() => {
+                    effects.push(session.scroll_by(-180, w, h));
+                }
+                MKey::PageDown if session.sim.is_none() => {
+                    effects.push(session.scroll_by(180, w, h));
                 }
                 MKey::F12 => {
                     shots += 1;
@@ -171,16 +228,35 @@ pub fn run(opts: &Options) -> Result<(), String> {
             }
         }
 
+        if let Some((_sx, sy)) = view.window.get_scroll_wheel()
+            && sy.abs() > 0.001
+        {
+            let mut delta = (-sy * 28.0).round() as i32;
+            if delta == 0 {
+                delta = if sy < 0.0 { 1 } else { -1 };
+            }
+            effects.push(session.scroll_by(delta, w, h));
+        }
+
         let pressed = view.window.get_mouse_down(MouseButton::Left);
         let clicked = pressed && !mouse_down;
+        if !pressed {
+            scroll_dragging = false;
+        }
         mouse_down = pressed;
         if let Some(pos) = view
             .window
             .get_mouse_pos(MouseMode::Discard)
             .and_then(|(x, y)| view.to_fb(x, y))
         {
+            if clicked && session.on_scroll_track(pos.0, pos.1, w, h) {
+                scroll_dragging = true;
+            }
             let moved = mouse_last != Some(pos);
-            if moved || clicked {
+            if scroll_dragging && pressed {
+                mouse_last = Some(pos);
+                effects.push(session.scroll_drag(pos.1, w, h));
+            } else if moved || clicked {
                 mouse_last = Some(pos);
                 effects.push(session.pointer(
                     Pointer {
@@ -240,8 +316,11 @@ pub fn run(opts: &Options) -> Result<(), String> {
         {
             return Ok(());
         }
-        // A countdown only changes once a second; poll fast only while cards animate.
-        let frame = if session.sim.is_none() && session.state.anim_ms > 0 {
+        // Poll at 60 fps while cards animate or an experimental countdown partition flashes.
+        let frame = if session.sim.is_none()
+            && (session.state.anim_ms > 0
+                || (session.layout != LayoutMode::Classic && session.state.countdown_ms.is_some()))
+        {
             ACTIVE_FRAME
         } else {
             IDLE_FRAME
@@ -298,8 +377,10 @@ fn set_title(view: &mut View, session: &Session) {
         None => "follows window".into(),
     };
     view.window.set_title(&format!(
-        "Smart Boot Menu - SIMULATED UEFI - {} - {size} - F1 help",
-        session.machine.scenario.id
+        "Smart Boot Menu - SIMULATED - {} - {} - {} - {size} - F1 help",
+        session.machine.scenario.id,
+        session.layout.label(),
+        session.discovery.mode.id()
     ));
 }
 
@@ -307,8 +388,9 @@ fn screenshot_path(session: &Session, fb: &Framebuffer, n: u32) -> PathBuf {
     sbm_preview::workspace_root()
         .join("build/sim/screenshots")
         .join(format!(
-            "{}-{}-{}x{}-{n:03}.png",
+            "{}-{}-{}-{}x{}-{n:03}.png",
             session.machine.scenario.id,
+            session.layout.id(),
             session.screen_name(),
             fb.width,
             fb.height

@@ -542,3 +542,423 @@ fn local_key_overrides_a_valid_core_request() {
             .is_none()
     );
 }
+
+#[test]
+fn experimental_layouts_and_progressive_discovery_work() {
+    use sbm_preview::{DiscoveryMode, DiscoverySchedule, LayoutMode};
+
+    let mut classic = session("dual-boot");
+    classic.set_layout(LayoutMode::Classic);
+    let fb_classic = render(&classic, W, H);
+
+    let mut rendered = Vec::new();
+    for mode in LayoutMode::EXPERIMENTS {
+        let mut s = session("dual-boot");
+        s.set_layout(mode);
+        let fb = render(&s, W, H);
+        assert_ne!(fb.px, fb_classic.px, "{mode:?} matched classic");
+        rendered.push(fb.px);
+    }
+    assert_ne!(rendered[0], rendered[1], "Bento and Schematic must differ");
+    assert_ne!(
+        rendered[1], rendered[2],
+        "Schematic and Storage must differ"
+    );
+    assert_ne!(rendered[0], rendered[2], "Bento and Storage must differ");
+
+    // Progressive discovery: t=0 keeps all boot targets selectable immediately,
+    // and crossing probe thresholds triggers discrete redraws.
+    let mut prog = session("multi-disk");
+    prog.set_layout(LayoutMode::Bento);
+    prog.set_discovery(DiscoverySchedule::new(DiscoveryMode::Progressive, None));
+    assert!(prog.cards() > 0);
+    assert!(prog.animating());
+    let spec_0 = prog.system_spec(W, H);
+    assert!(matches!(spec_0.cpu, sbm_gfx::hardware::ProbeState::Pending));
+    assert!(matches!(
+        spec_0.storage,
+        sbm_gfx::hardware::ProbeState::Ready(_)
+    ));
+
+    let fb_t0 = render(&prog, W, H);
+    let _ = prog.tick(1000, W, H);
+    let spec_done = prog.system_spec(W, H);
+    assert!(matches!(
+        spec_done.cpu,
+        sbm_gfx::hardware::ProbeState::Ready(_)
+    ));
+    let fb_done = render(&prog, W, H);
+    assert_ne!(fb_t0.px, fb_done.px);
+
+    // Sparse mode marks optional SMBIOS unavailable while keeping boot targets.
+    let mut sparse = session("dual-boot");
+    sparse.set_layout(LayoutMode::Schematic);
+    sparse.set_discovery(DiscoverySchedule::new(DiscoveryMode::Sparse, None));
+    let spec_sparse = sparse.system_spec(W, H);
+    assert!(matches!(
+        spec_sparse.board,
+        sbm_gfx::hardware::ProbeState::Unavailable
+    ));
+    assert!(matches!(
+        spec_sparse.gpu,
+        sbm_gfx::hardware::ProbeState::Unavailable
+    ));
+    assert!(matches!(
+        spec_sparse.network,
+        sbm_gfx::hardware::ProbeState::Unavailable
+    ));
+    assert!(sparse.cards() >= 3);
+}
+
+#[test]
+fn lba_stress_preserves_exact_lba_order_gaps_and_multi_target_polygons() {
+    use sbm_gfx::hardware::{ProbeState, RegionKind};
+    use sbm_preview::LayoutMode;
+
+    let mut s = session("lba-stress");
+    s.set_layout(LayoutMode::Storage);
+    let spec = s.system_spec(W, H);
+    let ProbeState::Ready(disks) = &spec.storage else {
+        panic!("expected storage ready");
+    };
+    assert_eq!(disks.len(), 2, "lba-stress should have 2 disks");
+
+    // Verify strict ascending LBA ordering and explicit unallocated gaps on both disks.
+    for disk in disks {
+        assert!(!disk.regions.is_empty());
+        let mut prev_end = 0u64;
+        let mut gap_count = 0usize;
+        for region in &disk.regions {
+            assert!(
+                region.start_lba >= prev_end,
+                "disk {} LBA out of order: {} < {}",
+                disk.device_name,
+                region.start_lba,
+                prev_end
+            );
+            assert!(region.end_lba > region.start_lba);
+            if matches!(region.kind, RegionKind::Unallocated) {
+                gap_count += 1;
+            }
+            prev_end = region.end_lba;
+        }
+        assert!(
+            gap_count >= 3,
+            "disk {} expected >=3 unallocated gaps, got {}",
+            disk.device_name,
+            gap_count
+        );
+    }
+
+    // Verify Arch Linux partition owns both Arch Linux + systemd-boot targets
+    // while ESP owns SBM Core Slot A, never conflating ESP and OS partitions.
+    let mut found_multi_target_os = false;
+    let mut found_esp_with_loaders = false;
+    for region in &disks[0].regions {
+        if let RegionKind::Partition(p) = &region.kind {
+            if p.label == "arch" {
+                assert_eq!(p.boot_targets.len(), 2, "Arch should own 2 boot targets");
+                for t in &p.boot_targets {
+                    assert_eq!(t.esp_part, Some(1));
+                    assert_eq!(t.os_part, Some(p.index));
+                }
+                found_multi_target_os = true;
+            }
+            if p.index == 1 {
+                assert!(p.loader_count >= 4);
+                assert_eq!(p.boot_targets.len(), 1, "ESP should own SBM Core Slot A");
+                found_esp_with_loaders = true;
+            }
+        }
+    }
+    assert!(found_multi_target_os, "missing multi-target Arch partition");
+    assert!(found_esp_with_loaders, "missing ESP loader metadata");
+
+    // Verify all 3 layouts render cleanly across 800x600, 1280x800, 1920x1080.
+    for mode in LayoutMode::EXPERIMENTS {
+        s.set_layout(mode);
+        for (w, h) in [(800, 600), (1280, 800), (1920, 1080)] {
+            let fb = render(&s, w, h);
+            assert!(fb.px.iter().any(|&p| p != fb.px[0]));
+        }
+    }
+}
+
+#[test]
+fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
+    use sbm_gfx::hardware::{ExperimentalHit, layout_experimental_scrolled};
+    use sbm_menu::Pointer;
+    use sbm_preview::LayoutMode;
+
+    // 1. Both [X] abort buttons (header + flashing partition) appear during countdown,
+    //    the partition flashes visibly between countdown ticks, and clicking EITHER [X]
+    //    aborts autoboot without booting.
+    for mode in LayoutMode::EXPERIMENTS {
+        for click_which in [0usize, 1usize] {
+            let mut s = session("lba-stress");
+            s.set_layout(mode);
+            assert!(
+                s.state.countdown_ms.is_some(),
+                "expected active autoboot countdown"
+            );
+
+            // Check flashing: advance by 300 ms and verify pixels change smoothly.
+            let fb_a = render(&s, W, H);
+            let _ = s.tick(300, W, H);
+            let fb_b = render(&s, W, H);
+            assert_ne!(
+                fb_a.px, fb_b.px,
+                "{mode:?} countdown partition should flash"
+            );
+
+            let spec = s.system_spec(W, H);
+            let map = layout_experimental_scrolled(mode, W, H, &spec, &s.state, s.scroll_y);
+            assert_eq!(
+                map.abort_buttons.len(),
+                2,
+                "{mode:?} should expose both top-right and partition [X] abort buttons"
+            );
+            let header_x = map
+                .abort_buttons
+                .iter()
+                .find(|r| r.y < 50)
+                .copied()
+                .unwrap();
+            let part_x = map
+                .abort_buttons
+                .iter()
+                .find(|r| r.y >= 50)
+                .copied()
+                .unwrap();
+            let target_btn = if click_which == 0 { header_x } else { part_x };
+            let cx = target_btn.x + target_btn.w / 2;
+            let cy = target_btn.y + target_btn.h / 2;
+            assert_eq!(
+                map.hit_test_experimental(cx, cy),
+                ExperimentalHit::AbortAutoboot
+            );
+
+            let eff = s.pointer(
+                Pointer {
+                    x: cx,
+                    y: cy,
+                    moved: true,
+                    clicked: true,
+                },
+                W,
+                H,
+            );
+            assert_eq!(eff, Effect::Redraw);
+            assert_eq!(
+                s.state.countdown_ms, None,
+                "clicking [X] must abort autoboot"
+            );
+            assert_eq!(s.screen_name(), "menu", "clicking [X] must not launch OS");
+
+            // Once aborted, both [X] buttons disappear.
+            let spec2 = s.system_spec(W, H);
+            let map2 = layout_experimental_scrolled(mode, W, H, &spec2, &s.state, s.scroll_y);
+            assert!(map2.abort_buttons.is_empty());
+        }
+    }
+
+    // 2. Multi-drive scrolling: 6 drives in `multi-disk` exceed viewport height in Bento/Storage,
+    //    expose a scrollbar, respond to scroll_by & scrollbar clicks, and auto-scroll on keyboard nav.
+    for mode in [
+        LayoutMode::Bento,
+        LayoutMode::Schematic,
+        LayoutMode::Storage,
+    ] {
+        let mut s = session("multi-disk");
+        s.set_layout(mode);
+        let spec = s.system_spec(W, H);
+        let map0 = layout_experimental_scrolled(mode, W, H, &spec, &s.state, s.scroll_y);
+        assert!(
+            map0.max_scroll_y > 0,
+            "{mode:?} multi-disk (6 drives) should be scrollable"
+        );
+        assert!(map0.scroll_up.is_some());
+        assert!(map0.scroll_down.is_some());
+        assert!(map0.scroll_track.is_some());
+        assert!(map0.scroll_thumb.is_some());
+
+        let fb_top = render(&s, W, H);
+        assert_eq!(s.scroll_by(220, W, H), Effect::Redraw);
+        assert!(s.scroll_y > 0);
+        let fb_mid = render(&s, W, H);
+        assert_ne!(fb_top.px, fb_mid.px, "{mode:?} scrolling must move drives");
+
+        // Clicking scrollbar down button scrolls further (or stays clamped at bottom).
+        let dn = map0.scroll_down.unwrap();
+        let _ = s.pointer(
+            Pointer {
+                x: dn.x + dn.w / 2,
+                y: dn.y + dn.h / 2,
+                moved: true,
+                clicked: true,
+            },
+            W,
+            H,
+        );
+        assert!(s.scroll_y >= 220.min(map0.max_scroll_y));
+
+        // Reset scroll to top and step through cards to bottom drive: auto-scroll brings it in view.
+        let _ = s.scroll_by(-10_000, W, H);
+        assert_eq!(s.scroll_y, 0);
+        for _ in 0..5 {
+            let _ = s.key(Key::Right, W, H);
+        }
+        assert!(
+            s.scroll_y > 0,
+            "{mode:?} navigating to bottom drive should auto-scroll into view"
+        );
+    }
+}
+
+#[test]
+fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
+    use sbm_gfx::hardware::layout_experimental_scrolled;
+    use sbm_menu::Pointer;
+    use sbm_preview::LayoutMode;
+
+    let mut s = session("lba-stress");
+    s.set_layout(LayoutMode::Bento);
+
+    // Abort initial Windows countdown first.
+    assert_eq!(s.abort_autoboot(), Effect::Redraw);
+    assert_eq!(s.state.countdown_ms, None);
+
+    // Locate Fedora's polygon zone (a different boot target than Windows).
+    let fedora_card = s
+        .visible()
+        .iter()
+        .position(|&idx| s.entries()[idx].item.target.display_name.contains("Fedora"))
+        .expect("lba-stress should have Fedora");
+    let spec = s.system_spec(W, H);
+    let map = layout_experimental_scrolled(LayoutMode::Bento, W, H, &spec, &s.state, s.scroll_y);
+    let fedora_seg = map
+        .zones
+        .iter()
+        .find(|z| z.card_index == fedora_card)
+        .expect("Fedora hit zone")
+        .segments[0];
+    let fx = fedora_seg.x + fedora_seg.w / 2;
+    let fy = fedora_seg.y + fedora_seg.h / 2;
+
+    // 1. Hovering Fedora must NOT hijack selection or start countdown.
+    let _ = s.pointer(
+        Pointer {
+            x: fx,
+            y: fy,
+            moved: true,
+            clicked: false,
+        },
+        W,
+        H,
+    );
+    assert_ne!(s.state.selected, fedora_card);
+    assert_eq!(s.state.countdown_ms, None);
+
+    // 2. First click on Fedora selects it and starts countdown WITHOUT booting yet.
+    let _ = s.pointer(
+        Pointer {
+            x: fx,
+            y: fy,
+            moved: false,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(
+        s.screen_name(),
+        "menu",
+        "first click must not boot immediately"
+    );
+    assert_eq!(s.state.selected, fedora_card);
+    assert!(
+        s.state.countdown_ms.is_some(),
+        "first click must start countdown"
+    );
+
+    // 3. Clicking a DIFFERENT partition (Windows) switches selection and restarts countdown
+    //    without booting Windows immediately.
+    let win_card = 0usize;
+    let win_seg = map
+        .zones
+        .iter()
+        .find(|z| z.card_index == win_card)
+        .expect("Windows hit zone")
+        .segments[0];
+    let wx = win_seg.x + win_seg.w / 2;
+    let wy = win_seg.y + win_seg.h / 2;
+    let _ = s.pointer(
+        Pointer {
+            x: wx,
+            y: wy,
+            moved: true,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(
+        s.screen_name(),
+        "menu",
+        "switching partition must start countdown, not boot"
+    );
+    assert_eq!(s.state.selected, win_card);
+    assert!(s.state.countdown_ms.is_some());
+
+    // 4. Second click on the SAME counting-down partition boots it immediately!
+    let _ = s.pointer(
+        Pointer {
+            x: wx,
+            y: wy,
+            moved: false,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    match &s.sim {
+        Some(SimScreen::Booted { name, .. }) => assert_eq!(name, "Windows"),
+        other => {
+            panic!("second click on counting-down partition should boot Windows, got {other:?}")
+        }
+    }
+
+    // 5. Enter behaves identically: 1st Enter starts countdown, Esc aborts,
+    //    Enter arms again, 2nd Enter boots immediately.
+    let mut k = session("lba-stress");
+    k.set_layout(LayoutMode::Storage);
+    assert_eq!(k.abort_autoboot(), Effect::Redraw);
+    assert_eq!(k.state.countdown_ms, None);
+
+    // Move to another target and press Enter once -> starts countdown, does NOT boot.
+    let _ = k.key(Key::Right, W, H);
+    assert_eq!(k.state.countdown_ms, None);
+    let _ = k.key(Key::Activate, W, H);
+    assert_eq!(
+        k.screen_name(),
+        "menu",
+        "first Enter must start countdown, not boot"
+    );
+    assert!(k.state.countdown_ms.is_some());
+
+    // Escape aborts countdown without booting.
+    let _ = k.key(Key::Escape, W, H);
+    assert_eq!(k.screen_name(), "menu");
+    assert_eq!(k.state.countdown_ms, None);
+
+    // Enter arms again, then second Enter boots immediately.
+    let _ = k.key(Key::Activate, W, H);
+    assert_eq!(k.screen_name(), "menu");
+    assert!(k.state.countdown_ms.is_some());
+    let _ = k.key(Key::Activate, W, H);
+    assert_ne!(
+        k.screen_name(),
+        "menu",
+        "second Enter while counting down must boot"
+    );
+}

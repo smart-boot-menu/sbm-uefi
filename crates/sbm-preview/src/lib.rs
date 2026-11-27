@@ -6,6 +6,7 @@
 //! of an EFI binary.
 
 pub mod core;
+pub mod hardware;
 pub mod machine;
 pub mod overlay;
 pub mod scenario;
@@ -15,8 +16,10 @@ use std::fs;
 use std::path::Path;
 
 use sbm_gfx::Framebuffer;
+pub use sbm_gfx::hardware::LayoutMode;
 use sbm_menu::Key;
 
+pub use hardware::{DiscoveryMode, DiscoverySchedule};
 pub use machine::Machine;
 pub use scenario::Scenario;
 pub use session::{Effect, Session};

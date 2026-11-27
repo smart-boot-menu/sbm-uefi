@@ -208,6 +208,13 @@ pub struct Partition {
     pub name: String,
     pub kind: PartKind,
     pub size: Size,
+    /// Optional explicit starting LBA (512-byte sectors). When omitted, placed
+    /// sequentially after the previous partition + optional `gap_before`.
+    #[serde(default)]
+    pub start_lba: Option<u64>,
+    /// Optional unallocated gap immediately preceding this partition.
+    #[serde(default)]
+    pub gap_before: Option<Size>,
     #[serde(default)]
     pub free: Option<Size>,
     #[serde(default)]
@@ -297,7 +304,11 @@ impl Scenario {
 
     fn validate(&self) -> Result<(), String> {
         for disk in &self.disks {
-            let used: u64 = disk.partitions.iter().map(|part| part.size.0).sum();
+            let used: u64 = disk
+                .partitions
+                .iter()
+                .map(|part| part.size.0 + part.gap_before.map(|g| g.0).unwrap_or(0))
+                .sum();
             if used > disk.size.0 {
                 return Err(format!(
                     "scenario {}: partitions on {} exceed the disk size",

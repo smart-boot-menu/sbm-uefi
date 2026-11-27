@@ -14,12 +14,16 @@ Native SBM development (SIMULATED; never touches host disks or NVRAM)
 
   cargo xtask sim [OPTIONS]        interactive UEFI menu window; Manage Computer opens native Core
       --scenario NAME              dual-boot (default), see `cargo xtask sim --list`
+      --layout NAME                classic (default), bento, schematic, storage
+      --discovery MODE             instant (default), progressive, slow, sparse   --delay-ms N
       --theme dark|light           --display window|WxH   --size WxH
       --no-core                    skip building sbm-core (Manage Computer shows an error)
       --watch                      rebuild and relaunch on change (needs watchexec)
       --release                    optimized build
   cargo xtask preview [OPTIONS]    headless PNG screenshots into build/preview
       --scenario NAME | --all-scenarios   --screen menu|splash|diagnostics|error|all
+      --layout NAME                classic, bento, schematic, storage, experiments, all
+      --discovery MODE             instant, progressive, slow, sparse   --delay-ms N  --at-ms N
       --theme dark|light|both  --size WxH | --sizes 800x600,1280x800,1920x1080|all
       --width N --height N  --keys Right,Enter,wait:500  --selected N  --out FILE|DIR  --open
   cargo xtask core [OPTIONS]       native Core (real sbm-ui) for a scenario, without the menu

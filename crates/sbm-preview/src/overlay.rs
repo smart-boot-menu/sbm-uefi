@@ -110,13 +110,16 @@ pub const HELP: &[&str] = &[
     "  Arrows  move     Enter/Space  boot     Tab  actions",
     "  T theme   C SBM Core (Manage Computer)   D diagnostics",
     "  F firmware   R restart   S shut down   Esc back",
-    "  Mouse: hover selects, click boots",
+    "  Enter/Space & Mouse: 1st press/click starts countdown, 2nd boots now",
+    "  Esc or [X] buttons: abort autoboot countdown",
+    "  Scroll wheel / trackpad / PageUp / PageDown: scroll drives",
     "",
-    "Simulator keys",
+    "Simulator & prototype keys",
     "  F1 help      F2 next scenario    Shift+F2 previous",
     "  F3 display size (window / fixed presets)",
-    "  F5 reset the computer     F12 screenshot (PNG)",
-    "  Cmd+Q / close window  quit",
+    "  F4 next layout  Shift+F4 prev   1-4 jump (Classic/A/B/C)",
+    "  F5 reset computer   F6 cycle discovery (prog/slow/sparse/instant)",
+    "  F12 screenshot (PNG)    Cmd+Q / close window  quit",
 ];
 
 pub fn paint_help(fb: &mut Framebuffer, dark: bool) {

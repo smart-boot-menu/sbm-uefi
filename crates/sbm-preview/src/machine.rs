@@ -212,6 +212,13 @@ impl Machine {
             })
     }
 
+    pub fn has_load_fault(&self, guid: &str, path: &str) -> bool {
+        let upper = normalize(path).to_ascii_uppercase();
+        self.faults
+            .iter()
+            .any(|fault| fault.guid.eq_ignore_ascii_case(guid) && fault.path == upper)
+    }
+
     pub fn read_boot(&self, path: &str) -> Option<Vec<u8>> {
         self.boot_esp()?.volume.read(path).ok()
     }

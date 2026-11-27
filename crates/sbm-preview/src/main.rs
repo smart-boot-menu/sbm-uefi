@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::{
-    DISPLAY_PRESETS, Session, core, load_session, parse_resolution, parse_script, render,
-    run_script, write_image,
+    DISPLAY_PRESETS, DiscoveryMode, DiscoverySchedule, LayoutMode, Session, core, load_session,
+    parse_resolution, parse_script, render, run_script, write_image,
 };
 
 #[cfg(feature = "window")]
@@ -15,7 +15,11 @@ const USAGE: &str = "\
 sbm-preview: native Smart Boot Menu UEFI preview against a simulated computer
 
   sbm-preview [--scenario NAME|PATH] [--theme dark|light] [--display window|WxH]
+              [--layout classic|bento|schematic|storage]
+              [--discovery instant|progressive|slow|sparse] [--delay-ms N]
   sbm-preview --headless [--scenario NAME] [--screen menu|splash|diagnostics|error|all]
+              [--layout classic|bento|schematic|storage|experiments|all]
+              [--discovery instant|progressive|slow|sparse] [--delay-ms N] [--at-ms N]
               [--theme dark|light|both] [--keys Right,Enter,wait:1000]
               [--size 1280x800 | --sizes 800x600,1280x800,1920x1080|all] [--out FILE.png|DIR]
   sbm-preview --list
@@ -24,6 +28,10 @@ sbm-preview: native Smart Boot Menu UEFI preview against a simulated computer
 Options
   --scenario      scenario name from sim/scenarios or a TOML path (default dual-boot)
   --all-scenarios headless: render every scenario
+  --layout        classic, bento (A), schematic (B), storage (C), experiments, or all
+  --discovery     instant (default), progressive, slow, or sparse (missing SMBIOS)
+  --delay-ms      total progressive discovery duration in ms
+  --at-ms         headless: capture progressive discovery at N ms after boot
   --theme         dark, light, or both (headless comparison)
   --display       window follows the window size; WxH renders a fixed virtual display
   --size          window or headless size (default 1280x800)
@@ -37,6 +45,10 @@ this computer is read or changed.";
 pub struct Options {
     pub scenario: String,
     pub all_scenarios: bool,
+    pub layouts: Vec<LayoutMode>,
+    pub discovery: DiscoverySchedule,
+    pub at_ms: Option<u32>,
+    pub scroll: u32,
     pub dark: bool,
     pub both_themes: bool,
     pub fixed: Option<(u32, u32)>,
@@ -52,10 +64,35 @@ pub struct Options {
     pub started: Instant,
 }
 
+fn parse_layouts(text: &str) -> Result<Vec<LayoutMode>, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower == "all" {
+        return Ok(LayoutMode::ALL.to_vec());
+    }
+    if lower == "experiments" || lower == "exp" {
+        return Ok(LayoutMode::EXPERIMENTS.to_vec());
+    }
+    let mut out = Vec::new();
+    for tok in lower.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mode = LayoutMode::parse(tok).ok_or_else(|| {
+            format!("unknown layout {tok:?} (classic|bento|schematic|storage|experiments|all)")
+        })?;
+        out.push(mode);
+    }
+    if out.is_empty() {
+        return Err("--layout requires at least one layout name".into());
+    }
+    Ok(out)
+}
+
 fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut opts = Options {
         scenario: "dual-boot".into(),
         all_scenarios: false,
+        layouts: vec![LayoutMode::Classic],
+        discovery: DiscoverySchedule::default(),
+        at_ms: None,
+        scroll: 0,
         dark: true,
         both_themes: false,
         fixed: None,
@@ -76,6 +113,19 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         match arg.as_str() {
             "--scenario" => opts.scenario = value()?,
             "--all-scenarios" => opts.all_scenarios = true,
+            "--layout" => opts.layouts = parse_layouts(&value()?)?,
+            "--discovery" => {
+                let raw = value()?;
+                opts.discovery.mode = DiscoveryMode::parse(&raw).ok_or_else(|| {
+                    format!("unknown discovery mode {raw:?} (instant|progressive|slow|sparse)")
+                })?;
+            }
+            "--delay-ms" => {
+                opts.discovery.delay_ms = Some(value()?.parse().map_err(|_| "invalid --delay-ms")?);
+            }
+            "--at-ms" => {
+                opts.at_ms = Some(value()?.parse().map_err(|_| "invalid --at-ms")?);
+            }
             "--theme" => match value()?.as_str() {
                 "dark" => {
                     opts.dark = true;
@@ -118,6 +168,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--headless" => opts.headless = true,
             "--screen" => opts.screen = value()?,
             "--keys" => opts.keys = value()?,
+            "--scroll" => opts.scroll = value()?.parse().map_err(|_| "invalid --scroll")?,
             "--out" => opts.out = Some(PathBuf::from(value()?)),
             "--core-bin" => opts.core_bin = PathBuf::from(value()?),
             "--exit-after-ms" => {
@@ -196,48 +247,78 @@ fn headless(opts: &Options) -> Result<(), String> {
         opts.sizes.clone()
     };
     let multi_size = sizes.len() > 1;
-    let single = names.len() == 1 && screens.len() == 1 && themes.len() == 1 && !multi_size;
+    let multi_layout = opts.layouts.len() > 1 || opts.layouts[0] != LayoutMode::Classic;
+    let single = names.len() == 1
+        && screens.len() == 1
+        && themes.len() == 1
+        && opts.layouts.len() == 1
+        && !multi_size;
     for &(width, height) in &sizes {
-        for name in &names {
-            for screen in &screens {
-                for dark in &themes {
-                    let started = Instant::now();
-                    let Some(session) = scripted(name, *dark, screen, &opts.keys, width, height)?
-                    else {
-                        println!("skip {name} {screen}: this scenario has no such state");
-                        continue;
-                    };
-                    let mut fb = sbm_gfx::Framebuffer::new(width, height);
-                    if *screen == "splash" {
-                        session.render_splash(&mut fb);
-                    } else {
-                        fb = render(&session, width, height);
-                    }
-                    let theme = if *dark { "dark" } else { "light" };
-                    let filename = if multi_size {
-                        format!("uefi-{name}-{screen}-{theme}-{width}x{height}.png")
-                    } else {
-                        format!("uefi-{name}-{screen}-{theme}.png")
-                    };
-                    let path = match (&opts.out, single) {
-                        (Some(path), true) if path.extension().is_some() => path.clone(),
-                        (Some(dir), _) => dir.join(&filename),
-                        (None, _) => out_dir().join(&filename),
-                    };
-                    let bytes = write_image(&path, &fb)?;
-                    println!(
-                        "SIMULATED preview {} ({}x{}, {} bytes, {} screen, {:.1} ms)",
-                        path.display(),
-                        width,
-                        height,
-                        bytes,
+        for &layout in &opts.layouts {
+            for name in &names {
+                for screen in &screens {
+                    for dark in &themes {
+                        let started = Instant::now();
+                        let Some(mut session) = scripted(
+                            name,
+                            *dark,
+                            layout,
+                            opts.discovery,
+                            opts.at_ms,
+                            screen,
+                            &opts.keys,
+                            width,
+                            height,
+                        )?
+                        else {
+                            println!("skip {name} {screen}: this scenario has no such state");
+                            continue;
+                        };
+                        if opts.scroll > 0 {
+                            let _ = session.scroll_by(opts.scroll as i32, width, height);
+                        }
+                        let mut fb = sbm_gfx::Framebuffer::new(width, height);
                         if *screen == "splash" {
-                            "splash"
+                            session.render_splash(&mut fb);
                         } else {
-                            session.screen_name()
-                        },
-                        started.elapsed().as_secs_f64() * 1000.0
-                    );
+                            fb = render(&session, width, height);
+                        }
+                        let theme = if *dark { "dark" } else { "light" };
+                        let filename = match (multi_layout, multi_size) {
+                            (true, true) => format!(
+                                "uefi-{name}-{}-{screen}-{theme}-{width}x{height}.png",
+                                layout.id()
+                            ),
+                            (true, false) => {
+                                format!("uefi-{name}-{}-{screen}-{theme}.png", layout.id())
+                            }
+                            (false, true) => {
+                                format!("uefi-{name}-{screen}-{theme}-{width}x{height}.png")
+                            }
+                            (false, false) => format!("uefi-{name}-{screen}-{theme}.png"),
+                        };
+                        let path = match (&opts.out, single) {
+                            (Some(path), true) if path.extension().is_some() => path.clone(),
+                            (Some(dir), _) => dir.join(&filename),
+                            (None, _) => out_dir().join(&filename),
+                        };
+                        let bytes = write_image(&path, &fb)?;
+                        println!(
+                            "SIMULATED preview {} ({}x{}, layout {}, discovery {}, {} bytes, {} screen, {:.1} ms)",
+                            path.display(),
+                            width,
+                            height,
+                            layout.id(),
+                            opts.discovery.mode.id(),
+                            bytes,
+                            if *screen == "splash" {
+                                "splash"
+                            } else {
+                                session.screen_name()
+                            },
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                 }
             }
         }
@@ -247,9 +328,13 @@ fn headless(opts: &Options) -> Result<(), String> {
 
 /// Build the session for a named screen. `error` searches for a card whose
 /// start fails in this scenario.
+#[allow(clippy::too_many_arguments)]
 fn scripted(
     name: &str,
     dark: bool,
+    layout: LayoutMode,
+    discovery: DiscoverySchedule,
+    at_ms: Option<u32>,
     screen: &str,
     keys: &str,
     width: u32,
@@ -257,6 +342,11 @@ fn scripted(
 ) -> Result<Option<Session>, String> {
     let steps = parse_script(keys)?;
     let mut session = load_session(name, dark)?;
+    session.set_layout(layout);
+    session.set_discovery(discovery);
+    if let Some(ms) = at_ms {
+        session.elapsed_ms = ms;
+    }
     match screen {
         "menu" | "splash" | "custom" => {}
         "diagnostics" => {
@@ -267,6 +357,8 @@ fn scripted(
             let mut found = None;
             for index in 0..cards.max(1) {
                 let mut probe = load_session(name, dark)?;
+                probe.set_layout(layout);
+                probe.set_discovery(discovery);
                 let mut script = vec!["right"; index].join(",");
                 script.push_str(if cards == 0 { "c" } else { ",enter" });
                 run_script(&mut probe, &parse_script(&script)?, width, height);

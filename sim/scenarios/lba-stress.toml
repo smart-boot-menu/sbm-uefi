@@ -1,0 +1,169 @@
+name = "LBA geometry stress test"
+summary = "Tiny ESP, huge OS/data partitions, many small partitions, multiple unallocated gaps, and multi-target OSes"
+
+[firmware]
+vendor = "Framework (Insyde UEFI)"
+secure_boot = "enabled"
+ram_mib = 32768
+tpm = true
+network = true
+
+[policy]
+default = "windows"
+timeout_seconds = 10
+
+[hardware]
+hostname = "lab-workstation"
+vendor = "Framework"
+product = "Framework 16 (LBA Stress)"
+cpu = "AMD Ryzen 9 7940HS"
+cores = 8
+gpus = ["AMD Radeon RX 7700S", "AMD Radeon 780M"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+state = "UP"
+mac = "c8:a3:62:40:11:09"
+addresses = ["192.168.50.14/24"]
+
+# Disk 1: Tiny 100 MiB ESP, 16 MiB MSR, 3 unallocated gaps (interior + trailing),
+# huge Windows (BitLocker), WinRE, multi-target Arch Linux (EFI stub + systemd-boot),
+# swap, Fedora UKI, and shared data.
+[[disk]]
+name = "nvme0n1"
+model = "WD_BLACK SN850X 2TB"
+size = "2TB"
+bus = "nvme"
+
+[[disk.partition]]
+name = "EFI system partition"
+kind = "esp"
+size = "100MiB"
+free = "58MiB"
+fs = "FAT32"
+label = "ESP"
+loaders = ["windows", "arch", "fedora-uki", "sbm"]
+
+[[disk.partition]]
+name = "Microsoft reserved"
+kind = "msr"
+size = "16MiB"
+
+[[disk.partition]]
+name = "Windows"
+kind = "windows"
+gap_before = "12GiB"
+size = "760GiB"
+free = "210GiB"
+fs = "NTFS"
+label = "Windows 11"
+bitlocker = true
+
+[[disk.partition]]
+name = "WinRE"
+kind = "windows_recovery"
+size = "1GiB"
+fs = "NTFS"
+label = "WinRE"
+
+[[disk.partition]]
+name = "Arch Linux"
+kind = "linux"
+gap_before = "64GiB"
+size = "380GiB"
+free = "140GiB"
+fs = "btrfs"
+label = "arch"
+
+[[disk.partition]]
+name = "Swap"
+kind = "swap"
+size = "16GiB"
+fs = "swap"
+label = "swap"
+
+[[disk.partition]]
+name = "Fedora"
+kind = "linux"
+size = "220GiB"
+free = "95GiB"
+fs = "ext4"
+label = "fedora"
+
+[[disk.partition]]
+name = "Shared Projects"
+kind = "data"
+gap_before = "24GiB"
+size = "260GiB"
+free = "112GiB"
+fs = "exfat"
+label = "Projects"
+
+# Disk 2: Many small utility/firmware/backup partitions + multiple unallocated gaps
+# + one huge archive data partition.
+[[disk]]
+name = "sda"
+model = "Samsung SSD 870 QVO 1TB"
+size = "1TB"
+bus = "sata"
+
+[[disk.partition]]
+name = "BIOS boot"
+kind = "data"
+size = "64MiB"
+fs = "raw"
+label = "boot-meta"
+
+[[disk.partition]]
+name = "Diag tools"
+kind = "data"
+size = "256MiB"
+fs = "FAT32"
+label = "diag"
+
+[[disk.partition]]
+name = "Firmware cache"
+kind = "data"
+size = "512MiB"
+fs = "FAT32"
+label = "fw-cache"
+
+[[disk.partition]]
+name = "Scratch A"
+kind = "data"
+gap_before = "8GiB"
+size = "4GiB"
+fs = "ext4"
+label = "scratch-a"
+
+[[disk.partition]]
+name = "Scratch B"
+kind = "data"
+size = "8GiB"
+fs = "ext4"
+label = "scratch-b"
+
+[[disk.partition]]
+name = "Kernel builds"
+kind = "data"
+size = "16GiB"
+fs = "ext4"
+label = "builds"
+
+[[disk.partition]]
+name = "Archive Vault"
+kind = "data"
+gap_before = "32GiB"
+size = "740GiB"
+free = "310GiB"
+fs = "ext4"
+label = "Archive"
+
+[[disk.partition]]
+name = "Cold Backup"
+kind = "data"
+gap_before = "16GiB"
+size = "48GiB"
+fs = "ext4"
+label = "backup"

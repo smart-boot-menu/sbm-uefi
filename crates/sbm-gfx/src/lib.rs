@@ -3,11 +3,19 @@
 
 extern crate alloc;
 
+#[cfg(feature = "experimental-layouts")]
+pub mod assets;
+#[cfg(feature = "experimental-layouts")]
+pub mod disk_wrap;
 mod draw;
 mod font8x8;
+#[cfg(feature = "experimental-layouts")]
+pub mod hardware;
 mod layout;
 mod paint;
 mod state;
+#[cfg(feature = "experimental-layouts")]
+pub mod text;
 mod theme;
 
 pub use draw::{Framebuffer, Rgba};

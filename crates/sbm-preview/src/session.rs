@@ -3,14 +3,18 @@
 //! `sbm_menu::flow::Picker` as the UEFI app; this file only adds the screens
 //! real firmware would hand to another program.
 
+use sbm_gfx::hardware::{
+    ExperimentalHit, LayoutMode, layout_experimental_scrolled, paint_experimental_scrolled,
+};
 use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
 use sbm_menu::flow::{HandoffVar, LaunchPlan, LaunchResult, Picker};
 use sbm_menu::{
-    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, StartFailure, diag_lines, menu_input,
-    paint_current, recovery_position,
+    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, StartFailure, countdown_ms,
+    diag_lines, menu_input, paint_current, recovery_position,
 };
 use sbm_types::{BootTargetKind, OsFamily, PlatformCapabilities};
 
+use crate::hardware::{DiscoverySchedule, build_system_spec};
 use crate::machine::Machine;
 use crate::overlay;
 
@@ -66,6 +70,10 @@ pub struct Session {
     pub state: MenuState,
     pub sim: Option<SimScreen>,
     pub help: bool,
+    pub layout: LayoutMode,
+    pub discovery: DiscoverySchedule,
+    pub elapsed_ms: u32,
+    pub scroll_y: u32,
     menu_us: u64,
     boots: u32,
     pub last_reason: &'static str,
@@ -75,7 +83,21 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn power_on(mut machine: Machine, dark: bool) -> Self {
+    pub fn power_on(machine: Machine, dark: bool) -> Self {
+        Self::power_on_with(
+            machine,
+            dark,
+            LayoutMode::Classic,
+            DiscoverySchedule::default(),
+        )
+    }
+
+    pub fn power_on_with(
+        mut machine: Machine,
+        dark: bool,
+        layout: LayoutMode,
+        discovery: DiscoverySchedule,
+    ) -> Self {
         machine.reset();
         let picker = Picker::start(&mut machine, &mut || false);
         let mut session = Self {
@@ -84,6 +106,10 @@ impl Session {
             state: MenuState::new(0, dark, None),
             sim: None,
             help: false,
+            layout,
+            discovery,
+            elapsed_ms: 0,
+            scroll_y: 0,
             menu_us: 0,
             boots: 1,
             last_reason: "menu",
@@ -94,11 +120,162 @@ impl Session {
         session
     }
 
+    pub fn set_layout(&mut self, layout: LayoutMode) {
+        self.layout = layout;
+        self.scroll_y = 0;
+    }
+
+    pub fn set_discovery(&mut self, discovery: DiscoverySchedule) {
+        self.discovery = discovery;
+        self.elapsed_ms = 0;
+    }
+
+    /// Abort any active autoboot countdown without moving focus or launching a target.
+    pub fn abort_autoboot(&mut self) -> Effect {
+        if self.state.countdown_ms.take().is_some() {
+            Effect::Redraw
+        } else {
+            Effect::None
+        }
+    }
+
+    fn arm_countdown_ms(&self) -> u32 {
+        countdown_ms(Some(self.picker.policy.timeout_seconds))
+            .filter(|&ms| ms > 0)
+            .unwrap_or(5_000)
+    }
+
+    /// Select a bootable card and start its autoboot countdown (first click).
+    fn arm_card(&mut self, index: usize, width: u32, height: u32) -> Effect {
+        if index >= self.cards() {
+            return Effect::None;
+        }
+        let ms = self.arm_countdown_ms();
+        self.state.selected = index;
+        self.state.focus = sbm_gfx::Focus::Cards;
+        self.state.countdown_ms = Some(ms);
+        self.state.countdown_total_ms = ms;
+        self.state.anim_ms = 160;
+        self.ensure_selected_visible(width, height);
+        Effect::Redraw
+    }
+
+    /// Scroll the multi-drive storage workspace vertically by `delta` pixels.
+    pub fn scroll_by(&mut self, delta: i32, width: u32, height: u32) -> Effect {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+            || delta == 0
+        {
+            return Effect::None;
+        }
+        let spec = self.system_spec(width, height);
+        let map = layout_experimental_scrolled(
+            self.layout,
+            width,
+            height,
+            &spec,
+            &self.state,
+            self.scroll_y,
+        );
+        let next = (self.scroll_y as i64 + delta as i64).clamp(0, map.max_scroll_y as i64) as u32;
+        if next != self.scroll_y {
+            self.scroll_y = next;
+            Effect::Redraw
+        } else {
+            Effect::None
+        }
+    }
+
+    /// True when `(x, y)` lies on the experimental storage scrollbar track (starts drag).
+    pub fn on_scroll_track(&self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+        {
+            return false;
+        }
+        let spec = self.system_spec(width, height);
+        let map = layout_experimental_scrolled(
+            self.layout,
+            width,
+            height,
+            &spec,
+            &self.state,
+            self.scroll_y,
+        );
+        map.scroll_track.is_some_and(|r| r.contains(x, y))
+    }
+
+    /// Scrub `scroll_y` continuously while dragging the scrollbar thumb.
+    pub fn scroll_drag(&mut self, y: u32, width: u32, height: u32) -> Effect {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+        {
+            return Effect::None;
+        }
+        let spec = self.system_spec(width, height);
+        let map = layout_experimental_scrolled(
+            self.layout,
+            width,
+            height,
+            &spec,
+            &self.state,
+            self.scroll_y,
+        );
+        if let Some(track) = map.scroll_track
+            && map.max_scroll_y > 0
+        {
+            let thumb_h = map.scroll_thumb.map(|t| t.h).unwrap_or(24);
+            let travel = track.h.saturating_sub(thumb_h).max(1);
+            let rel = y.saturating_sub(track.y + thumb_h / 2).min(travel);
+            let target = ((rel as u64 * map.max_scroll_y as u64) / travel as u64) as u32;
+            let clamped = target.min(map.max_scroll_y);
+            if clamped != self.scroll_y {
+                self.scroll_y = clamped;
+                return Effect::Redraw;
+            }
+        }
+        Effect::None
+    }
+
+    /// Auto-scroll the storage viewport so the drive holding `state.selected` is visible.
+    fn ensure_selected_visible(&mut self, width: u32, height: u32) {
+        if self.layout == LayoutMode::Classic || self.state.screen != Screen::Menu {
+            return;
+        }
+        let spec = self.system_spec(width, height);
+        let map = layout_experimental_scrolled(
+            self.layout,
+            width,
+            height,
+            &spec,
+            &self.state,
+            self.scroll_y,
+        );
+        if map.max_scroll_y == 0 {
+            self.scroll_y = 0;
+            return;
+        }
+        if let Some((top, bottom)) = map.selected_drive_band {
+            let mut next = self.scroll_y.min(map.max_scroll_y);
+            if top < next {
+                next = top;
+            } else if bottom > next.saturating_add(map.viewport_h) {
+                next = bottom.saturating_sub(map.viewport_h);
+            }
+            self.scroll_y = next.min(map.max_scroll_y);
+        }
+    }
+
     /// Simulated reset: volatile variables are gone; discovery, policy and
     /// the ESP state files run again.
     pub fn boot(&mut self) {
         self.boots += 1;
         self.sim = None;
+        self.elapsed_ms = 0;
+        self.scroll_y = 0;
         self.core_plan = None;
         self.machine.reset();
         self.picker = Picker::start(&mut self.machine, &mut || false);
@@ -146,6 +323,14 @@ impl Session {
             self.cards(),
             self.state.selected,
         );
+        if self.layout != LayoutMode::Classic
+            && self.state.screen == Screen::Menu
+            && self.state.focus == sbm_gfx::Focus::Cards
+            && matches!(input, Some(Input::Activate))
+            && self.state.countdown_ms.is_none()
+        {
+            return self.arm_card(self.state.selected, width, height);
+        }
         self.drive(input, width, height, 0)
     }
 
@@ -156,14 +341,61 @@ impl Session {
         let before = self.state.cursor;
         self.state.cursor = Some((pointer.x, pointer.y));
         let input = if self.state.screen == Screen::Menu {
-            menu_input(
-                None,
-                &pointer,
-                width,
-                height,
-                self.cards(),
-                self.state.selected,
-            )
+            if self.layout == LayoutMode::Classic {
+                menu_input(
+                    None,
+                    &pointer,
+                    width,
+                    height,
+                    self.cards(),
+                    self.state.selected,
+                )
+            } else {
+                let spec = self.system_spec(width, height);
+                let map = layout_experimental_scrolled(
+                    self.layout,
+                    width,
+                    height,
+                    &spec,
+                    &self.state,
+                    self.scroll_y,
+                );
+                match map.hit_test_experimental(pointer.x, pointer.y) {
+                    ExperimentalHit::AbortAutoboot if pointer.clicked => {
+                        return self.abort_autoboot();
+                    }
+                    ExperimentalHit::ScrollDelta(delta) if pointer.clicked => {
+                        return self.scroll_by(delta, width, height);
+                    }
+                    ExperimentalHit::ScrollTo(target) if pointer.clicked => {
+                        let clamped = target.min(map.max_scroll_y);
+                        if clamped != self.scroll_y {
+                            self.scroll_y = clamped;
+                            return Effect::Redraw;
+                        }
+                        None
+                    }
+                    ExperimentalHit::Card(index) if pointer.clicked => {
+                        let already_counting = self.state.focus == sbm_gfx::Focus::Cards
+                            && self.state.selected == index
+                            && self.state.countdown_ms.is_some();
+                        if already_counting {
+                            Some(Input::ClickCard(index))
+                        } else {
+                            return self.arm_card(index, width, height);
+                        }
+                    }
+                    ExperimentalHit::Card(_) if pointer.moved => {
+                        // Hover updates visual highlight & LBA inspect via `state.cursor`
+                        // without hijacking `state.selected` or an armed autoboot countdown.
+                        None
+                    }
+                    ExperimentalHit::Action(index) if pointer.clicked => {
+                        Some(Input::ClickAction(index))
+                    }
+                    _ => None,
+                }
+            }
         } else if pointer.clicked {
             Some(Input::Escape)
         } else {
@@ -181,13 +413,24 @@ impl Session {
         if self.sim.is_some() {
             return Effect::None;
         }
+        let before_settled = self.discovery.settled_count(self.elapsed_ms);
+        self.elapsed_ms = self.elapsed_ms.saturating_add(dt_ms);
+        let probe_changed = self.layout != LayoutMode::Classic
+            && self.discovery.settled_count(self.elapsed_ms) != before_settled;
         let shown = self.state.countdown_ms.map(|ms| ms.div_ceil(1000));
+        let flashing = self.layout != LayoutMode::Classic
+            && self.state.screen == Screen::Menu
+            && self.state.countdown_ms.is_some();
         let animating = self.state.anim_ms > 0;
         let effect = self.drive(None, width, height, dt_ms);
         if effect != Effect::None {
             return effect;
         }
-        if animating || shown != self.state.countdown_ms.map(|ms| ms.div_ceil(1000)) {
+        if probe_changed
+            || animating
+            || flashing
+            || shown != self.state.countdown_ms.map(|ms| ms.div_ceil(1000))
+        {
             Effect::Redraw
         } else {
             Effect::None
@@ -198,14 +441,48 @@ impl Session {
     pub fn animating(&self) -> bool {
         self.sim.is_none()
             && self.state.screen == Screen::Menu
-            && (self.state.anim_ms > 0 || self.state.countdown_ms.is_some())
+            && (self.state.anim_ms > 0
+                || self.state.countdown_ms.is_some()
+                || (self.layout != LayoutMode::Classic
+                    && self.discovery.is_probing(self.elapsed_ms)))
+    }
+
+    pub fn system_spec(&self, width: u32, height: u32) -> sbm_gfx::hardware::SystemSpec {
+        build_system_spec(
+            &self.machine,
+            &self.picker.entries,
+            &self.picker.visible,
+            self.last_reason,
+            self.discovery,
+            self.elapsed_ms,
+            width,
+            height,
+        )
     }
 
     fn drive(&mut self, input: Option<Input>, width: u32, height: u32, dt_ms: u32) -> Effect {
         let cards = self.cards();
-        let cols = layout_menu(width, height, cards, 3, self.state.selected).cols;
+        let cols = if self.layout == LayoutMode::Classic {
+            layout_menu(width, height, cards, 3, self.state.selected).cols
+        } else {
+            let spec = self.system_spec(width, height);
+            layout_experimental_scrolled(
+                self.layout,
+                width,
+                height,
+                &spec,
+                &self.state,
+                self.scroll_y,
+            )
+            .cols
+            .max(1)
+        };
+        let prev_selected = self.state.selected;
         let had_input = input.is_some();
         let outcome = step(&mut self.state, input, cards, cols, dt_ms);
+        if self.state.selected != prev_selected {
+            self.ensure_selected_visible(width, height);
+        }
         let effect = match outcome {
             Outcome::Boot => match self.picker.entry_for_card(self.state.selected) {
                 Some(index) => self.boot_at(index),
@@ -407,6 +684,11 @@ impl Session {
     pub fn render(&self, fb: &mut Framebuffer) {
         match &self.sim {
             Some(screen) => overlay::paint_sim_screen(fb, self.state.dark, screen),
+            None if self.state.screen == Screen::Menu && self.layout != LayoutMode::Classic => {
+                let spec = self.system_spec(fb.width, fb.height);
+                let _ =
+                    paint_experimental_scrolled(fb, self.layout, &spec, &self.state, self.scroll_y);
+            }
             None => {
                 let lines = self.diagnostics(fb.width, fb.height);
                 paint_current(

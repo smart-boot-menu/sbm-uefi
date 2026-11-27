@@ -19,7 +19,7 @@ path = "src/main.rs"
 minifb = { version = "0.29", optional = true }
 png = "0.18"
 sbm-boot = { path = "../sbm-boot" }
-sbm-gfx = { path = "../sbm-gfx" }
+sbm-gfx = { path = "../sbm-gfx", features = ["experimental-layouts"] }
 sbm-menu = { path = "../sbm-menu" }
 sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }
