@@ -14,8 +14,8 @@ use alloc::vec::Vec;
 
 use sbm_boot::{DiscoveredTarget, compare_targets, selectable, visible};
 use sbm_gfx::{
-    CardView, Framebuffer, Hit, Input, MenuState, Screen, hit_test, layout_menu, paint_diagnostics,
-    paint_error, paint_menu,
+    CardView, FontMode, Framebuffer, Hit, Input, MenuState, Screen, TextRenderer, UiScale,
+    hit_test, layout_menu, paint_diagnostics_with, paint_error_with, paint_menu_with,
 };
 use sbm_types::{BootTargetId, BootTargetKind, CpuArch, OsFamily, SecureBootState};
 
@@ -208,15 +208,36 @@ pub fn paint_current(
     state: &MenuState,
     lines: &[String],
 ) {
+    let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, fb.height, UiScale::default());
+    paint_current_with(
+        fb,
+        entries,
+        visible_index,
+        state,
+        lines,
+        false,
+        &mut renderer,
+    );
+}
+
+pub fn paint_current_with(
+    fb: &mut Framebuffer,
+    entries: &[MenuEntry],
+    visible_index: &[usize],
+    state: &MenuState,
+    lines: &[String],
+    high_contrast: bool,
+    renderer: &mut TextRenderer<'_>,
+) {
     match state.screen {
-        Screen::Error => paint_error(fb, state.dark, &state.message),
+        Screen::Error => paint_error_with(fb, state.dark, high_contrast, &state.message, renderer),
         Screen::Diagnostics => {
             let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
-            paint_diagnostics(fb, state.dark, &borrowed);
+            paint_diagnostics_with(fb, state.dark, high_contrast, &borrowed, renderer);
         }
         Screen::Menu => {
             let cards = cards(entries, visible_index);
-            paint_menu(fb, &cards, state);
+            paint_menu_with(fb, &cards, state, high_contrast, renderer);
         }
     }
 }

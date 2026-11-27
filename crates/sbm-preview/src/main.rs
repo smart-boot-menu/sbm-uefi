@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::{
-    DISPLAY_PRESETS, DiscoveryMode, DiscoverySchedule, LayoutMode, Session, core, load_session,
-    parse_resolution, parse_script, render, run_script, write_image,
+    DISPLAY_PRESETS, DiscoveryMode, DiscoverySchedule, FontMode, LayoutMode, Session, UiScale,
+    core, load_session, parse_resolution, parse_script, render, run_script, write_image,
 };
 
 #[cfg(feature = "window")]
@@ -16,9 +16,11 @@ sbm-preview: native Smart Boot Menu UEFI preview against a simulated computer
 
   sbm-preview [--scenario NAME|PATH] [--theme dark|light] [--display window|WxH]
               [--layout classic|bento|schematic|storage]
+              [--font next-mono|next|bitmap] [--contrast normal|high] [--scale 75..200]
               [--discovery instant|progressive|slow|sparse] [--delay-ms N]
   sbm-preview --headless [--scenario NAME] [--screen menu|splash|diagnostics|error|all]
               [--layout classic|bento|schematic|storage|experiments|all]
+              [--font next-mono|next|bitmap|all] [--contrast normal|high|both] [--scale N]
               [--discovery instant|progressive|slow|sparse] [--delay-ms N] [--at-ms N]
               [--theme dark|light|both] [--keys Right,Enter,wait:1000]
               [--size 1280x800 | --sizes 800x600,1280x800,1920x1080|all] [--out FILE.png|DIR]
@@ -29,6 +31,9 @@ Options
   --scenario      scenario name from sim/scenarios or a TOML path (default dual-boot)
   --all-scenarios headless: render every scenario
   --layout        classic, bento (A), schematic (B), storage (C), experiments, or all
+  --font          next-mono (default), next, bitmap, or all (headless comparison)
+  --contrast      normal (default), high, or both (headless comparison)
+  --scale         UI typography scale percentage 75..=200 (default 100)
   --discovery     instant (default), progressive, slow, or sparse (missing SMBIOS)
   --delay-ms      total progressive discovery duration in ms
   --at-ms         headless: capture progressive discovery at N ms after boot
@@ -46,6 +51,10 @@ pub struct Options {
     pub scenario: String,
     pub all_scenarios: bool,
     pub layouts: Vec<LayoutMode>,
+    pub fonts: Vec<FontMode>,
+    pub high_contrast: bool,
+    pub both_contrasts: bool,
+    pub scale: UiScale,
     pub discovery: DiscoverySchedule,
     pub at_ms: Option<u32>,
     pub scroll: u32,
@@ -62,6 +71,23 @@ pub struct Options {
     pub exit_after_ms: Option<u64>,
     pub materialize: Option<PathBuf>,
     pub started: Instant,
+}
+
+fn parse_fonts(text: &str) -> Result<Vec<FontMode>, String> {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower == "all" {
+        return Ok(FontMode::ALL.to_vec());
+    }
+    let mut out = Vec::new();
+    for tok in lower.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mode = FontMode::parse(tok)
+            .ok_or_else(|| format!("unknown font {tok:?} (next-mono|next|bitmap|all)"))?;
+        out.push(mode);
+    }
+    if out.is_empty() {
+        return Err("--font requires at least one font mode".into());
+    }
+    Ok(out)
 }
 
 fn parse_layouts(text: &str) -> Result<Vec<LayoutMode>, String> {
@@ -90,6 +116,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         scenario: "dual-boot".into(),
         all_scenarios: false,
         layouts: vec![LayoutMode::Classic],
+        fonts: vec![FontMode::AtkinsonNextMono],
+        high_contrast: false,
+        both_contrasts: false,
+        scale: UiScale::default(),
         discovery: DiscoverySchedule::default(),
         at_ms: None,
         scroll: 0,
@@ -114,6 +144,23 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--scenario" => opts.scenario = value()?,
             "--all-scenarios" => opts.all_scenarios = true,
             "--layout" => opts.layouts = parse_layouts(&value()?)?,
+            "--font" => opts.fonts = parse_fonts(&value()?)?,
+            "--contrast" => match value()?.to_ascii_lowercase().as_str() {
+                "normal" => {
+                    opts.high_contrast = false;
+                    opts.both_contrasts = false;
+                }
+                "high" | "hc" => {
+                    opts.high_contrast = true;
+                    opts.both_contrasts = false;
+                }
+                "both" => opts.both_contrasts = true,
+                other => return Err(format!("unknown contrast {other:?} (normal|high|both)")),
+            },
+            "--scale" => {
+                let pct: u16 = value()?.parse().map_err(|_| "invalid --scale (75..=200)")?;
+                opts.scale = UiScale::new(pct);
+            }
             "--discovery" => {
                 let raw = value()?;
                 opts.discovery.mode = DiscoveryMode::parse(&raw).ok_or_else(|| {
@@ -241,6 +288,11 @@ fn headless(opts: &Options) -> Result<(), String> {
     } else {
         vec![opts.dark]
     };
+    let contrasts: Vec<bool> = if opts.both_contrasts {
+        vec![false, true]
+    } else {
+        vec![opts.high_contrast]
+    };
     let sizes: Vec<(u32, u32)> = if opts.sizes.is_empty() {
         vec![opts.size]
     } else {
@@ -248,76 +300,103 @@ fn headless(opts: &Options) -> Result<(), String> {
     };
     let multi_size = sizes.len() > 1;
     let multi_layout = opts.layouts.len() > 1 || opts.layouts[0] != LayoutMode::Classic;
+    let multi_font = opts.fonts.len() > 1 || opts.fonts[0] != FontMode::AtkinsonNextMono;
+    let multi_contrast = contrasts.len() > 1 || contrasts[0];
     let single = names.len() == 1
         && screens.len() == 1
         && themes.len() == 1
+        && contrasts.len() == 1
         && opts.layouts.len() == 1
+        && opts.fonts.len() == 1
         && !multi_size;
     for &(width, height) in &sizes {
         for &layout in &opts.layouts {
-            for name in &names {
-                for screen in &screens {
-                    for dark in &themes {
-                        let started = Instant::now();
-                        let Some(mut session) = scripted(
-                            name,
-                            *dark,
-                            layout,
-                            opts.discovery,
-                            opts.at_ms,
-                            screen,
-                            &opts.keys,
-                            width,
-                            height,
-                        )?
-                        else {
-                            println!("skip {name} {screen}: this scenario has no such state");
-                            continue;
-                        };
-                        if opts.scroll > 0 {
-                            let _ = session.scroll_by(opts.scroll as i32, width, height);
-                        }
-                        let mut fb = sbm_gfx::Framebuffer::new(width, height);
-                        if *screen == "splash" {
-                            session.render_splash(&mut fb);
-                        } else {
-                            fb = render(&session, width, height);
-                        }
-                        let theme = if *dark { "dark" } else { "light" };
-                        let filename = match (multi_layout, multi_size) {
-                            (true, true) => format!(
-                                "uefi-{name}-{}-{screen}-{theme}-{width}x{height}.png",
-                                layout.id()
-                            ),
-                            (true, false) => {
-                                format!("uefi-{name}-{}-{screen}-{theme}.png", layout.id())
+            for &font in &opts.fonts {
+                for name in &names {
+                    for screen in &screens {
+                        for &dark in &themes {
+                            for &high_contrast in &contrasts {
+                                let started = Instant::now();
+                                let Some(mut session) = scripted(
+                                    name,
+                                    dark,
+                                    high_contrast,
+                                    layout,
+                                    font,
+                                    opts.scale,
+                                    opts.discovery,
+                                    opts.at_ms,
+                                    screen,
+                                    &opts.keys,
+                                    width,
+                                    height,
+                                )?
+                                else {
+                                    println!(
+                                        "skip {name} {screen}: this scenario has no such state"
+                                    );
+                                    continue;
+                                };
+                                if opts.scroll > 0 {
+                                    let _ = session.scroll_by(opts.scroll as i32, width, height);
+                                }
+                                let mut fb = sbm_gfx::Framebuffer::new(width, height);
+                                if *screen == "splash" {
+                                    session.render_splash(&mut fb);
+                                } else {
+                                    fb = render(&session, width, height);
+                                }
+                                let theme = if dark { "dark" } else { "light" };
+                                let mut parts = vec![format!("uefi-{name}")];
+                                if multi_layout {
+                                    parts.push(layout.id().into());
+                                }
+                                if multi_font {
+                                    parts.push(font.id().into());
+                                }
+                                parts.push((*screen).into());
+                                parts.push(theme.into());
+                                if multi_contrast {
+                                    parts.push(if high_contrast { "hc" } else { "std" }.into());
+                                }
+                                if opts.scale != UiScale::default() {
+                                    parts.push(format!("{}pct", opts.scale.percent()));
+                                }
+                                if multi_size {
+                                    parts.push(format!("{width}x{height}"));
+                                }
+                                let filename = format!("{}.png", parts.join("-"));
+                                let path = match (&opts.out, single) {
+                                    (Some(path), true) if path.extension().is_some() => {
+                                        path.clone()
+                                    }
+                                    (Some(dir), _) => dir.join(&filename),
+                                    (None, _) => out_dir().join(&filename),
+                                };
+                                let bytes = write_image(&path, &fb)?;
+                                let stats = session.renderer_stats();
+                                println!(
+                                    "SIMULATED preview {} ({}x{}, layout {}, font {}, {}%, {}, discovery {}, {} glyphs/{} B, {} bytes, {} screen, {:.1} ms)",
+                                    path.display(),
+                                    width,
+                                    height,
+                                    layout.id(),
+                                    font.id(),
+                                    opts.scale.percent(),
+                                    if high_contrast { "hc" } else { "std" },
+                                    opts.discovery.mode.id(),
+                                    stats.entries,
+                                    stats.bytes,
+                                    bytes,
+                                    if *screen == "splash" {
+                                        "splash"
+                                    } else {
+                                        session.screen_name()
+                                    },
+                                    started.elapsed().as_secs_f64() * 1000.0
+                                );
                             }
-                            (false, true) => {
-                                format!("uefi-{name}-{screen}-{theme}-{width}x{height}.png")
-                            }
-                            (false, false) => format!("uefi-{name}-{screen}-{theme}.png"),
-                        };
-                        let path = match (&opts.out, single) {
-                            (Some(path), true) if path.extension().is_some() => path.clone(),
-                            (Some(dir), _) => dir.join(&filename),
-                            (None, _) => out_dir().join(&filename),
-                        };
-                        let bytes = write_image(&path, &fb)?;
-                        println!(
-                            "SIMULATED preview {} ({}x{}, layout {}, discovery {}, {} bytes, {} screen, {:.1} ms)",
-                            path.display(),
-                            width,
-                            height,
-                            layout.id(),
-                            opts.discovery.mode.id(),
-                            bytes,
-                            if *screen == "splash" {
-                                "splash"
-                            } else {
-                                session.screen_name()
-                            },
-                            started.elapsed().as_secs_f64() * 1000.0
-                        );
+                        }
                     }
                 }
             }
@@ -332,7 +411,10 @@ fn headless(opts: &Options) -> Result<(), String> {
 fn scripted(
     name: &str,
     dark: bool,
+    high_contrast: bool,
     layout: LayoutMode,
+    font: FontMode,
+    scale: UiScale,
     discovery: DiscoverySchedule,
     at_ms: Option<u32>,
     screen: &str,
@@ -343,6 +425,9 @@ fn scripted(
     let steps = parse_script(keys)?;
     let mut session = load_session(name, dark)?;
     session.set_layout(layout);
+    session.set_font_mode(font);
+    session.set_high_contrast(high_contrast);
+    session.set_scale(scale);
     session.set_discovery(discovery);
     if let Some(ms) = at_ms {
         session.elapsed_ms = ms;
@@ -358,6 +443,9 @@ fn scripted(
             for index in 0..cards.max(1) {
                 let mut probe = load_session(name, dark)?;
                 probe.set_layout(layout);
+                probe.set_font_mode(font);
+                probe.set_high_contrast(high_contrast);
+                probe.set_scale(scale);
                 probe.set_discovery(discovery);
                 let mut script = vec!["right"; index].join(",");
                 script.push_str(if cards == 0 { "c" } else { ",enter" });

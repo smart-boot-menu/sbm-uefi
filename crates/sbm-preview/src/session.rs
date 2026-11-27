@@ -3,14 +3,19 @@
 //! `sbm_menu::flow::Picker` as the UEFI app; this file only adds the screens
 //! real firmware would hand to another program.
 
+use std::cell::RefCell;
+
 use sbm_gfx::hardware::{
-    ExperimentalHit, LayoutMode, layout_experimental_scrolled, paint_experimental_scrolled,
+    ExperimentalHit, LayoutMode, layout_experimental_with, paint_experimental_with,
 };
-use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_gfx::{
+    CacheStats, FontMode, Framebuffer, Input, MenuState, Outcome, Screen, TextRenderer, UiScale,
+    layout_menu, paint_splash_with, step,
+};
 use sbm_menu::flow::{HandoffVar, LaunchPlan, LaunchResult, Picker};
 use sbm_menu::{
-    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, StartFailure, countdown_ms,
-    diag_lines, menu_input, paint_current, recovery_position,
+    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, StartFailure, diag_lines, menu_input,
+    paint_current_with, recovery_position,
 };
 use sbm_types::{BootTargetKind, OsFamily, PlatformCapabilities};
 
@@ -72,6 +77,10 @@ pub struct Session {
     pub help: bool,
     pub layout: LayoutMode,
     pub discovery: DiscoverySchedule,
+    pub font_mode: FontMode,
+    pub high_contrast: bool,
+    pub scale: UiScale,
+    renderer: RefCell<TextRenderer<'static>>,
     pub elapsed_ms: u32,
     pub scroll_y: u32,
     menu_us: u64,
@@ -100,6 +109,8 @@ impl Session {
     ) -> Self {
         machine.reset();
         let picker = Picker::start(&mut machine, &mut || false);
+        let font_mode = FontMode::AtkinsonNextMono;
+        let scale = UiScale::default();
         let mut session = Self {
             machine,
             picker,
@@ -108,6 +119,10 @@ impl Session {
             help: false,
             layout,
             discovery,
+            font_mode,
+            high_contrast: false,
+            scale,
+            renderer: RefCell::new(TextRenderer::new(font_mode, 800, scale)),
             elapsed_ms: 0,
             scroll_y: 0,
             menu_us: 0,
@@ -130,7 +145,26 @@ impl Session {
         self.elapsed_ms = 0;
     }
 
-    /// Abort any active autoboot countdown without moving focus or launching a target.
+    pub fn set_font_mode(&mut self, mode: FontMode) {
+        self.font_mode = mode;
+        self.renderer.borrow_mut().set_mode(mode);
+    }
+
+    pub fn set_high_contrast(&mut self, high_contrast: bool) {
+        self.high_contrast = high_contrast;
+    }
+
+    pub fn set_scale(&mut self, scale: UiScale) {
+        self.scale = scale;
+        self.renderer.borrow_mut().set_scale(scale);
+        self.scroll_y = 0;
+    }
+
+    pub fn renderer_stats(&self) -> CacheStats {
+        self.renderer.borrow().cache_stats()
+    }
+
+    /// Abort any active policy autoboot countdown without moving focus or launching a target.
     pub fn abort_autoboot(&mut self) -> Effect {
         if self.state.countdown_ms.take().is_some() {
             Effect::Redraw
@@ -139,25 +173,33 @@ impl Session {
         }
     }
 
-    fn arm_countdown_ms(&self) -> u32 {
-        countdown_ms(Some(self.picker.policy.timeout_seconds))
-            .filter(|&ms| ms > 0)
-            .unwrap_or(5_000)
-    }
-
-    /// Select a bootable card and start its autoboot countdown (first click).
-    fn arm_card(&mut self, index: usize, width: u32, height: u32) -> Effect {
+    /// Select a bootable partition on first click and cancel any active policy
+    /// countdown. Never starts a new automatic boot timer.
+    fn select_card(&mut self, index: usize, width: u32, height: u32) -> Effect {
         if index >= self.cards() {
             return Effect::None;
         }
-        let ms = self.arm_countdown_ms();
         self.state.selected = index;
         self.state.focus = sbm_gfx::Focus::Cards;
-        self.state.countdown_ms = Some(ms);
-        self.state.countdown_total_ms = ms;
+        self.state.countdown_ms = None;
         self.state.anim_ms = 160;
         self.ensure_selected_visible(width, height);
         Effect::Redraw
+    }
+
+    fn experimental_hit_map(&self, width: u32, height: u32) -> sbm_gfx::hardware::LayoutHitMap {
+        let spec = self.system_spec(width, height);
+        let mut renderer = self.renderer.borrow_mut();
+        layout_experimental_with(
+            self.layout,
+            width,
+            height,
+            &spec,
+            &self.state,
+            self.scroll_y,
+            self.high_contrast,
+            &mut renderer,
+        )
     }
 
     /// Scroll the multi-drive storage workspace vertically by `delta` pixels.
@@ -169,15 +211,7 @@ impl Session {
         {
             return Effect::None;
         }
-        let spec = self.system_spec(width, height);
-        let map = layout_experimental_scrolled(
-            self.layout,
-            width,
-            height,
-            &spec,
-            &self.state,
-            self.scroll_y,
-        );
+        let map = self.experimental_hit_map(width, height);
         let next = (self.scroll_y as i64 + delta as i64).clamp(0, map.max_scroll_y as i64) as u32;
         if next != self.scroll_y {
             self.scroll_y = next;
@@ -195,15 +229,7 @@ impl Session {
         {
             return false;
         }
-        let spec = self.system_spec(width, height);
-        let map = layout_experimental_scrolled(
-            self.layout,
-            width,
-            height,
-            &spec,
-            &self.state,
-            self.scroll_y,
-        );
+        let map = self.experimental_hit_map(width, height);
         map.scroll_track.is_some_and(|r| r.contains(x, y))
     }
 
@@ -215,15 +241,7 @@ impl Session {
         {
             return Effect::None;
         }
-        let spec = self.system_spec(width, height);
-        let map = layout_experimental_scrolled(
-            self.layout,
-            width,
-            height,
-            &spec,
-            &self.state,
-            self.scroll_y,
-        );
+        let map = self.experimental_hit_map(width, height);
         if let Some(track) = map.scroll_track
             && map.max_scroll_y > 0
         {
@@ -245,15 +263,7 @@ impl Session {
         if self.layout == LayoutMode::Classic || self.state.screen != Screen::Menu {
             return;
         }
-        let spec = self.system_spec(width, height);
-        let map = layout_experimental_scrolled(
-            self.layout,
-            width,
-            height,
-            &spec,
-            &self.state,
-            self.scroll_y,
-        );
+        let map = self.experimental_hit_map(width, height);
         if map.max_scroll_y == 0 {
             self.scroll_y = 0;
             return;
@@ -323,14 +333,6 @@ impl Session {
             self.cards(),
             self.state.selected,
         );
-        if self.layout != LayoutMode::Classic
-            && self.state.screen == Screen::Menu
-            && self.state.focus == sbm_gfx::Focus::Cards
-            && matches!(input, Some(Input::Activate))
-            && self.state.countdown_ms.is_none()
-        {
-            return self.arm_card(self.state.selected, width, height);
-        }
         self.drive(input, width, height, 0)
     }
 
@@ -351,15 +353,7 @@ impl Session {
                     self.state.selected,
                 )
             } else {
-                let spec = self.system_spec(width, height);
-                let map = layout_experimental_scrolled(
-                    self.layout,
-                    width,
-                    height,
-                    &spec,
-                    &self.state,
-                    self.scroll_y,
-                );
+                let map = self.experimental_hit_map(width, height);
                 match map.hit_test_experimental(pointer.x, pointer.y) {
                     ExperimentalHit::AbortAutoboot if pointer.clicked => {
                         return self.abort_autoboot();
@@ -376,18 +370,21 @@ impl Session {
                         None
                     }
                     ExperimentalHit::Card(index) if pointer.clicked => {
-                        let already_counting = self.state.focus == sbm_gfx::Focus::Cards
-                            && self.state.selected == index
-                            && self.state.countdown_ms.is_some();
-                        if already_counting {
+                        // Safe two-step click on dense partition maps:
+                        // - Clicking an unselected partition selects it & cancels any policy
+                        //   countdown (never boots on first click and never arms a new timer).
+                        // - Clicking the already-selected partition boots it immediately.
+                        let already_selected = self.state.focus == sbm_gfx::Focus::Cards
+                            && self.state.selected == index;
+                        if already_selected {
                             Some(Input::ClickCard(index))
                         } else {
-                            return self.arm_card(index, width, height);
+                            return self.select_card(index, width, height);
                         }
                     }
                     ExperimentalHit::Card(_) if pointer.moved => {
                         // Hover updates visual highlight & LBA inspect via `state.cursor`
-                        // without hijacking `state.selected` or an armed autoboot countdown.
+                        // without changing `state.selected` or touching policy countdown.
                         None
                     }
                     ExperimentalHit::Action(index) if pointer.clicked => {
@@ -465,17 +462,7 @@ impl Session {
         let cols = if self.layout == LayoutMode::Classic {
             layout_menu(width, height, cards, 3, self.state.selected).cols
         } else {
-            let spec = self.system_spec(width, height);
-            layout_experimental_scrolled(
-                self.layout,
-                width,
-                height,
-                &spec,
-                &self.state,
-                self.scroll_y,
-            )
-            .cols
-            .max(1)
+            self.experimental_hit_map(width, height).cols.max(1)
         };
         let prev_selected = self.state.selected;
         let had_input = input.is_some();
@@ -668,7 +655,16 @@ impl Session {
                 integrity: self.picker.integrity_note.as_deref(),
             },
         );
+        let cache = self.renderer.borrow().cache_stats();
         lines.push(format!("scenario {} ({})", scenario.id, scenario.name));
+        lines.push(format!(
+            "typography {}  scale {}%  contrast {}  glyphs {} ({} B)",
+            self.font_mode.label(),
+            self.scale.percent(),
+            if self.high_contrast { "high" } else { "normal" },
+            cache.entries,
+            cache.bytes
+        ));
         lines.push(format!(
             "policy decision {}  attempts {}",
             self.last_reason,
@@ -682,31 +678,54 @@ impl Session {
     }
 
     pub fn render(&self, fb: &mut Framebuffer) {
+        let mut renderer = self.renderer.borrow_mut();
         match &self.sim {
-            Some(screen) => overlay::paint_sim_screen(fb, self.state.dark, screen),
+            Some(screen) => overlay::paint_sim_screen(
+                fb,
+                self.state.dark,
+                self.high_contrast,
+                screen,
+                &mut renderer,
+            ),
             None if self.state.screen == Screen::Menu && self.layout != LayoutMode::Classic => {
                 let spec = self.system_spec(fb.width, fb.height);
-                let _ =
-                    paint_experimental_scrolled(fb, self.layout, &spec, &self.state, self.scroll_y);
+                let _ = paint_experimental_with(
+                    fb,
+                    self.layout,
+                    &spec,
+                    &self.state,
+                    self.scroll_y,
+                    self.high_contrast,
+                    &mut renderer,
+                );
             }
             None => {
+                drop(renderer);
                 let lines = self.diagnostics(fb.width, fb.height);
-                paint_current(
+                let mut renderer = self.renderer.borrow_mut();
+                paint_current_with(
                     fb,
                     &self.picker.entries,
                     &self.picker.visible,
                     &self.state,
                     &lines,
+                    self.high_contrast,
+                    &mut renderer,
                 );
+                if self.help {
+                    overlay::paint_help(fb, self.state.dark, self.high_contrast, &mut renderer);
+                }
+                return;
             }
         }
         if self.help {
-            overlay::paint_help(fb, self.state.dark);
+            overlay::paint_help(fb, self.state.dark, self.high_contrast, &mut renderer);
         }
     }
 
     pub fn render_splash(&self, fb: &mut Framebuffer) {
-        paint_splash(fb, self.state.dark);
+        let mut renderer = self.renderer.borrow_mut();
+        paint_splash_with(fb, self.state.dark, self.high_contrast, &mut renderer);
     }
 
     pub fn screen_name(&self) -> &'static str {

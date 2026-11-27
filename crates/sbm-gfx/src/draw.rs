@@ -36,15 +36,18 @@ impl Rgba {
             ch(self.b(), other.b()),
         )
     }
+
+    /// Relative luminance approximation (`0..=255`) for contrast-aware blending.
+    pub const fn luma(self) -> u8 {
+        (((self.r() as u32) * 54 + (self.g() as u32) * 183 + (self.b() as u32) * 19) >> 8) as u8
+    }
 }
 
 pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
     pub px: Vec<u32>,
-    #[cfg(feature = "experimental-layouts")]
-    clip: Option<(u32, u32, u32, u32)>,
-    #[cfg(feature = "experimental-layouts")]
+    clip: (u32, u32, u32, u32),
     y_bias: i32,
 }
 
@@ -55,35 +58,37 @@ impl Framebuffer {
             width,
             height,
             px: alloc::vec![0; len],
-            #[cfg(feature = "experimental-layouts")]
-            clip: None,
-            #[cfg(feature = "experimental-layouts")]
+            clip: (0, 0, width, height),
             y_bias: 0,
         }
     }
 
     /// Constrain subsequent draw calls to `(x, y, w, h)` while translating all
-    /// `y` coordinates by `y_bias` (used for pixel-exact scrollable viewports).
-    #[cfg(feature = "experimental-layouts")]
+    /// content `y` coordinates by `y_bias` (pixel-exact scrollable viewports).
     pub fn set_viewport(&mut self, x: u32, y: u32, w: u32, h: u32, y_bias: i32) {
         let x0 = x.min(self.width);
         let y0 = y.min(self.height);
         let x1 = x.saturating_add(w).min(self.width);
         let y1 = y.saturating_add(h).min(self.height);
-        self.clip = Some((x0, y0, x1, y1));
+        self.clip = (x0, y0, x1, y1);
         self.y_bias = y_bias;
     }
 
-    #[cfg(feature = "experimental-layouts")]
     pub fn clear_viewport(&mut self) {
-        self.clip = None;
+        self.clip = (0, 0, self.width, self.height);
         self.y_bias = 0;
     }
 
-    #[cfg(feature = "experimental-layouts")]
+    /// Active clip rectangle `(x0, y0, x1, y1)` in screen pixels.
     #[inline]
-    fn clip_bounds(&self) -> (u32, u32, u32, u32) {
-        self.clip.unwrap_or((0, 0, self.width, self.height))
+    pub const fn clip_bounds(&self) -> (u32, u32, u32, u32) {
+        self.clip
+    }
+
+    /// Active vertical translation in screen pixels (negative when scrolled down).
+    #[inline]
+    pub const fn y_bias(&self) -> i32 {
+        self.y_bias
     }
 
     pub fn pixel(&self, x: u32, y: u32) -> Option<Rgba> {
@@ -102,67 +107,37 @@ impl Framebuffer {
         if self.width == 0 || self.height == 0 || w == 0 || h == 0 {
             return;
         }
-        #[cfg(feature = "experimental-layouts")]
-        {
-            let (cx0, cy0, cx1, cy1) = self.clip_bounds();
-            let x0 = x.max(cx0).min(cx1);
-            let x1 = x.saturating_add(w).min(cx1);
-            if x0 >= x1 {
-                return;
-            }
-            let sy0 = (y as i64) + (self.y_bias as i64);
-            let sy1 = sy0 + (h as i64);
-            let y0 = sy0.max(cy0 as i64).min(cy1 as i64) as u32;
-            let y1 = sy1.max(cy0 as i64).min(cy1 as i64) as u32;
-            for row in y0..y1 {
-                let start = (row * self.width + x0) as usize;
-                let end = (row * self.width + x1) as usize;
-                self.px[start..end].fill(color.0);
-            }
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let x0 = x.max(cx0).min(cx1);
+        let x1 = x.saturating_add(w).min(cx1);
+        if x0 >= x1 {
+            return;
         }
-        #[cfg(not(feature = "experimental-layouts"))]
-        {
-            let x0 = x.min(self.width);
-            let y0 = y.min(self.height);
-            let x1 = x.saturating_add(w).min(self.width);
-            let y1 = y.saturating_add(h).min(self.height);
-            for row in y0..y1 {
-                let start = (row * self.width + x0) as usize;
-                let end = (row * self.width + x1) as usize;
-                self.px[start..end].fill(color.0);
-            }
+        let sy0 = (y as i64) + (self.y_bias as i64);
+        let sy1 = sy0 + (h as i64);
+        let y0 = sy0.max(cy0 as i64).min(cy1 as i64) as u32;
+        let y1 = sy1.max(cy0 as i64).min(cy1 as i64) as u32;
+        for row in y0..y1 {
+            let start = (row * self.width + x0) as usize;
+            let end = (row * self.width + x1) as usize;
+            self.px[start..end].fill(color.0);
         }
     }
 
-    pub fn plot(&mut self, x: u32, y: u32, color: Rgba) {
-        #[cfg(feature = "experimental-layouts")]
-        {
-            let (cx0, cy0, cx1, cy1) = self.clip_bounds();
-            let sy = (y as i64) + (self.y_bias as i64);
-            if x >= cx0 && x < cx1 && sy >= cy0 as i64 && sy < cy1 as i64 {
-                self.px[((sy as u32) * self.width + x) as usize] = color.0;
-            }
-        }
-        #[cfg(not(feature = "experimental-layouts"))]
-        {
-            if x < self.width && y < self.height {
-                self.px[(y * self.width + x) as usize] = color.0;
-            }
-        }
-    }
-
-    #[cfg(feature = "experimental-layouts")]
     #[inline]
-    pub fn blend_pixel(&mut self, x: u32, y: u32, color: Rgba, alpha: u8) {
-        if alpha == 0 {
-            return;
-        }
-        let (cx0, cy0, cx1, cy1) = self.clip_bounds();
+    pub fn plot(&mut self, x: u32, y: u32, color: Rgba) {
+        let (cx0, cy0, cx1, cy1) = self.clip;
         let sy = (y as i64) + (self.y_bias as i64);
-        if x < cx0 || x >= cx1 || sy < cy0 as i64 || sy >= cy1 as i64 {
-            return;
+        if x >= cx0 && x < cx1 && sy >= cy0 as i64 && sy < cy1 as i64 {
+            self.px[((sy as u32) * self.width + x) as usize] = color.0;
         }
-        let idx = ((sy as u32) * self.width + x) as usize;
+    }
+
+    /// Alpha-composite `color` with coverage `alpha` (`0..=255`) at pre-clipped
+    /// screen pixel `(sx, sy)` (used by vector/glyph inner loops after clipping).
+    #[inline]
+    pub(crate) fn blend_pixel_screen(&mut self, sx: u32, sy: u32, color: Rgba, alpha: u8) {
+        let idx = (sy * self.width + sx) as usize;
         if alpha == 255 {
             self.px[idx] = color.0;
             return;
@@ -176,10 +151,64 @@ impl Framebuffer {
         self.px[idx] = Rgba::rgb(r as u8, g as u8, b as u8).0;
     }
 
+    /// Linear-light (gamma ~2.0) alpha-composite at pre-clipped screen pixel `(sx, sy)`.
+    #[inline]
+    pub(crate) fn blend_pixel_linear_screen(&mut self, sx: u32, sy: u32, color: Rgba, alpha: u8) {
+        let idx = (sy * self.width + sx) as usize;
+        if alpha == 255 {
+            self.px[idx] = color.0;
+            return;
+        }
+        let bg = Rgba(self.px[idx]);
+        let a = u32::from(alpha);
+        let inv = 255 - a;
+        let blend_ch = |b: u8, f: u8| -> u8 {
+            let bl = u32::from(b) * u32::from(b);
+            let fl = u32::from(f) * u32::from(f);
+            let mixed = (bl * inv + fl * a + 127) / 255;
+            isqrt_u32(mixed).min(255) as u8
+        };
+        self.px[idx] = Rgba::rgb(
+            blend_ch(bg.r(), color.r()),
+            blend_ch(bg.g(), color.g()),
+            blend_ch(bg.b(), color.b()),
+        )
+        .0;
+    }
+
+    /// Alpha-composite `color` with coverage `alpha` (`0..=255`) onto content `(x, y)`.
+    #[inline]
+    pub fn blend_pixel(&mut self, x: u32, y: u32, color: Rgba, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let sy = (y as i64) + (self.y_bias as i64);
+        if x < cx0 || x >= cx1 || sy < cy0 as i64 || sy >= cy1 as i64 {
+            return;
+        }
+        self.blend_pixel_screen(x, sy as u32, color, alpha);
+    }
+
+    /// Linear-light (gamma ~2.0) alpha-composite for stem-weight-consistent
+    /// antialiased text and vector edges across both dark and light themes.
+    #[inline]
+    pub fn blend_pixel_linear(&mut self, x: u32, y: u32, color: Rgba, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        let (cx0, cy0, cx1, cy1) = self.clip;
+        let sy = (y as i64) + (self.y_bias as i64);
+        if x < cx0 || x >= cx1 || sy < cy0 as i64 || sy >= cy1 as i64 {
+            return;
+        }
+        self.blend_pixel_linear_screen(x, sy as u32, color, alpha);
+    }
+
     #[cfg(feature = "experimental-layouts")]
     pub fn fill_hatch(&mut self, x: u32, y: u32, w: u32, h: u32, step: u32, color: Rgba) {
         let step = step.max(4);
-        let (cx0, cy0, cx1, cy1) = self.clip_bounds();
+        let (cx0, cy0, cx1, cy1) = self.clip;
         let x0 = x.max(cx0).min(cx1);
         let x1 = x.saturating_add(w).min(cx1);
         if x0 >= x1 {
@@ -197,45 +226,6 @@ impl Framebuffer {
                     self.px[(py * self.width + px) as usize] = color.0;
                 }
             }
-        }
-    }
-
-    pub fn round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: Rgba) {
-        if w == 0 || h == 0 {
-            return;
-        }
-        let radius = radius.min(w / 2).min(h / 2);
-        for row in 0..h {
-            for col in 0..w {
-                if inside_round(col, row, w, h, radius) {
-                    self.plot(x.saturating_add(col), y.saturating_add(row), color);
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn round_panel(
-        &mut self,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        radius: u32,
-        thickness: u32,
-        fill: Rgba,
-        border: Rgba,
-    ) {
-        self.round_rect(x, y, w, h, radius, border);
-        if w > thickness * 2 && h > thickness * 2 {
-            self.round_rect(
-                x.saturating_add(thickness),
-                y.saturating_add(thickness),
-                w - thickness * 2,
-                h - thickness * 2,
-                radius.saturating_sub(thickness),
-                fill,
-            );
         }
     }
 
@@ -335,23 +325,6 @@ impl Framebuffer {
         self.vline(rx.saturating_sub(1), by.saturating_sub(len), len, color);
     }
 
-    #[cfg(feature = "experimental-layouts")]
-    pub fn circle_dot(&mut self, cx: u32, cy: u32, r: u32, color: Rgba) {
-        let ri = r as i32;
-        let r2 = ri * ri;
-        for dy in -ri..=ri {
-            for dx in -ri..=ri {
-                if dx * dx + dy * dy <= r2 {
-                    let px = cx as i32 + dx;
-                    let py = cy as i32 + dy;
-                    if px >= 0 && py >= 0 {
-                        self.plot(px as u32, py as u32, color);
-                    }
-                }
-            }
-        }
-    }
-
     pub fn to_ppm(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let header = alloc::format!("P6\n{} {}\n255\n", self.width, self.height);
@@ -363,6 +336,22 @@ impl Framebuffer {
             out.push(color.b());
         }
         out
+    }
+}
+
+/// Fast integer square root for `0..=65025` (8-bit squared channels).
+#[inline]
+fn isqrt_u32(v: u32) -> u32 {
+    if v <= 1 {
+        return v;
+    }
+    let mut x = 1u32 << (32 - v.leading_zeros()).div_ceil(2);
+    loop {
+        let next = (x + v / x) >> 1;
+        if next >= x {
+            return x;
+        }
+        x = next;
     }
 }
 
@@ -384,36 +373,24 @@ pub fn fit_text(text: &str, size: u32, max_width: u32) -> String {
     out
 }
 
-fn glyph_bits(ch: char) -> [u8; 8] {
-    let index = u32::from(ch);
-    if index < 128 {
-        FONT8X8[index as usize]
-    } else {
-        FONT8X8[b'?' as usize]
-    }
-}
+/// Draw a visible missing-glyph tofu box (`.notdef`) for legacy 8x8 mode
+/// rather than misleadingly substituting `'?'`.
+const NOTDEF_8X8: [u8; 8] = [0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00];
 
-fn inside_round(col: u32, row: u32, w: u32, h: u32, radius: u32) -> bool {
-    if radius == 0 {
-        return true;
+fn glyph_bits(ch: char) -> [u8; 8] {
+    match ch {
+        '\u{00B7}' => [0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00], // · middle dot
+        '\u{00D7}' => [0x00, 0x00, 0x42, 0x24, 0x18, 0x24, 0x42, 0x00], // × multiplication
+        '\u{2013}' | '\u{2014}' => [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00], // – / — dash
+        _ => {
+            let index = u32::from(ch);
+            if index < 128 {
+                FONT8X8[index as usize]
+            } else {
+                NOTDEF_8X8
+            }
+        }
     }
-    let cx = if col < radius {
-        radius
-    } else if col >= w.saturating_sub(radius) {
-        w.saturating_sub(radius)
-    } else {
-        return true;
-    };
-    let cy = if row < radius {
-        radius
-    } else if row >= h.saturating_sub(radius) {
-        h.saturating_sub(radius)
-    } else {
-        return true;
-    };
-    let dx = col as i32 - cx as i32;
-    let dy = row as i32 - cy as i32;
-    dx * dx + dy * dy <= (radius as i32) * (radius as i32)
 }
 
 #[cfg(test)]
@@ -428,5 +405,40 @@ mod tests {
         let fitted = fit_text("Fedora Linux", 8, 40);
         assert!(fitted.ends_with("..."));
         assert!(text_width(&fitted, 8) <= 40);
+    }
+
+    #[test]
+    fn unknown_glyph_uses_notdef_box_not_question_mark() {
+        assert_ne!(glyph_bits('漢'), FONT8X8[b'?' as usize]);
+        assert_eq!(glyph_bits('漢'), NOTDEF_8X8);
+    }
+
+    #[test]
+    fn blend_pixel_and_linear_blend_produce_antialiased_intermediate() {
+        let mut fb = Framebuffer::new(4, 1);
+        fb.fill(Rgba::rgb(0, 0, 0));
+        fb.blend_pixel(0, 0, Rgba::rgb(255, 255, 255), 128);
+        fb.blend_pixel_linear(1, 0, Rgba::rgb(255, 255, 255), 128);
+        let p0 = fb.pixel(0, 0).unwrap();
+        let p1 = fb.pixel(1, 0).unwrap();
+        assert!(p0.r() > 120 && p0.r() < 135);
+        // Linear-light 50% coverage maps to ~180 in sRGB (gamma 2.0)
+        assert!(p1.r() > 170 && p1.r() < 190);
+    }
+
+    #[test]
+    fn viewport_clips_and_translates_y_for_all_pixel_blends() {
+        let mut fb = Framebuffer::new(20, 20);
+        let bg = Rgba::rgb(0, 0, 0);
+        let fg = Rgba::rgb(200, 100, 50);
+        fb.fill(bg);
+        fb.set_viewport(4, 4, 10, 10, -20);
+        // Content y=26 -> screen y=6 (inside viewport [4, 14))
+        fb.blend_pixel(8, 26, fg, 255);
+        // Content y=22 -> screen y=2 (above viewport clip!)
+        fb.blend_pixel(8, 22, fg, 255);
+        fb.clear_viewport();
+        assert_eq!(fb.pixel(8, 6), Some(fg));
+        assert_eq!(fb.pixel(8, 2), Some(bg));
     }
 }

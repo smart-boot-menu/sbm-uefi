@@ -36,10 +36,15 @@ The production keys work as on firmware: arrows, Enter, Tab, Esc, `T` theme,
 
 | Key | Action |
 | --- | --- |
+| 1–4 / F4 | Switch layout (Classic, Bento, Schematic, Storage) |
 | F1 | Help overlay |
 | F2 / Shift+F2 | Next / previous scenario |
 | F3 | Cycle virtual resolutions (800x600 … 2560x1600, then follow window) |
 | F5 | Simulated reset of the current scenario |
+| F6 | Toggle progressive hardware discovery |
+| F7 / Shift+F7 | Cycle typography mode (Atkinson Next+Mono / Next / Bitmap 8×8) |
+| F8 | Toggle high-contrast theme |
+| + / - / 0 | Adjust UI scale (75%–200%) / reset to 100% |
 | F12 | Screenshot to `build/sim/screenshots/` |
 | Cmd+Q | Quit |
 

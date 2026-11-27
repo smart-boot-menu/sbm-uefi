@@ -12,7 +12,9 @@ use sbm_gfx::Framebuffer;
 use sbm_menu::{Key, Pointer};
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::session::CoreExit;
-use sbm_preview::{DISPLAY_PRESETS, Effect, LayoutMode, Machine, Session, core, write_image};
+use sbm_preview::{
+    DISPLAY_PRESETS, Effect, FontMode, LayoutMode, Machine, Session, UiScale, core, write_image,
+};
 
 use crate::Options;
 
@@ -89,12 +91,20 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let scenarios = scenario::list(&scenario::scenario_dir())?;
     let mut current = scenario::resolve(&opts.scenario)?;
     let initial_layout = opts.layouts.first().copied().unwrap_or(LayoutMode::Classic);
+    let initial_font = opts
+        .fonts
+        .first()
+        .copied()
+        .unwrap_or(FontMode::AtkinsonNextMono);
     let mut session = Session::power_on_with(
         Machine::new(Scenario::load(&current)?),
         opts.dark,
         initial_layout,
         opts.discovery,
     );
+    session.set_font_mode(initial_font);
+    session.set_high_contrast(opts.high_contrast);
+    session.set_scale(opts.scale);
     let mut view = View::open(opts.size, opts.fixed)?;
     let mut preset = None::<usize>;
     let mut shots = 0u32;
@@ -140,12 +150,18 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     let dark = session.state.dark;
                     let layout = session.layout;
                     let discovery = session.discovery;
+                    let font = session.font_mode;
+                    let hc = session.high_contrast;
+                    let scale = session.scale;
                     session = Session::power_on_with(
                         Machine::new(Scenario::load(&current)?),
                         dark,
                         layout,
                         discovery,
                     );
+                    session.set_font_mode(font);
+                    session.set_high_contrast(hc);
+                    session.set_scale(scale);
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -185,12 +201,18 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     let dark = session.state.dark;
                     let layout = session.layout;
                     let discovery = session.discovery;
+                    let font = session.font_mode;
+                    let hc = session.high_contrast;
+                    let scale = session.scale;
                     session = Session::power_on_with(
                         Machine::new(Scenario::load(&current)?),
                         dark,
                         layout,
                         discovery,
                     );
+                    session.set_font_mode(font);
+                    session.set_high_contrast(hc);
+                    session.set_scale(scale);
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -199,6 +221,36 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     let mut next = session.discovery;
                     next.mode = next.mode.next();
                     session.set_discovery(next);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::F7 => {
+                    let next = if shift {
+                        session.font_mode.prev()
+                    } else {
+                        session.font_mode.next()
+                    };
+                    session.set_font_mode(next);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::F8 => {
+                    session.set_high_contrast(!session.high_contrast);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Equal | MKey::NumPadPlus => {
+                    session.set_scale(session.scale.step_up());
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Minus | MKey::NumPadMinus => {
+                    session.set_scale(session.scale.step_down());
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Key0 | MKey::NumPad0 => {
+                    session.set_scale(UiScale::default());
                     set_title(&mut view, &session);
                     dirty = true;
                 }
@@ -376,22 +428,28 @@ fn set_title(view: &mut View, session: &Session) {
         Some((w, h)) => format!("{w}x{h} fixed"),
         None => "follows window".into(),
     };
+    let hc = if session.high_contrast { " HC" } else { "" };
     view.window.set_title(&format!(
-        "Smart Boot Menu - SIMULATED - {} - {} - {} - {size} - F1 help",
+        "Smart Boot Menu - SIMULATED - {} - {} - {} - {} {}%{hc} - {size} - F1 help",
         session.machine.scenario.id,
         session.layout.label(),
-        session.discovery.mode.id()
+        session.discovery.mode.id(),
+        session.font_mode.label(),
+        session.scale.percent(),
     ));
 }
 
 fn screenshot_path(session: &Session, fb: &Framebuffer, n: u32) -> PathBuf {
+    let hc = if session.high_contrast { "-hc" } else { "" };
     sbm_preview::workspace_root()
         .join("build/sim/screenshots")
         .join(format!(
-            "{}-{}-{}-{}x{}-{n:03}.png",
+            "{}-{}-{}-{}{hc}-{}pct-{}x{}-{n:03}.png",
             session.machine.scenario.id,
             session.layout.id(),
+            session.font_mode.id(),
             session.screen_name(),
+            session.scale.percent(),
             fb.width,
             fb.height
         ))

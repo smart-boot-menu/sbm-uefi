@@ -816,17 +816,17 @@ fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
 }
 
 #[test]
-fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
+fn clicking_partition_selects_safely_without_arming_unintended_autoboot() {
     use sbm_gfx::hardware::layout_experimental_scrolled;
     use sbm_menu::Pointer;
     use sbm_preview::LayoutMode;
 
     let mut s = session("lba-stress");
     s.set_layout(LayoutMode::Bento);
-
-    // Abort initial Windows countdown first.
-    assert_eq!(s.abort_autoboot(), Effect::Redraw);
-    assert_eq!(s.state.countdown_ms, None);
+    assert!(
+        s.state.countdown_ms.is_some(),
+        "policy startup countdown should be active on boot"
+    );
 
     // Locate Fedora's polygon zone (a different boot target than Windows).
     let fedora_card = s
@@ -845,7 +845,7 @@ fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
     let fx = fedora_seg.x + fedora_seg.w / 2;
     let fy = fedora_seg.y + fedora_seg.h / 2;
 
-    // 1. Hovering Fedora must NOT hijack selection or start countdown.
+    // 1. Hovering Fedora must NOT hijack selection or touch the active policy countdown.
     let _ = s.pointer(
         Pointer {
             x: fx,
@@ -857,9 +857,10 @@ fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
         H,
     );
     assert_ne!(s.state.selected, fedora_card);
-    assert_eq!(s.state.countdown_ms, None);
+    assert!(s.state.countdown_ms.is_some());
 
-    // 2. First click on Fedora selects it and starts countdown WITHOUT booting yet.
+    // 2. First click on unselected Fedora selects it, cancels policy countdown,
+    //    NEVER boots on first click, and NEVER arms a new automatic boot timer.
     let _ = s.pointer(
         Pointer {
             x: fx,
@@ -870,19 +871,19 @@ fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
         W,
         H,
     );
-    assert_eq!(
-        s.screen_name(),
-        "menu",
-        "first click must not boot immediately"
-    );
+    assert_eq!(s.screen_name(), "menu");
     assert_eq!(s.state.selected, fedora_card);
-    assert!(
-        s.state.countdown_ms.is_some(),
-        "first click must start countdown"
+    assert_eq!(
+        s.state.countdown_ms, None,
+        "selecting a partition must cancel policy countdown, never arm a new timer"
     );
+    // Tick 30 full seconds to prove zero unintended automatic boot behavior.
+    run_script(&mut s, &parse_script("wait:30000").unwrap(), W, H);
+    assert_eq!(s.screen_name(), "menu");
+    assert!(s.sim.is_none());
 
-    // 3. Clicking a DIFFERENT partition (Windows) switches selection and restarts countdown
-    //    without booting Windows immediately.
+    // 3. Clicking a DIFFERENT partition (Windows) switches selection without booting
+    //    or starting any automatic boot timer.
     let win_card = 0usize;
     let win_seg = map
         .zones
@@ -902,15 +903,13 @@ fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
         W,
         H,
     );
-    assert_eq!(
-        s.screen_name(),
-        "menu",
-        "switching partition must start countdown, not boot"
-    );
+    assert_eq!(s.screen_name(), "menu");
     assert_eq!(s.state.selected, win_card);
-    assert!(s.state.countdown_ms.is_some());
+    assert_eq!(s.state.countdown_ms, None);
+    run_script(&mut s, &parse_script("wait:30000").unwrap(), W, H);
+    assert_eq!(s.screen_name(), "menu");
 
-    // 4. Second click on the SAME counting-down partition boots it immediately!
+    // 4. Second click on the already-selected partition boots it immediately.
     let _ = s.pointer(
         Pointer {
             x: wx,
@@ -923,42 +922,80 @@ fn clicking_partition_starts_countdown_and_second_click_boots_immediately() {
     );
     match &s.sim {
         Some(SimScreen::Booted { name, .. }) => assert_eq!(name, "Windows"),
-        other => {
-            panic!("second click on counting-down partition should boot Windows, got {other:?}")
-        }
+        other => panic!("second click on selected partition should boot Windows, got {other:?}"),
     }
 
-    // 5. Enter behaves identically: 1st Enter starts countdown, Esc aborts,
-    //    Enter arms again, 2nd Enter boots immediately.
+    // 5. Keyboard matches production UEFI semantics: Escape cancels policy countdown
+    //    without booting; Enter boots the selected target immediately (no surprise timer).
     let mut k = session("lba-stress");
     k.set_layout(LayoutMode::Storage);
-    assert_eq!(k.abort_autoboot(), Effect::Redraw);
-    assert_eq!(k.state.countdown_ms, None);
-
-    // Move to another target and press Enter once -> starts countdown, does NOT boot.
-    let _ = k.key(Key::Right, W, H);
-    assert_eq!(k.state.countdown_ms, None);
-    let _ = k.key(Key::Activate, W, H);
-    assert_eq!(
-        k.screen_name(),
-        "menu",
-        "first Enter must start countdown, not boot"
-    );
     assert!(k.state.countdown_ms.is_some());
-
-    // Escape aborts countdown without booting.
     let _ = k.key(Key::Escape, W, H);
     assert_eq!(k.screen_name(), "menu");
     assert_eq!(k.state.countdown_ms, None);
-
-    // Enter arms again, then second Enter boots immediately.
-    let _ = k.key(Key::Activate, W, H);
+    run_script(&mut k, &parse_script("wait:30000").unwrap(), W, H);
     assert_eq!(k.screen_name(), "menu");
-    assert!(k.state.countdown_ms.is_some());
+
+    let _ = k.key(Key::Right, W, H);
+    assert_eq!(k.state.countdown_ms, None);
     let _ = k.key(Key::Activate, W, H);
     assert_ne!(
         k.screen_name(),
         "menu",
-        "second Enter while counting down must boot"
+        "Enter on selected target must boot immediately"
     );
+}
+
+#[test]
+fn unified_typography_high_contrast_and_scaling_work_across_layouts() {
+    use sbm_preview::{FontMode, LayoutMode, UiScale};
+
+    for layout in LayoutMode::ALL {
+        let mut s = session("dual-boot");
+        s.set_layout(layout);
+
+        // Compare Atkinson Next+Mono vs Bitmap8x8.
+        s.set_font_mode(FontMode::AtkinsonNextMono);
+        let fb_next_mono = render(&s, W, H);
+        assert!(
+            s.renderer_stats().entries > 0,
+            "{layout:?} should populate glyph cache"
+        );
+        s.set_font_mode(FontMode::Bitmap8x8);
+        let fb_bitmap = render(&s, W, H);
+        assert_ne!(
+            fb_next_mono.px, fb_bitmap.px,
+            "{layout:?} typography modes must differ"
+        );
+
+        // Compare normal vs high-contrast themes.
+        s.set_font_mode(FontMode::AtkinsonNextMono);
+        s.set_high_contrast(true);
+        let fb_hc_dark = render(&s, W, H);
+        assert_ne!(
+            fb_next_mono.px, fb_hc_dark.px,
+            "{layout:?} high-contrast dark must differ from normal dark"
+        );
+        s.state.dark = false;
+        let fb_hc_light = render(&s, W, H);
+        assert_ne!(
+            fb_hc_dark.px, fb_hc_light.px,
+            "{layout:?} high-contrast light must differ from dark"
+        );
+
+        // Adjustable scaling (75%, 100%, 150%, 200%) renders cleanly without panicking.
+        s.set_high_contrast(false);
+        s.state.dark = true;
+        s.set_scale(UiScale::new(150));
+        let fb_scaled = render(&s, W, H);
+        assert_ne!(
+            fb_next_mono.px, fb_scaled.px,
+            "{layout:?} 150% scale must differ from 100%"
+        );
+        for pct in [75u16, 200] {
+            s.set_scale(UiScale::new(pct));
+            let fb = render(&s, W, H);
+            assert!(fb.px.iter().any(|&p| p != fb.px[0]));
+        }
+    }
 }

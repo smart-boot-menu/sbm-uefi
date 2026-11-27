@@ -14,10 +14,13 @@ use core::cell::OnceCell;
 use core::time::Duration;
 
 use sbm_boot::{ParsedLoadOption, Volume, normalize, parse_load_option};
-use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_gfx::{
+    Focus, FontMode, Framebuffer, Input, MenuState, Outcome, Screen, TextRenderer, UiScale,
+    layout_menu, paint_splash_with, step,
+};
 use sbm_menu::flow::{HandoffVar, LaunchResult, Picker, Platform};
 use sbm_menu::{
-    DiagFacts, NO_RECOVERY_MESSAGE, Pointer, arch_name, menu_input, paint_current,
+    DiagFacts, NO_RECOVERY_MESSAGE, Pointer, arch_name, menu_input, paint_current_with,
     recovery_position,
 };
 use sbm_types::{CpuArch, PlatformCapabilities, SecureBootState};
@@ -145,6 +148,36 @@ struct Facts {
     ram_mib: Option<u64>,
 }
 
+/// Snapshot of visual state that triggers a frame redraw in the UEFI event loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FrameKey {
+    screen: Screen,
+    dark: bool,
+    focus: Focus,
+    selected: usize,
+    action: usize,
+    countdown_sec: Option<u32>,
+    anim_ms: u32,
+    cursor: Option<(u32, u32)>,
+    message_len: usize,
+}
+
+impl FrameKey {
+    fn of(state: &MenuState) -> Self {
+        Self {
+            screen: state.screen,
+            dark: state.dark,
+            focus: state.focus,
+            selected: state.selected,
+            action: state.action,
+            countdown_sec: state.countdown_ms.map(|ms| ms.div_ceil(1000)),
+            anim_ms: state.anim_ms,
+            cursor: state.cursor,
+            message_len: state.message.len(),
+        }
+    }
+}
+
 fn run() -> ! {
     let clock = firmware::Clock::start();
     mark("uefi_entry");
@@ -157,8 +190,9 @@ fn run() -> ! {
         .map(|screen| (screen.width(), screen.height()))
         .unwrap_or((1024, 768));
     let mut fb = Framebuffer::new(width, height);
+    let mut text = TextRenderer::new(FontMode::AtkinsonNextMono, height, UiScale::default());
     if let Some(screen) = gop.as_mut() {
-        paint_splash(&mut fb, true);
+        paint_splash_with(&mut fb, true, false, &mut text);
         screen.present(&fb);
         mark(&alloc::format!("gop {}", screen.describe()));
         mark(&alloc::format!(
@@ -212,18 +246,28 @@ fn run() -> ! {
     let discovery_us = picker.timings.discovery_us;
     let mut state = picker.initial_state(true);
     let mut mouse = Mouse::open(width, height);
-    paint_current(
+    paint_current_with(
         &mut fb,
         &picker.entries,
         &picker.visible,
         &state,
         &diag_lines(&picker, &facts, first_frame_us, discovery_us, None),
+        false,
+        &mut text,
     );
     if let Some(screen) = gop.as_mut() {
         screen.present(&fb);
     }
     let menu_ready_us = platform.clock.elapsed_us();
     mark(&alloc::format!("menu_ready us={menu_ready_us}"));
+    let cache = text.cache_stats();
+    mark(&alloc::format!(
+        "glyph_cache glyphs={} bytes={} hits={} misses={}",
+        cache.entries,
+        cache.bytes,
+        cache.hits,
+        cache.misses
+    ));
     firmware::lab_marker(
         "menu-ready",
         &alloc::format!(
@@ -232,6 +276,7 @@ fn run() -> ! {
             picker.visible.len()
         ),
     );
+    let mut last_frame = FrameKey::of(&state);
     let mut pending = early;
     if state.countdown_ms == Some(0)
         && let Some(index) = picker.entry_for_card(state.selected)
@@ -276,6 +321,7 @@ fn run() -> ! {
             }
         }
         let outcome = step(&mut state, input, cards, cols, dt_ms);
+        let mut force_redraw = false;
         match outcome {
             Outcome::Boot => {
                 if let Some(index) = picker.entry_for_card(state.selected) {
@@ -286,19 +332,24 @@ fn run() -> ! {
                         &mut state,
                         first_frame_us,
                     );
+                    force_redraw = true;
                 }
             }
             Outcome::Recovery => match recovery_position(&picker.entries) {
-                Some(index) => boot_entry(
-                    &mut platform,
-                    &mut picker,
-                    index,
-                    &mut state,
-                    first_frame_us,
-                ),
+                Some(index) => {
+                    boot_entry(
+                        &mut platform,
+                        &mut picker,
+                        index,
+                        &mut state,
+                        first_frame_us,
+                    );
+                    force_redraw = true;
+                }
                 None => {
                     state.screen = Screen::Error;
                     state.message = String::from(NO_RECOVERY_MESSAGE);
+                    force_redraw = true;
                 }
             },
             Outcome::Action(0) => match firmware::reboot_to_firmware_ui() {
@@ -306,27 +357,34 @@ fn run() -> ! {
                 Err(message) => {
                     state.screen = Screen::Error;
                     state.message = String::from(message);
+                    force_redraw = true;
                 }
             },
             Outcome::Action(1) => firmware::reboot(),
             Outcome::Action(2) => firmware::shutdown(),
             Outcome::Action(_) | Outcome::Exit | Outcome::None => {}
         }
-        paint_current(
-            &mut fb,
-            &picker.entries,
-            &picker.visible,
-            &state,
-            &diag_lines(
-                &picker,
-                &facts,
-                first_frame_us,
-                discovery_us,
-                Some(menu_ready_us),
-            ),
-        );
-        if let Some(screen) = gop.as_mut() {
-            screen.present(&fb);
+        let frame_key = FrameKey::of(&state);
+        if force_redraw || frame_key != last_frame {
+            paint_current_with(
+                &mut fb,
+                &picker.entries,
+                &picker.visible,
+                &state,
+                &diag_lines(
+                    &picker,
+                    &facts,
+                    first_frame_us,
+                    discovery_us,
+                    Some(menu_ready_us),
+                ),
+                false,
+                &mut text,
+            );
+            if let Some(screen) = gop.as_mut() {
+                screen.present(&fb);
+            }
+            last_frame = frame_key;
         }
         boot::stall(Duration::from_millis(16));
     }

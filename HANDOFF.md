@@ -1,5 +1,21 @@
 # Handoff
 
+## Visual architecture consolidation & Agent 13 release qualification (2026-11-27)
+
+Consolidated Agent 20's accessible typography (`Atkinson Hyperlegible Next` Regular/SemiBold + `Atkinson Hyperlegible Mono` Regular) and unified CPU vector rendering backend (`sbm_gfx::vector`) into `main` alongside the LBA-ordered paragraph-style partition dashboards (`Bento`, `Schematic`, `Storage`) and all Agent 15 UEFI security/performance/handoff fixes.
+
+### What changed
+- **Single unified rendering engine (`sbm-gfx`):** Removed `crates/sbm-gfx/src/text.rs` (`noto-sans-mono-bitmap`), `crates/sbm-gfx/src/assets.rs`, duplicate pixel polygon fill/stroke loops in `disk_wrap.rs`, hard-aliased rounded-panel helpers in `draw.rs`, and the ~330-line duplicate `paint_*_legacy` engine in `paint.rs`. Both Classic and experimental layouts now render through one `TextRenderer` + `sbm_gfx::vector` pipeline with unconditional viewport clipping and scroll-bias translation (`Framebuffer::with_viewport`).
+- **Accessibility, themes, and scaling:** Unified `Theme::resolve(dark, high_contrast)` and `Palette::resolve(dark, high_contrast)` across Classic, experimental dashboards, and simulator overlays (Light, Dark, High-Contrast Dark, High-Contrast Light with 2 px borders and high-contrast badge ink). `UiScale` (`75%`–`200%`) dynamically scales both Classic and experimental metrics.
+- **Production layout policy:** Classic remains the sole production layout compiled into `sbm-app`. Experimental dashboards stay gated behind `sbm-gfx/experimental-layouts` and selectable in `sbm-preview` (`1`–`4` / `F4`, `--layout`).
+- **Safe countdown & click-to-boot semantics:** Removed `arm_card` / click-triggered countdown arming in `sbm-preview`. Only policy-authorized startup autoboot (`Picker::initial_state`) may run a countdown timer. Clicking an unselected partition selects it and cancels any running policy countdown without arming a new timer; clicking the already-selected partition or pressing `Enter`/`Space` boots immediately; `[×]`, `Esc`, and arrow keys abort countdown without booting.
+- **Agent 15 fixes preserved intact:** `sbm-common@abe3029`, lazy `OnceCell` capabilities, 1 MiB streaming SHA-256 with `sha2` `opt-level = 3`, all five Spec 03 volatile EFI variables, UUIDv4 `attempt_id`, bound `LocalBootRequest`, `sbm-menu::flow::Picker`, SBAT `.sbat`, and PE `NX_COMPAT`.
+
+### Coordination for Agent 13 (Release Qualification)
+- **Qualification candidate:** Use this consolidation commit on `main` (see `git rev-parse HEAD` / commit log for the exact SHA). Built release artifacts `artifacts/sbm-aarch64.efi` (`410,112 B`) and `artifacts/sbm-x86_64.efi` (`465,920 B`) carry `.sbat` and `NX_COMPAT`.
+- **Completed locally (native):** All host unit/integration tests (`88` tests across default + experimental feature sets), clippy `-D warnings` across host + window + both UEFI targets, `bench_typography` latency/memory profiling (Classic `2.60 ms` warm / `7.5 KiB` cache at `1280×800`; experimental `6.90–9.93 ms` warm / `13.8–16.8 KiB` cache), and visual screenshot audit (`build/sim/consolidation/`).
+- **Remaining for Agent 13 in QEMU/lab:** Run `cargo run -p xtask -- qemu all` (deferred here while `sbm-lab` guest memory budget was occupied) plus real recovery media verification against the existing Slot A UKI (`menu_ready` guest-timer + `SBM_MARK glyph_cache` telemetry + refreshed QEMU captures in `screenshots/`).
+
 ## Agent 15 update
 
 The picker performs metadata-only Slot A discovery and streams the selected recovery UKI through SHA-256 before launch. It writes the Spec 03 handoff and attempt to the identified boot ESP, publishes all five volatile variables, and starts the UKI by its exact device path with empty external options. Core-issued one-shot requests bind to a confirmed attempt, and a rejected request leaves the picker interactive with an explanation.

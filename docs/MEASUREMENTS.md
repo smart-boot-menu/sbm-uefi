@@ -1,4 +1,53 @@
-# Measurements, 2026-11-26
+# Measurements, 2026-11-27
+
+## Visual architecture consolidation (2026-11-27)
+
+Consolidated Agent 20's accessible vector typography (`Atkinson Hyperlegible Next` Regular/SemiBold + `Atkinson Hyperlegible Mono` Regular, `ttf-parser` 0.25.1 + `ab_glyph_rasterizer` 0.1.10) and unified CPU vector backend (`sbm_gfx::vector`) with `main`'s LBA-ordered paragraph-style partition dashboards (`Bento`, `Schematic`, `Storage`) and Agent 15's UEFI security/performance/handoff fixes. Removed redundant text rendering (`text.rs` / `noto-sans-mono-bitmap`), legacy raster assets (`assets.rs`), duplicate polygon fill/stroke loops (`disk_wrap.rs`), hard-aliased rounded-panel helpers (`draw.rs`), and the ~330-line duplicate `paint_*_legacy` engine (`paint.rs`). Classic remains the sole production layout compiled into `sbm-app` (`experimental-layouts` stays disabled in `sbm-app`).
+
+### Release UEFI binary sizes (`cargo run -p xtask -- build all`)
+
+Profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`, `sha2` at `opt-level = 3`, SBAT `.sbat` section (`sbat,1,`) and `IMAGE_DLLCHARACTERISTICS_NX_COMPAT` verified on both binaries.
+
+| Artifact | Pre-consolidation (`60e7c42`, Agent 15 + 8×8) | Consolidated (`Atkinson Next + Mono` + Unified Vector) | Delta | % of 1 MiB Target |
+| --- | ---: | ---: | ---: | ---: |
+| `artifacts/sbm-aarch64.efi` | 230,912 B (225.5 KiB) | **410,112 B (400.5 KiB)** | +179,200 B (+175.0 KiB) | **39.1%** |
+| `artifacts/sbm-x86_64.efi` | 261,632 B (255.5 KiB) | **465,920 B (455.0 KiB)** | +204,288 B (+199.5 KiB) | **44.4%** |
+| Bundled TTF fonts (3 files) | 0 B | **101,836 B (99.4 KiB)** | +101,836 B | 9.7% |
+
+Compared with Agent 20's unmerged branch (`+185,344 B` on `aarch64`, `+207,872 B` on `x86_64`), removing the duplicate legacy paint engine reduced net renderer overhead by `6,144 B` (`aarch64`) and `3,584 B` (`x86_64`).
+
+### Native host latency and glyph-cache memory (`cargo run -p sbm-gfx --release --features experimental-layouts --example bench_typography`)
+
+Measured on Apple Silicon M5 (macOS, release build, single-threaded software framebuffer):
+
+#### Classic production layout (`paint_menu_with`, 6 targets)
+
+| Resolution | Cold `Bitmap8x8` | Cold `AtkinsonNext` | Cold `AtkinsonNextMono` | Warm `AtkinsonNextMono` (50f) | Cache Footprint (cap: 192 / 64 KiB) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `800×600` | 1,471.6 µs | 2,282.7 µs | **2,306.4 µs** | — | 79 glyphs / 6,218 B (6.1 KiB) |
+| `1024×768` | — | — | — | **2,287.6 µs** (1.41× vs uncached) | 79 glyphs / 7,727 B (7.5 KiB) |
+| `1280×800` | 1,991.5 µs | 3,009.4 µs | **2,782.0 µs** | **2,603.8 µs** (1.34× vs uncached) | 79 glyphs / 7,727 B (7.5 KiB) |
+| `1920×1080` | 3,276.4 µs | 4,240.9 µs | **4,084.6 µs** | **4,079.6 µs** (1.23× vs uncached) | 79 glyphs / 10,492 B (10.2 KiB) |
+| `3840×2160` | 9,509.3 µs | 10,589.1 µs | **10,758.0 µs** | — | 79 glyphs / 24,713 B (24.1 KiB) |
+
+Cold splash (`paint_splash_with`): `524.8 µs` (`1024×768`), `621.8 µs` (`1280×800`), `1,160.0 µs` (`1920×1080`). Isolated text pass (6 mixed-role lines, 243 glyphs at `1280×800`): `1,077.5 µs` uncached vs **406.0 µs** cached (**2.65× speedup**, 114 entries / 13,464 B, 0 evictions).
+
+#### Experimental LBA paragraph dashboards (`paint_experimental_with`, `AtkinsonNextMono`, 5-region NVMe with unallocated gap & multi-target partition)
+
+| Layout | Resolution | Cold First Frame | Warm Frame (30f) | Cache Footprint |
+| --- | --- | ---: | ---: | --- |
+| `bento` | `1280×800` | **10.00 ms** (10,000.2 µs) | **9.36 ms** (9,358.7 µs) | 192 glyphs / 16,841 B (16.4 KiB) |
+| `bento` | `1920×1080` | **18.87 ms** (18,871.6 µs) | **17.50 ms** (17,496.1 µs) | 192 glyphs / 22,642 B (22.1 KiB) |
+| `schematic` | `1280×800` | **7.54 ms** (7,538.9 µs) | **6.90 ms** (6,898.6 µs) | 189 glyphs / 17,204 B (16.8 KiB) |
+| `schematic` | `1920×1080` | **13.58 ms** (13,576.0 µs) | **12.39 ms** (12,391.0 µs) | 184 glyphs / 22,509 B (22.0 KiB) |
+| `storage` | `1280×800` | **10.71 ms** (10,710.1 µs) | **9.93 ms** (9,926.4 µs) | 168 glyphs / 14,156 B (13.8 KiB) |
+| `storage` | `1920×1080` | **19.40 ms** (19,398.9 µs) | **17.37 ms** (17,369.0 µs) | 164 glyphs / 18,616 B (18.2 KiB) |
+
+### Verification status & QEMU deferral
+
+- Host test suites: `sbm-boot` (26), `sbm-gfx` default (22) & `--features experimental-layouts` (28), `sbm-menu` (3), `sbm-preview` (2 unit + 24 integration scenarios), `xtask` (5) — all passing.
+- `cargo clippy -- -D warnings` clean across host, `sbm-gfx --no-default-features`, `sbm-preview --features window`, `sbm-app --target aarch64-unknown-uefi`, and `sbm-app --target x86_64-unknown-uefi`.
+- `xtask qemu` was deferred during this consolidation because `sbm-lab`'s host guest-memory reservation was active (`4096 MiB` reserved against `3584 MiB` budget) and recovery images were intentionally not rebuilt. Agent 13 should execute QEMU OVMF qualification (`cargo run -p xtask -- qemu all`) on this revision once the lab slot is free.
 
 ## Agent 15 real recovery media
 

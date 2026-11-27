@@ -623,13 +623,6 @@ fn label_rect_score(r: Rect) -> u64 {
     bonus.saturating_mul(1024).saturating_add(area / 64)
 }
 
-/// Fill all segments of a connected orthogonal polygon with zero internal seams.
-pub fn fill_polygon(fb: &mut Framebuffer, segments: &[Rect], color: Rgba) {
-    for &seg in segments {
-        fb.fill_rect(seg.x, seg.y, seg.w, seg.h, color);
-    }
-}
-
 /// Fill all segments of a connected orthogonal polygon with a subtle diagonal hatch
 /// (used for unallocated LBA regions).
 pub fn hatch_polygon(fb: &mut Framebuffer, segments: &[Rect], step: u32, color: Rgba) {
@@ -638,95 +631,10 @@ pub fn hatch_polygon(fb: &mut Framebuffer, segments: &[Rect], step: u32, color: 
     }
 }
 
-/// Stroke ONLY the outer perimeter of a connected orthogonal polygon, merging away
-/// all internal horizontal borders shared between adjacent row segments.
-pub fn stroke_merged_polygon(fb: &mut Framebuffer, segments: &[Rect], thickness: u32, color: Rgba) {
-    let t = thickness.max(1);
-    let len = segments.len();
-    for (k, &s) in segments.iter().enumerate() {
-        if s.w == 0 || s.h == 0 {
-            continue;
-        }
-        let x0 = s.x;
-        let x1 = s.x.saturating_add(s.w);
-        let y0 = s.y;
-        let y1 = s.y.saturating_add(s.h);
-
-        // Left and right vertical edges are always on the outer boundary.
-        fb.fill_rect(x0, y0, t.min(s.w), s.h, color);
-        fb.fill_rect(x1.saturating_sub(t), y0, t.min(s.w), s.h, color);
-
-        // Top horizontal edge: subtract shared overlap with `segments[k - 1]`.
-        let prev = (k > 0).then(|| segments[k - 1]);
-        draw_subtracted_hline(fb, x0, x1, y0, t, prev, color);
-
-        // Bottom horizontal edge: subtract shared overlap with `segments[k + 1]`.
-        let next = (k + 1 < len).then(|| segments[k + 1]);
-        draw_subtracted_hline(fb, x0, x1, y1.saturating_sub(t), t, next, color);
-
-        // Crisp inner-corner joins when `t > 1` so thick focus outlines have no 1 px notch.
-        if t > 1 {
-            if let Some(p) = prev {
-                let px0 = p.x;
-                let px1 = p.x.saturating_add(p.w);
-                if px0 > x0 && px0 < x1 {
-                    fb.fill_rect(px0, y0, t, t, color);
-                }
-                if px1 > x0 && px1 < x1 {
-                    fb.fill_rect(px1.saturating_sub(t), y0, t, t, color);
-                }
-            }
-            if let Some(nx) = next {
-                let nx0 = nx.x;
-                let nx1 = nx.x.saturating_add(nx.w);
-                if nx0 > x0 && nx0 < x1 {
-                    fb.fill_rect(nx0, y1.saturating_sub(t), t, t, color);
-                }
-                if nx1 > x0 && nx1 < x1 {
-                    fb.fill_rect(nx1.saturating_sub(t), y1.saturating_sub(t), t, t, color);
-                }
-            }
-        }
-    }
-}
-
-fn draw_subtracted_hline(
-    fb: &mut Framebuffer,
-    x0: u32,
-    x1: u32,
-    y: u32,
-    t: u32,
-    neighbor: Option<Rect>,
-    color: Rgba,
-) {
-    let Some(nb) = neighbor else {
-        fb.fill_rect(x0, y, x1.saturating_sub(x0), t, color);
-        return;
-    };
-    let nx0 = nb.x;
-    let nx1 = nb.x.saturating_add(nb.w);
-    // Overlap of [x0, x1] with [nx0, nx1].
-    let ov0 = x0.max(nx0);
-    let ov1 = x1.min(nx1);
-    if ov1 <= ov0 {
-        // No overlap: draw full span.
-        fb.fill_rect(x0, y, x1.saturating_sub(x0), t, color);
-        return;
-    }
-    if ov0 > x0 {
-        // Extend by `t` at the inner reflex corner so the outer stroke turns cleanly.
-        let end = ov0.saturating_add(t).min(x1);
-        fb.fill_rect(x0, y, end.saturating_sub(x0), t, color);
-    }
-    if x1 > ov1 {
-        let start = ov1.saturating_sub(t).max(x0);
-        fb.fill_rect(start, y, x1.saturating_sub(start), t, color);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::{fill_ortho_polygon, stroke_ortho_polygon};
 
     fn mk(gb: u64, min_w: u32, interactive: bool) -> WrapInput {
         WrapInput {
@@ -832,8 +740,8 @@ mod tests {
                 h: 30,
             },
         ];
-        fill_polygon(&mut fb, &segs, fill);
-        stroke_merged_polygon(&mut fb, &segs, 1, border);
+        fill_ortho_polygon(&mut fb, &segs, 0.0, fill);
+        stroke_ortho_polygon(&mut fb, &segs, 1.0, 0.0, border);
         // Shared horizontal seam at x=30, y=39..40 must stay `fill` (merged!).
         assert_eq!(fb.pixel(30, 39), Some(fill));
         assert_eq!(fb.pixel(30, 40), Some(fill));
