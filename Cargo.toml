@@ -21,6 +21,7 @@ repository = "https://github.com/smart-boot-menu/sbm-uefi"
 [workspace.dependencies]
 ab_glyph_rasterizer = { version = "0.1", default-features = false, features = ["libm"] }
 libm = "0.2"
+qrcode = { version = "0.15", default-features = false }
 sbm-types = { git = "https://github.com/smart-boot-menu/sbm-common", rev = "abe3029c831f05d77d10cfb214a0c236903d00d9", default-features = false }
 sbm-protocol = { git = "https://github.com/smart-boot-menu/sbm-common", rev = "abe3029c831f05d77d10cfb214a0c236903d00d9", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

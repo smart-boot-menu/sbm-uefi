@@ -112,6 +112,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
     session.set_font_mode(initial_font);
     session.set_high_contrast(opts.high_contrast);
     session.set_scale(opts.scale);
+    session.set_show_hints(opts.hints);
     let mut view = View::open(opts.size, opts.fixed)?;
     let mut preset = None::<usize>;
     let mut shots = 0u32;
@@ -119,6 +120,8 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let mut mouse_last = None::<(u32, u32)>;
     let mut mouse_down = false;
     let mut scroll_dragging = false;
+    let mut hw_scroll_dragging = false;
+    let mut scroll_active_until = None::<Instant>;
     let mut last = Instant::now();
     let mut first_frame = true;
     let mut pending = session.take_pending();
@@ -161,6 +164,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     let font = session.font_mode;
                     let hc = session.high_contrast;
                     let scale = session.scale;
+                    let show_hints = session.show_hints;
                     session = Session::power_on_with(
                         Machine::new(Scenario::load(&current)?),
                         dark,
@@ -171,6 +175,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     session.set_font_mode(font);
                     session.set_high_contrast(hc);
                     session.set_scale(scale);
+                    session.set_show_hints(show_hints);
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -214,6 +219,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     let font = session.font_mode;
                     let hc = session.high_contrast;
                     let scale = session.scale;
+                    let show_hints = session.show_hints;
                     session = Session::power_on_with(
                         Machine::new(Scenario::load(&current)?),
                         dark,
@@ -224,6 +230,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     session.set_font_mode(font);
                     session.set_high_contrast(hc);
                     session.set_scale(scale);
+                    session.set_show_hints(show_hints);
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -274,10 +281,18 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     dirty = true;
                 }
                 MKey::PageUp if session.sim.is_none() => {
-                    effects.push(session.scroll_by(-180, w, h));
+                    if shift {
+                        effects.push(session.scroll_x_by(-180, w, h));
+                    } else {
+                        effects.push(session.scroll_by(-180, w, h));
+                    }
                 }
                 MKey::PageDown if session.sim.is_none() => {
-                    effects.push(session.scroll_by(180, w, h));
+                    if shift {
+                        effects.push(session.scroll_x_by(180, w, h));
+                    } else {
+                        effects.push(session.scroll_by(180, w, h));
+                    }
                 }
                 MKey::F12 => {
                     shots += 1;
@@ -303,20 +318,35 @@ pub fn run(opts: &Options) -> Result<(), String> {
             }
         }
 
-        if let Some((_sx, sy)) = view.window.get_scroll_wheel()
-            && sy.abs() > 0.001
-        {
-            let mut delta = (-sy * 28.0).round() as i32;
-            if delta == 0 {
-                delta = if sy < 0.0 { 1 } else { -1 };
+        if let Some((sx, sy)) = view.window.get_scroll_wheel() {
+            if sx.abs() > 0.001 {
+                let mut dx = (-sx * 28.0).round() as i32;
+                if dx == 0 {
+                    dx = if sx < 0.0 { 1 } else { -1 };
+                }
+                effects.push(session.scroll_x_by(dx, w, h));
+                scroll_active_until = Some(now + Duration::from_millis(250));
             }
-            effects.push(session.scroll_by(delta, w, h));
+            if sy.abs() > 0.001 {
+                let mut dy = (-sy * 28.0).round() as i32;
+                if dy == 0 {
+                    dy = if sy < 0.0 { 1 } else { -1 };
+                }
+                let over_hw = mouse_last.is_some_and(|(mx, my)| session.over_hw_grid(mx, my, w, h));
+                if shift || over_hw {
+                    effects.push(session.scroll_x_by(dy, w, h));
+                } else {
+                    effects.push(session.scroll_by(dy, w, h));
+                }
+                scroll_active_until = Some(now + Duration::from_millis(250));
+            }
         }
 
         let pressed = view.window.get_mouse_down(MouseButton::Left);
         let clicked = pressed && !mouse_down;
         if !pressed {
             scroll_dragging = false;
+            hw_scroll_dragging = false;
         }
         mouse_down = pressed;
         if let Some(pos) = view
@@ -324,11 +354,18 @@ pub fn run(opts: &Options) -> Result<(), String> {
             .get_mouse_pos(MouseMode::Discard)
             .and_then(|(x, y)| view.to_fb(x, y))
         {
-            if clicked && session.on_scroll_track(pos.0, pos.1, w, h) {
-                scroll_dragging = true;
+            if clicked {
+                if session.on_hw_scroll_track(pos.0, pos.1, w, h) {
+                    hw_scroll_dragging = true;
+                } else if session.on_scroll_track(pos.0, pos.1, w, h) {
+                    scroll_dragging = true;
+                }
             }
             let moved = mouse_last != Some(pos);
-            if scroll_dragging && pressed {
+            if hw_scroll_dragging && pressed {
+                mouse_last = Some(pos);
+                effects.push(session.scroll_x_drag(pos.0, w, h));
+            } else if scroll_dragging && pressed {
                 mouse_last = Some(pos);
                 effects.push(session.scroll_drag(pos.1, w, h));
             } else if moved || clicked {
@@ -395,9 +432,13 @@ pub fn run(opts: &Options) -> Result<(), String> {
         {
             return Ok(());
         }
-        // Poll at 60 fps while cards animate or an experimental countdown partition flashes.
+        // Poll at 60 fps while cards animate, scroll momentum settles, or a countdown flashes.
+        let scrolling = scroll_active_until.is_some_and(|until| now < until);
         let frame = if session.sim.is_none()
             && (session.state.anim_ms > 0
+                || scrolling
+                || scroll_dragging
+                || hw_scroll_dragging
                 || (session.layout != LayoutMode::Classic && session.state.countdown_ms.is_some()))
         {
             ACTIVE_FRAME
@@ -503,6 +544,9 @@ fn map_key(key: MKey, shift: bool) -> Option<Key> {
         MKey::Tab => Some(Key::Tab),
         MKey::Escape => Some(Key::Escape),
         MKey::Space => Some(Key::Char(' ')),
+        MKey::Slash if shift => Some(Key::Char('?')),
+        MKey::LeftBracket => Some(Key::Char('[')),
+        MKey::RightBracket => Some(Key::Char(']')),
         MKey::A => letter('a'),
         MKey::B => letter('b'),
         MKey::C => letter('c'),

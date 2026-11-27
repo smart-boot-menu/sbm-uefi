@@ -19,10 +19,14 @@ use crate::state::{Focus, MenuState};
 use crate::theme::Theme;
 use crate::typography::{FontMode, TextRenderer, TextRole, UiScale};
 use crate::vector::{
-    draw_vector_chevron, draw_vector_close_x, draw_vector_emblem, draw_vector_hamburger,
-    draw_vector_lock, fill_circle, fill_ortho_polygon, fill_rounded_panel, fill_rounded_rect,
+    draw_vector_chevron, draw_vector_chevron_h, draw_vector_close_x, draw_vector_cpu_logo,
+    draw_vector_emblem, draw_vector_gpu_logo, draw_vector_hamburger, draw_vector_lock,
+    draw_vector_qr, fill_circle, fill_ortho_polygon, fill_rounded_panel, fill_rounded_rect,
     stroke_ortho_polygon,
 };
+
+/// Canonical project URL encoded in the Brand widget's scannable QR code.
+pub const BRAND_QR_URL: &str = "https://g-AI.org/Smart-Boot-Manager";
 
 /// How storage devices display their contents in experimental hardware dashboards.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,12 +79,18 @@ impl StorageDetail {
 /// View options passed to experimental dashboard layout & painting routines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExperimentalOptions {
+    /// Horizontal scroll offset (pixels) for the top hardware widget strip.
+    pub scroll_x: u32,
+    /// Vertical scroll offset (pixels) for the storage workspace.
     pub scroll_y: u32,
     pub high_contrast: bool,
     pub detail: StorageDetail,
     /// Index in `spec.storage` of the drive whose Compact-mode hamburger
     /// overflow menu (`>4` OS targets) is currently open.
     pub overflow_drive: Option<usize>,
+    /// Controlled by the `?` button: reveals optional helper text, keyboard
+    /// shortcut hints, and verbose explanatory captions when `true`.
+    pub show_hints: bool,
 }
 
 /// Selectable menu layout for interactive design comparison.
@@ -337,6 +347,8 @@ impl StorageDevice {
 #[derive(Clone, Debug)]
 pub struct SystemSpec {
     pub host_label: String,
+    /// Software version displayed in the Brand/QR widget (0SFS `YY.MM.DD#N` / `YY.MM.DD LTS`).
+    pub sbm_version: String,
     pub cpu: ProbeState<CpuSpec>,
     pub memory: ProbeState<MemorySpec>,
     pub board: ProbeState<BoardSpec>,
@@ -368,14 +380,20 @@ pub enum ExperimentalHit {
     None,
     Card(usize),
     Action(usize),
-    /// Clicking either the top-right `[X]` or the flashing target's `[X]`.
+    /// Clicking either the storage-bar `[X]` or the flashing target's `[X]`.
     AbortAutoboot,
-    /// Clicking the scrollbar up/down arrow buttons (signed pixel delta).
+    /// Clicking the vertical storage scrollbar up/down arrow buttons (signed pixel delta).
     ScrollDelta(i32),
-    /// Clicking on the scrollbar track to jump to a specific scroll offset.
+    /// Clicking on the vertical storage scrollbar track to jump to a scroll offset.
     ScrollTo(u32),
-    /// Clicking the header `[ Compact | Detailed ]` segmented toggle.
+    /// Clicking the horizontal top-grid scrollbar left/right arrow buttons (signed pixel delta).
+    ScrollXDelta(i32),
+    /// Clicking on the horizontal top-grid scrollbar track to jump to a scroll offset.
+    ScrollXTo(u32),
+    /// Clicking the `[ Compact | Detailed ]` segmented toggle above the storage section.
     SetDetail(StorageDetail),
+    /// Clicking the `[ ? ]` toggle button to show/hide optional helper text.
+    ToggleHints,
     /// Clicking the 4th-slot hamburger overflow tile on a drive with >4 OS targets.
     ToggleOverflow(usize),
     /// Clicking the overflow popover's `[X]` button or clicking outside the popover.
@@ -388,17 +406,28 @@ pub enum ExperimentalHit {
 pub struct LayoutHitMap {
     pub zones: Vec<CardHitZone>,
     pub actions: Vec<Rect>,
-    /// Clickable `[X]` abort-autoboot buttons (top-right countdown pill + flashing target).
+    /// Clickable `[X]` abort-autoboot buttons (storage bar countdown + flashing target).
     pub abort_buttons: Vec<Rect>,
-    /// Clickable header `[ Compact | Detailed ]` toggle segments.
+    /// Clickable `[ Compact | Detailed ]` toggle segments right above the storage section.
     pub detail_compact: Option<Rect>,
     pub detail_detailed: Option<Rect>,
+    /// Clickable `[ ? ]` button toggling optional helper/hint text.
+    pub help_button: Option<Rect>,
     /// Clickable 4th-slot hamburger overflow tiles `(drive_index, rect)` in Compact mode.
     pub overflow_buttons: Vec<(usize, Rect)>,
     /// Open Compact-mode overflow popover geometry & interactive rows.
     pub overflow_panel: Option<Rect>,
     pub overflow_close: Option<Rect>,
     pub overflow_zones: Vec<CardHitZone>,
+    /// Top hardware widget strip viewport & horizontal scrollbar geometry.
+    pub hw_viewport: Option<Rect>,
+    pub hw_scroll_left: Option<Rect>,
+    pub hw_scroll_right: Option<Rect>,
+    pub hw_scroll_track: Option<Rect>,
+    pub hw_scroll_thumb: Option<Rect>,
+    pub scroll_x: u32,
+    pub max_scroll_x: u32,
+    /// Storage workspace vertical scrollbar geometry.
     pub scroll_up: Option<Rect>,
     pub scroll_down: Option<Rect>,
     pub scroll_track: Option<Rect>,
@@ -470,12 +499,18 @@ impl LayoutHitMap {
             if self.detail_detailed.is_some_and(|r| r.contains(x, y)) {
                 return ExperimentalHit::SetDetail(StorageDetail::Detailed);
             }
+            if self.help_button.is_some_and(|r| r.contains(x, y)) {
+                return ExperimentalHit::ToggleHints;
+            }
             return ExperimentalHit::CloseOverflow;
         }
         // Abort `[X]` buttons always take highest priority so clicking `[X]` on
         // the flashing target aborts autoboot instead of launching it.
         if self.abort_buttons.iter().any(|r| r.contains(x, y)) {
             return ExperimentalHit::AbortAutoboot;
+        }
+        if self.help_button.is_some_and(|r| r.contains(x, y)) {
+            return ExperimentalHit::ToggleHints;
         }
         if self.detail_compact.is_some_and(|r| r.contains(x, y)) {
             return ExperimentalHit::SetDetail(StorageDetail::Compact);
@@ -487,6 +522,22 @@ impl LayoutHitMap {
             if rect.contains(x, y) {
                 return ExperimentalHit::ToggleOverflow(drive_idx);
             }
+        }
+        if self.hw_scroll_left.is_some_and(|r| r.contains(x, y)) {
+            return ExperimentalHit::ScrollXDelta(-160);
+        }
+        if self.hw_scroll_right.is_some_and(|r| r.contains(x, y)) {
+            return ExperimentalHit::ScrollXDelta(160);
+        }
+        if let Some(track) = self.hw_scroll_track
+            && track.contains(x, y)
+            && self.max_scroll_x > 0
+        {
+            let thumb_w = self.hw_scroll_thumb.map(|t| t.w).unwrap_or(28);
+            let travel = track.w.saturating_sub(thumb_w).max(1);
+            let rel = x.saturating_sub(track.x + thumb_w / 2).min(travel);
+            let target = ((rel as u64 * self.max_scroll_x as u64) / travel as u64) as u32;
+            return ExperimentalHit::ScrollXTo(target.min(self.max_scroll_x));
         }
         if self.scroll_up.is_some_and(|r| r.contains(x, y)) {
             return ExperimentalHit::ScrollDelta(-110);
@@ -755,7 +806,6 @@ struct Metrics {
     tech_h: u32,
     body_h: u32,
     head_h: u32,
-    header_h: u32,
     footer_h: u32,
     pad: u32,
     gap: u32,
@@ -797,14 +847,12 @@ impl Metrics {
         } else {
             10
         };
-        let header_h = head_h.max(cap_h + 8).saturating_add(16).clamp(34, 84);
         let footer_h = body_h.max(cap_h + 6).saturating_add(16).clamp(34, 80);
         Self {
             cap_h,
             tech_h,
             body_h,
             head_h,
-            header_h,
             footer_h,
             pad,
             gap,
@@ -954,7 +1002,7 @@ fn render_mode(
         && let Some(drive_idx) = opts.overflow_drive
     {
         draw_overflow_popover(
-            fb, w, h, spec, drive_idx, state, &pal, m, renderer, paint, &mut hit,
+            fb, w, h, spec, drive_idx, state, opts, &pal, m, renderer, paint, &mut hit,
         );
     }
     hit
@@ -977,6 +1025,192 @@ fn autoboot_pulse(countdown_ms: u32) -> u32 {
 // Experiment A: Hardware Bento Dashboard + Wrapped LBA Storage Widgets
 // ============================================================================
 
+#[derive(Clone, Copy, Default)]
+struct HwStripHit {
+    viewport: Option<Rect>,
+    scroll_left: Option<Rect>,
+    scroll_right: Option<Rect>,
+    scroll_track: Option<Rect>,
+    scroll_thumb: Option<Rect>,
+    scroll_x: u32,
+    max_scroll_x: u32,
+}
+
+impl HwStripHit {
+    fn apply(self, hit: &mut LayoutHitMap) {
+        hit.hw_viewport = self.viewport;
+        hit.hw_scroll_left = self.scroll_left;
+        hit.hw_scroll_right = self.scroll_right;
+        hit.hw_scroll_track = self.scroll_track;
+        hit.hw_scroll_thumb = self.scroll_thumb;
+        hit.scroll_x = self.scroll_x;
+        hit.max_scroll_x = self.max_scroll_x;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_h_scrollbar(
+    fb: &mut Framebuffer,
+    bar: Rect,
+    viewport: Rect,
+    content_w: u32,
+    eff_scroll_x: u32,
+    max_scroll_x: u32,
+    state: &MenuState,
+    pal: &Palette,
+    paint: bool,
+    hw_hit: &mut HwStripHit,
+) {
+    let btn_w = bar.h.clamp(14, 20);
+    let left_rect = Rect {
+        x: bar.x,
+        y: bar.y,
+        w: btn_w,
+        h: bar.h,
+    };
+    let right_rect = Rect {
+        x: bar.x + bar.w.saturating_sub(btn_w),
+        y: bar.y,
+        w: btn_w,
+        h: bar.h,
+    };
+    let track_x = left_rect.x + left_rect.w + 3;
+    let track_w = right_rect.x.saturating_sub(track_x + 3).max(20);
+    let track_rect = Rect {
+        x: track_x,
+        y: bar.y,
+        w: track_w,
+        h: bar.h,
+    };
+    let thumb_w = ((track_w as u64 * viewport.w as u64) / content_w.max(1) as u64)
+        .clamp(28u64.min(track_w as u64), track_w as u64) as u32;
+    let travel = track_w.saturating_sub(thumb_w);
+    let thumb_x = track_x
+        + if max_scroll_x > 0 {
+            ((travel as u64 * eff_scroll_x as u64) / max_scroll_x as u64) as u32
+        } else {
+            0
+        };
+    let thumb_rect = Rect {
+        x: thumb_x,
+        y: bar.y + 2,
+        w: thumb_w,
+        h: bar.h.saturating_sub(4).max(6),
+    };
+
+    hw_hit.scroll_left = Some(left_rect);
+    hw_hit.scroll_right = Some(right_rect);
+    hw_hit.scroll_track = Some(track_rect);
+    hw_hit.scroll_thumb = Some(thumb_rect);
+
+    if !paint {
+        return;
+    }
+
+    let l_hov = state.cursor.is_some_and(|(x, y)| left_rect.contains(x, y));
+    let r_hov = state.cursor.is_some_and(|(x, y)| right_rect.contains(x, y));
+    let t_hov = state.cursor.is_some_and(|(x, y)| thumb_rect.contains(x, y));
+    let bp = pal.border_px();
+
+    draw_bento_panel(fb, track_rect, pal.surface_alt, pal.border, 5, bp);
+    draw_bento_panel(
+        fb,
+        left_rect,
+        if l_hov {
+            pal.surface_hover
+        } else {
+            pal.surface
+        },
+        if eff_scroll_x > 0 {
+            pal.border_strong
+        } else {
+            pal.border
+        },
+        4,
+        bp,
+    );
+    draw_vector_chevron_h(
+        fb,
+        left_rect.x + 2,
+        left_rect.y + 2,
+        left_rect.h.saturating_sub(4),
+        true,
+        if eff_scroll_x > 0 {
+            if l_hov { pal.focus } else { pal.text }
+        } else {
+            pal.border
+        },
+    );
+    draw_bento_panel(
+        fb,
+        right_rect,
+        if r_hov {
+            pal.surface_hover
+        } else {
+            pal.surface
+        },
+        if eff_scroll_x < max_scroll_x {
+            pal.border_strong
+        } else {
+            pal.border
+        },
+        4,
+        bp,
+    );
+    draw_vector_chevron_h(
+        fb,
+        right_rect.x + 2,
+        right_rect.y + 2,
+        right_rect.h.saturating_sub(4),
+        false,
+        if eff_scroll_x < max_scroll_x {
+            if r_hov { pal.focus } else { pal.text }
+        } else {
+            pal.border
+        },
+    );
+    let thumb_col = if t_hov { pal.focus } else { pal.border_strong };
+    draw_rrect(fb, thumb_rect, 4, thumb_col);
+
+    // Subtle edge overflow accent bars along left/right viewport edges.
+    if eff_scroll_x > 0 {
+        fb.vline(
+            viewport.x,
+            viewport.y + 8,
+            viewport.h.saturating_sub(16),
+            pal.focus,
+        );
+    }
+    if eff_scroll_x < max_scroll_x {
+        fb.vline(
+            viewport.x + viewport.w.saturating_sub(1),
+            viewport.y + 8,
+            viewport.h.saturating_sub(16),
+            pal.accent,
+        );
+    }
+}
+
+fn brand_tile_min_width(
+    tile_h: u32,
+    spec: &SystemSpec,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+) -> u32 {
+    let pad = m.pad.clamp(8, 14);
+    let qr_sz = tile_h.saturating_sub(pad * 2).clamp(44, 88);
+    let text_w = renderer
+        .measure("Smart-Boot-Manager", TextRole::Body)
+        .width
+        .max(renderer.measure("g-AI.org/", TextRole::Caption).width)
+        .max(
+            renderer
+                .measure(&spec.sbm_version, TextRole::Technical)
+                .width,
+        );
+    qr_sz + pad * 2 + 12 + text_w + 8
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_bento(
     fb: &mut Framebuffer,
@@ -993,55 +1227,38 @@ fn paint_bento(
     if paint {
         fb.fill(pal.bg);
     }
-    let header_h = m.header_h;
     let footer_h = m.footer_h;
-    let header_hits = draw_header(
+    let x0 = m.pad;
+    let inner_w = w.saturating_sub(m.pad * 2);
+    let y0 = m.pad;
+
+    let min_tile_h = (m.cap_h + m.body_h + m.tech_h + 28).max(m.scaled(82));
+    let max_tile_h = (h * 20 / 100).max(86);
+    let tile_h = min_tile_h.min(max_tile_h).max(76);
+
+    let (hw_hit, strip_total_h) = draw_bento_hw_grid(
         fb,
-        w,
-        header_h,
-        "A // HARDWARE BENTO",
+        Rect {
+            x: x0,
+            y: y0,
+            w: inner_w,
+            h: tile_h,
+        },
         spec,
         state,
-        opts.detail,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
-
-    let x0 = m.pad;
-    let inner_w = w.saturating_sub(m.pad * 2);
-    let mut y = header_h.saturating_add(m.gap);
-
-    let min_bento = if m.compact {
-        (m.cap_h + m.body_h + m.cap_h + 20) * 2 + m.gap
-    } else {
-        m.cap_h + m.head_h + m.body_h + m.cap_h + 36
-    };
-    let max_bento = (h * if m.compact { 30 } else { 25 } / 100).max(96);
-    let bento_h = min_bento.min(max_bento).max(88);
-    if paint {
-        draw_bento_hw_grid(
-            fb,
-            Rect {
-                x: x0,
-                y,
-                w: inner_w,
-                h: bento_h,
-            },
-            spec,
-            pal,
-            m,
-            renderer,
-        );
-    }
-    y = y.saturating_add(bento_h).saturating_add(m.gap);
+    let storage_y = y0.saturating_add(strip_total_h).saturating_add(m.gap);
 
     let footer_y = h.saturating_sub(footer_h);
-    let storage_h = footer_y.saturating_sub(y).saturating_sub(m.gap);
+    let storage_h = footer_y.saturating_sub(storage_y).saturating_sub(m.gap);
     let storage_rect = Rect {
         x: x0,
-        y,
+        y: storage_y,
         w: inner_w,
         h: storage_h,
     };
@@ -1058,8 +1275,8 @@ fn paint_bento(
         renderer,
         paint,
     );
-    header_hits.apply(&mut hit);
-    hit.actions = draw_footer(
+    hw_hit.apply(&mut hit);
+    let (actions, help_btn) = draw_footer(
         fb,
         Rect {
             x: 0,
@@ -1068,107 +1285,132 @@ fn paint_bento(
             h: footer_h,
         },
         state,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
+    hit.actions = actions;
+    hit.help_button = help_btn;
     hit
 }
 
+/// Horizontally scrollable top hardware strip: Brand/QR/Version + CPU + GPU + RAM +
+/// Display/Firmware + Security + Network. Zero redundant category eyebrows.
+#[allow(clippy::too_many_arguments)]
 fn draw_bento_hw_grid(
     fb: &mut Framebuffer,
     area: Rect,
     spec: &SystemSpec,
+    state: &MenuState,
+    opts: ExperimentalOptions,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
-) {
-    let tiles = if m.compact {
-        let row_h = area.h.saturating_sub(m.gap) / 2;
-        let col_w = area.w.saturating_sub(m.gap * 2) / 3;
-        vec![
-            (
-                0,
-                Rect {
-                    x: area.x,
-                    y: area.y,
-                    w: col_w,
-                    h: row_h,
-                },
-            ),
-            (
-                1,
-                Rect {
-                    x: area.x + col_w + m.gap,
-                    y: area.y,
-                    w: col_w,
-                    h: row_h,
-                },
-            ),
-            (
-                2,
-                Rect {
-                    x: area.x + (col_w + m.gap) * 2,
-                    y: area.y,
-                    w: area.w.saturating_sub((col_w + m.gap) * 2),
-                    h: row_h,
-                },
-            ),
-            (
-                3,
-                Rect {
-                    x: area.x,
-                    y: area.y + row_h + m.gap,
-                    w: col_w,
-                    h: area.h.saturating_sub(row_h + m.gap),
-                },
-            ),
-            (
-                4,
-                Rect {
-                    x: area.x + col_w + m.gap,
-                    y: area.y + row_h + m.gap,
-                    w: area.w.saturating_sub(col_w + m.gap),
-                    h: area.h.saturating_sub(row_h + m.gap),
-                },
-            ),
-        ]
-    } else {
-        let gaps = m.gap * 4;
-        let avail = area.w.saturating_sub(gaps);
-        let w0 = avail * 26 / 100;
-        let w1 = avail * 22 / 100;
-        let w2 = avail * 20 / 100;
-        let w3 = avail * 16 / 100;
-        let w4 = avail.saturating_sub(w0 + w1 + w2 + w3);
-        let widths = [w0, w1, w2, w3, w4];
-        let mut out = Vec::with_capacity(5);
-        let mut x = area.x;
-        for (idx, tw) in widths.into_iter().enumerate() {
-            out.push((
-                idx,
-                Rect {
-                    x,
-                    y: area.y,
-                    w: tw,
-                    h: area.h,
-                },
-            ));
-            x = x.saturating_add(tw).saturating_add(m.gap);
+    paint: bool,
+) -> (HwStripHit, u32) {
+    let brand_w = brand_tile_min_width(area.h, spec, m, renderer);
+    let base_widths: [u32; 7] = [
+        brand_w,
+        m.scaled(228).max(180),
+        m.scaled(254).max(196),
+        m.scaled(124).max(100),
+        m.scaled(176).max(140),
+        m.scaled(150).max(120),
+        m.scaled(186).max(148),
+    ];
+    let total_gaps = m.gap.saturating_mul(6);
+    let natural_w: u32 = base_widths.iter().sum::<u32>().saturating_add(total_gaps);
+    let scrollable_x = natural_w > area.w;
+
+    // Stretch tiles proportionally to fill wide screens cleanly when all 7 fit.
+    let widths: [u32; 7] = if !scrollable_x && area.w > total_gaps {
+        let avail = area.w.saturating_sub(total_gaps);
+        let sum_base = base_widths.iter().sum::<u32>().max(1);
+        let mut out = [0u32; 7];
+        let mut used = 0u32;
+        for i in 0..7 {
+            if i == 6 {
+                out[i] = avail.saturating_sub(used);
+            } else {
+                let w = ((avail as u64 * base_widths[i] as u64) / sum_base as u64) as u32;
+                out[i] = w;
+                used = used.saturating_add(w);
+            }
         }
         out
+    } else {
+        base_widths
     };
 
-    for (idx, r) in tiles {
-        match idx {
-            0 => draw_cpu_tile(fb, r, spec, pal, m, renderer),
-            1 => draw_mem_gpu_tile(fb, r, spec, pal, m, renderer),
-            2 => draw_board_fw_tile(fb, r, spec, pal, m, renderer),
-            3 => draw_security_tile(fb, r, spec, pal, m, renderer),
-            _ => draw_network_tile(fb, r, spec, pal, m, renderer),
+    let content_w: u32 = widths.iter().sum::<u32>().saturating_add(total_gaps);
+    let max_scroll_x = content_w.saturating_sub(area.w);
+    let eff_scroll_x = opts.scroll_x.min(max_scroll_x);
+
+    let mut hw_hit = HwStripHit {
+        viewport: Some(area),
+        scroll_x: eff_scroll_x,
+        max_scroll_x,
+        ..HwStripHit::default()
+    };
+
+    if paint {
+        fb.set_viewport_xy(area.x, area.y, area.w, area.h, -(eff_scroll_x as i32), 0);
+        let mut x = area.x;
+        for (idx, &tw) in widths.iter().enumerate() {
+            let r = Rect {
+                x,
+                y: area.y,
+                w: tw,
+                h: area.h,
+            };
+            // Skip tiles completely outside the horizontal viewport.
+            let screen_x0 = (r.x as i64) - (eff_scroll_x as i64);
+            let screen_x1 = screen_x0 + (r.w as i64);
+            if screen_x1 > area.x as i64 && screen_x0 < (area.x + area.w) as i64 {
+                match idx {
+                    0 => draw_brand_tile(fb, r, spec, pal, m, renderer),
+                    1 => draw_cpu_tile(fb, r, spec, pal, m, renderer),
+                    2 => draw_gpu_tile(fb, r, spec, pal, m, renderer),
+                    3 => draw_memory_tile(fb, r, spec, pal, m, renderer),
+                    4 => draw_board_fw_tile(fb, r, spec, pal, m, renderer),
+                    5 => draw_security_tile(fb, r, spec, pal, m, renderer),
+                    _ => draw_network_tile(fb, r, spec, pal, m, renderer),
+                }
+            }
+            x = x.saturating_add(tw).saturating_add(m.gap);
         }
+        fb.clear_viewport();
     }
+
+    let total_h = if scrollable_x {
+        let sb_h = if m.compact { 12 } else { 14 };
+        let sb_gap = 4u32;
+        let sb_rect = Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.h).saturating_add(sb_gap),
+            w: area.w,
+            h: sb_h,
+        };
+        draw_h_scrollbar(
+            fb,
+            sb_rect,
+            area,
+            content_w,
+            eff_scroll_x,
+            max_scroll_x,
+            state,
+            pal,
+            paint,
+            &mut hw_hit,
+        );
+        area.h.saturating_add(sb_gap).saturating_add(sb_h)
+    } else {
+        area.h
+    };
+
+    (hw_hit, total_h)
 }
 
 fn draw_bento_panel(
@@ -1186,6 +1428,92 @@ fn draw_rrect(fb: &mut Framebuffer, r: Rect, radius: u32, fill: Rgba) {
     fill_rounded_rect(fb, r.x, r.y, r.w, r.h, radius, fill);
 }
 
+/// Brand identity widget replacing the old top bar: scannable QR code linking to
+/// `https://g-AI.org/Smart-Boot-Manager`, `g-AI.org/` (small gray),
+/// `Smart-Boot-Manager` (normal white/ink), and the 0SFS software version.
+fn draw_brand_tile(
+    fb: &mut Framebuffer,
+    r: Rect,
+    spec: &SystemSpec,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+) {
+    draw_bento_panel(
+        fb,
+        r,
+        pal.header,
+        pal.border_strong,
+        m.radius,
+        pal.border_px(),
+    );
+    let pad = m.pad.clamp(7, 12);
+    let qr_sz = r.h.saturating_sub(pad * 2).clamp(44, 88);
+    let qx = r.x + pad;
+    let qy = r.y + r.h.saturating_sub(qr_sz) / 2;
+    let qr_drawn = draw_vector_qr(
+        fb,
+        qx,
+        qy,
+        qr_sz,
+        BRAND_QR_URL,
+        Rgba::rgb(0xFF, 0xFF, 0xFF),
+        Rgba::rgb(0x0B, 0x10, 0x14),
+    );
+
+    let tx = if qr_drawn { qx + qr_sz + 10 } else { r.x + pad };
+    let tw = r.x.saturating_add(r.w).saturating_sub(tx + pad);
+    if tw < 24 {
+        return;
+    }
+
+    let gap1 = 1u32;
+    let gap2 = 4u32;
+    let block_h = m.cap_h + gap1 + m.body_h + gap2 + m.tech_h;
+    let mut y = r.y + r.h.saturating_sub(block_h) / 2;
+
+    // Small gray domain prefix: `g-AI.org/`
+    renderer.draw_truncated(fb, "g-AI.org/", tx, y, tw, TextRole::Caption, pal.muted);
+    y += m.cap_h + gap1;
+
+    // Normal size white (high-contrast text) product name: `Smart-Boot-Manager`
+    renderer.draw_truncated(
+        fb,
+        "Smart-Boot-Manager",
+        tx,
+        y,
+        tw,
+        TextRole::Body,
+        pal.text,
+    );
+    y += m.body_h + gap2;
+
+    // 0SFS software version (`YY.MM.DD#N` / `YY.MM.DD LTS`), plus transient probing badge if active
+    let ver = if spec.sbm_version.is_empty() {
+        match &spec.firmware {
+            ProbeState::Ready(fw) => fw.version.as_str(),
+            _ => "",
+        }
+    } else {
+        spec.sbm_version.as_str()
+    };
+    if let Some(status) = spec
+        .discovery_status
+        .as_deref()
+        .filter(|s| s.starts_with("PROBING"))
+    {
+        let ver_w = renderer.measure(ver, TextRole::Technical).width;
+        renderer.draw_truncated(fb, ver, tx, y, tw, TextRole::Technical, pal.accent);
+        let sx = tx + ver_w + 8;
+        let rem = tx.saturating_add(tw).saturating_sub(sx);
+        if rem > 28 {
+            renderer.draw_truncated(fb, status, sx, y, rem, TextRole::Caption, pal.warn);
+        }
+    } else {
+        renderer.draw_truncated(fb, ver, tx, y, tw, TextRole::Technical, pal.accent);
+    }
+}
+
 fn draw_cpu_tile(
     fb: &mut Framebuffer,
     r: Rect,
@@ -1195,79 +1523,137 @@ fn draw_cpu_tile(
     renderer: &mut TextRenderer<'_>,
 ) {
     draw_bento_panel(fb, r, pal.tint_cpu, pal.border, m.radius, pal.border_px());
-    let px = r.x + m.pad;
-    let tight = r.h < m.cap_h + m.head_h + m.body_h + 26;
-    let py = r.y + if tight { 5 } else { m.pad.min(8) };
-    let tw = r.w.saturating_sub(m.pad * 2);
-    let hero_role = if tight {
-        TextRole::Body
-    } else {
-        TextRole::Heading
-    };
-    let hero_h = if tight { m.body_h } else { m.head_h };
-    draw_eyebrow(fb, px, py, tw, "01 / PROCESSOR", pal.eyebrow, renderer);
-    let mut y = py
-        + m.cap_h
-        + (if tight {
-            2
-        } else if m.compact {
-            3
-        } else {
-            5
-        });
+    let pad = m.pad.clamp(7, 12);
+    let logo_sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
+    let lx = r.x + pad;
+    let ly = r.y + r.h.saturating_sub(logo_sz) / 2;
+    draw_vector_cpu_logo(fb, lx, ly, logo_sz, pal.accent, pal.on_accent);
+
+    let tx = lx + logo_sz + 10;
+    let tw = r.x.saturating_add(r.w).saturating_sub(tx + pad);
+    if tw < 24 {
+        return;
+    }
+
     match &spec.cpu {
         ProbeState::Pending => {
-            draw_pill(fb, px, y, "PROBING CPU..", pal.warn, pal, m, renderer);
+            let py = r.y + r.h.saturating_sub(m.cap_h + 6) / 2;
+            draw_pill(fb, tx, py, "PROBING..", pal.warn, pal, m, renderer);
         }
         ProbeState::Unavailable => {
-            renderer.draw_truncated(fb, "CPU unavailable", px, y, tw, TextRole::Body, pal.muted);
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "CPU n/a", tx, py, tw, TextRole::Body, pal.muted);
         }
         ProbeState::Ready(cpu) => {
             let hero = match cpu.cores {
                 Some(c) => format!("{c}C · {}", cpu.arch.to_ascii_uppercase()),
                 None => cpu.arch.to_ascii_uppercase(),
             };
-            renderer.draw_truncated(fb, &hero, px, y, tw, hero_role, pal.accent);
-            y += hero_h + (if tight || m.compact { 2 } else { 4 });
-            let model = cpu.model.as_deref().unwrap_or("Model not exposed");
-            let col = if cpu.model.is_some() {
+            let model = cpu.model.as_deref().unwrap_or("Model n/a");
+            let model_col = if cpu.model.is_some() {
                 pal.text
             } else {
                 pal.muted
             };
-            let sub_role = if tight {
-                TextRole::Caption
-            } else {
-                TextRole::Body
+            let board = match &spec.board {
+                ProbeState::Ready(b) => b.product.as_deref().or(b.vendor.as_deref()),
+                _ => None,
             };
-            if y + renderer.line_metrics(sub_role).line_height <= r.y + r.h - 4 {
-                renderer.draw_truncated(fb, model, px, y, tw, sub_role, col);
-            }
-            if !tight && y + m.body_h + m.cap_h + 8 < r.y + r.h {
-                let board = match &spec.board {
-                    ProbeState::Ready(b) => b
-                        .product
-                        .clone()
-                        .or_else(|| b.vendor.clone())
-                        .unwrap_or_else(|| "Board n/a".into()),
-                    ProbeState::Pending => "Board probing..".into(),
-                    ProbeState::Unavailable => "Board not exposed".into(),
-                };
-                renderer.draw_truncated(
-                    fb,
-                    &board,
-                    px,
-                    r.y + r.h - m.pad.min(8) - m.cap_h,
-                    tw,
-                    TextRole::Caption,
-                    pal.muted,
-                );
+            let has_board = board.is_some() && r.h >= m.body_h + m.cap_h * 2 + 24;
+            let block_h = m.body_h + 3 + m.cap_h + if has_board { 3 + m.cap_h } else { 0 };
+            let mut y = r.y + r.h.saturating_sub(block_h) / 2;
+            renderer.draw_truncated(fb, &hero, tx, y, tw, TextRole::Body, pal.accent);
+            y += m.body_h + 3;
+            renderer.draw_truncated(fb, model, tx, y, tw, TextRole::Caption, model_col);
+            if let Some(b) = board
+                && has_board
+            {
+                y += m.cap_h + 3;
+                renderer.draw_truncated(fb, b, tx, y, tw, TextRole::Caption, pal.muted);
             }
         }
     }
 }
 
-fn draw_mem_gpu_tile(
+fn draw_gpu_tile(
+    fb: &mut Framebuffer,
+    r: Rect,
+    spec: &SystemSpec,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+) {
+    draw_bento_panel(fb, r, pal.tint_gpu, pal.border, m.radius, pal.border_px());
+    let pad = m.pad.clamp(7, 12);
+    let logo_sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
+    let lx = r.x + pad;
+    let ly = r.y + r.h.saturating_sub(logo_sz) / 2;
+    let badge_bg = match &spec.gpu {
+        ProbeState::Ready(gpus) if !gpus.is_empty() => pal.focus,
+        ProbeState::Pending => pal.warn,
+        _ => pal.border_strong,
+    };
+    draw_vector_gpu_logo(fb, lx, ly, logo_sz, badge_bg, pal.on_accent);
+
+    let tx = lx + logo_sz + 10;
+    let tw = r.x.saturating_add(r.w).saturating_sub(tx + pad);
+    if tw < 24 {
+        return;
+    }
+
+    match &spec.gpu {
+        ProbeState::Pending => {
+            let py = r.y + r.h.saturating_sub(m.cap_h + 6) / 2;
+            draw_pill(fb, tx, py, "PROBING..", pal.warn, pal, m, renderer);
+        }
+        ProbeState::Unavailable => {
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "Not exposed", tx, py, tw, TextRole::Body, pal.muted);
+        }
+        ProbeState::Ready(gpus) if gpus.is_empty() => {
+            let block_h = m.body_h + 3 + m.cap_h;
+            let y = r.y + r.h.saturating_sub(block_h) / 2;
+            renderer.draw_truncated(fb, "GOP only", tx, y, tw, TextRole::Body, pal.muted);
+            renderer.draw_truncated(
+                fb,
+                "No PCI GPU",
+                tx,
+                y + m.body_h + 3,
+                tw,
+                TextRole::Caption,
+                pal.muted,
+            );
+        }
+        ProbeState::Ready(gpus) => {
+            if gpus.len() > 1 {
+                let block_h = m.body_h + 3 + m.cap_h;
+                let y = r.y + r.h.saturating_sub(block_h) / 2;
+                renderer.draw_truncated(fb, &gpus[0], tx, y, tw, TextRole::Body, pal.text);
+                renderer.draw_truncated(
+                    fb,
+                    &format!("+{} · {}", gpus.len() - 1, gpus[1]),
+                    tx,
+                    y + m.body_h + 3,
+                    tw,
+                    TextRole::Caption,
+                    pal.focus,
+                );
+            } else {
+                let single_w = renderer.measure(&gpus[0], TextRole::Body).width;
+                if single_w <= tw {
+                    let y = r.y + r.h.saturating_sub(m.body_h) / 2;
+                    renderer.draw_truncated(fb, &gpus[0], tx, y, tw, TextRole::Body, pal.text);
+                } else {
+                    let block_h = (m.body_h * 2 + 2).min(r.h.saturating_sub(12));
+                    let y = r.y + r.h.saturating_sub(block_h) / 2;
+                    renderer.draw_wrapped(fb, &gpus[0], tx, y, tw, 2, TextRole::Body, pal.text);
+                }
+            }
+        }
+    }
+}
+
+fn draw_memory_tile(
     fb: &mut Framebuffer,
     r: Rect,
     spec: &SystemSpec,
@@ -1276,93 +1662,35 @@ fn draw_mem_gpu_tile(
     renderer: &mut TextRenderer<'_>,
 ) {
     draw_bento_panel(fb, r, pal.tint_mem, pal.border, m.radius, pal.border_px());
-    let px = r.x + m.pad;
-    let tight = r.h < m.cap_h + m.head_h + m.body_h + 26;
-    let py = r.y + if tight { 5 } else { m.pad.min(8) };
-    let tw = r.w.saturating_sub(m.pad * 2);
-    let hero_role = if tight {
-        TextRole::Body
-    } else {
-        TextRole::Heading
-    };
-    let hero_h = if tight { m.body_h } else { m.head_h };
-    draw_eyebrow(fb, px, py, tw, "02 / MEMORY + GPU", pal.eyebrow, renderer);
-    let mut y = py
-        + m.cap_h
-        + (if tight {
-            2
-        } else if m.compact {
-            3
-        } else {
-            5
-        });
+    let pad = m.pad.clamp(7, 12);
+    let px = r.x + pad;
+    let tw = r.w.saturating_sub(pad * 2);
+    if tw < 24 {
+        return;
+    }
     match &spec.memory {
         ProbeState::Pending => {
-            draw_pill(fb, px, y, "PROBING RAM..", pal.warn, pal, m, renderer);
+            let py = r.y + r.h.saturating_sub(m.cap_h + 6) / 2;
+            draw_pill(fb, px, py, "PROBING..", pal.warn, pal, m, renderer);
         }
         ProbeState::Unavailable => {
-            renderer.draw_truncated(fb, "RAM n/a", px, y, tw, hero_role, pal.muted);
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "RAM n/a", px, py, tw, TextRole::Body, pal.muted);
         }
         ProbeState::Ready(mem) => {
+            let block_h = m.head_h + 2 + m.cap_h;
+            let y = r.y + r.h.saturating_sub(block_h) / 2;
             let label = format_mib(mem.total_mib);
-            renderer.draw_truncated(fb, &label, px, y, tw, hero_role, pal.text);
-        }
-    }
-    y += hero_h + (if tight || m.compact { 2 } else { 4 });
-    let sub_role = if tight {
-        TextRole::Caption
-    } else {
-        TextRole::Body
-    };
-    if y + renderer.line_metrics(sub_role).line_height <= r.y + r.h - 4 {
-        match &spec.gpu {
-            ProbeState::Pending => {
-                renderer.draw_truncated(
-                    fb,
-                    "GPU probing..",
-                    px,
-                    y,
-                    tw,
-                    TextRole::Caption,
-                    pal.warn,
-                );
-            }
-            ProbeState::Unavailable => {
-                renderer.draw_truncated(
-                    fb,
-                    "GPU not exposed",
-                    px,
-                    y,
-                    tw,
-                    TextRole::Caption,
-                    pal.muted,
-                );
-            }
-            ProbeState::Ready(gpus) if gpus.is_empty() => {
-                renderer.draw_truncated(
-                    fb,
-                    "GOP only (no PCI GPU)",
-                    px,
-                    y,
-                    tw,
-                    TextRole::Caption,
-                    pal.muted,
-                );
-            }
-            ProbeState::Ready(gpus) => {
-                renderer.draw_truncated(fb, &gpus[0], px, y, tw, sub_role, pal.focus);
-                if gpus.len() > 1 && !tight && y + m.body_h + m.cap_h + 8 < r.y + r.h {
-                    renderer.draw_truncated(
-                        fb,
-                        &format!("+{} more: {}", gpus.len() - 1, gpus[1]),
-                        px,
-                        r.y + r.h - m.pad.min(8) - m.cap_h,
-                        tw,
-                        TextRole::Caption,
-                        pal.muted,
-                    );
-                }
-            }
+            renderer.draw_truncated(fb, &label, px, y, tw, TextRole::Heading, pal.text);
+            renderer.draw_truncated(
+                fb,
+                "RAM",
+                px,
+                y + m.head_h + 2,
+                tw,
+                TextRole::Caption,
+                pal.muted,
+            );
         }
     }
 }
@@ -1375,73 +1703,39 @@ fn draw_board_fw_tile(
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
 ) {
-    draw_bento_panel(fb, r, pal.tint_gpu, pal.border, m.radius, pal.border_px());
-    let px = r.x + m.pad;
-    let tight = r.h < m.cap_h + m.head_h + m.body_h + 26;
-    let py = r.y + if tight { 5 } else { m.pad.min(8) };
-    let tw = r.w.saturating_sub(m.pad * 2);
-    let hero_role = if tight {
-        TextRole::Technical
-    } else {
-        TextRole::Heading
-    };
-    let hero_h = if tight { m.tech_h } else { m.head_h };
-    draw_eyebrow(fb, px, py, tw, "03 / FIRMWARE + GOP", pal.eyebrow, renderer);
-    let mut y = py
-        + m.cap_h
-        + (if tight {
-            2
-        } else if m.compact {
-            3
-        } else {
-            5
-        });
+    draw_bento_panel(fb, r, pal.surface, pal.border, m.radius, pal.border_px());
+    let pad = m.pad.clamp(7, 12);
+    let px = r.x + pad;
+    let tw = r.w.saturating_sub(pad * 2);
+    if tw < 24 {
+        return;
+    }
     let disp = format!("{}×{}", spec.display.width, spec.display.height);
-    renderer.draw_truncated(fb, &disp, px, y, tw, hero_role, pal.focus);
-    y += hero_h + (if tight || m.compact { 2 } else { 4 });
-    let sub_role = if tight {
-        TextRole::Caption
-    } else {
-        TextRole::Body
-    };
-    if y + renderer.line_metrics(sub_role).line_height <= r.y + r.h - 4 {
-        match &spec.firmware {
-            ProbeState::Pending => {
+    let block_h = m.body_h + 3 + m.cap_h + 3 + m.tech_h;
+    let mut y = r.y + r.h.saturating_sub(block_h.min(r.h.saturating_sub(10))) / 2;
+    renderer.draw_truncated(fb, &disp, px, y, tw, TextRole::Body, pal.focus);
+    y += m.body_h + 3;
+    match &spec.firmware {
+        ProbeState::Pending => {
+            renderer.draw_truncated(fb, "UEFI..", px, y, tw, TextRole::Caption, pal.warn);
+        }
+        ProbeState::Unavailable => {
+            renderer.draw_truncated(fb, "UEFI n/a", px, y, tw, TextRole::Caption, pal.muted);
+        }
+        ProbeState::Ready(fw) => {
+            let v = fw.vendor.as_deref().unwrap_or("UEFI");
+            renderer.draw_truncated(fb, v, px, y, tw, TextRole::Caption, pal.text);
+            y += m.cap_h + 3;
+            if y + m.tech_h <= r.y + r.h - 4 {
                 renderer.draw_truncated(
                     fb,
-                    "UEFI probing..",
+                    &format!("UEFI · {}", fw.arch),
                     px,
                     y,
                     tw,
-                    TextRole::Caption,
-                    pal.warn,
-                );
-            }
-            ProbeState::Unavailable => {
-                renderer.draw_truncated(
-                    fb,
-                    "Firmware n/a",
-                    px,
-                    y,
-                    tw,
-                    TextRole::Caption,
+                    TextRole::Technical,
                     pal.muted,
                 );
-            }
-            ProbeState::Ready(fw) => {
-                let v = fw.vendor.as_deref().unwrap_or("UEFI vendor n/a");
-                renderer.draw_truncated(fb, v, px, y, tw, sub_role, pal.text);
-                if !tight && y + m.body_h + m.cap_h + 8 < r.y + r.h {
-                    renderer.draw_truncated(
-                        fb,
-                        &format!("SBM {} · {}", fw.version, fw.arch),
-                        px,
-                        r.y + r.h - m.pad.min(8) - m.cap_h,
-                        tw,
-                        TextRole::Technical,
-                        pal.muted,
-                    );
-                }
             }
         }
     }
@@ -1456,26 +1750,20 @@ fn draw_security_tile(
     renderer: &mut TextRenderer<'_>,
 ) {
     draw_bento_panel(fb, r, pal.tint_sec, pal.border, m.radius, pal.border_px());
-    let px = r.x + m.pad;
-    let tight = r.h < m.cap_h + m.head_h + m.body_h + 26;
-    let py = r.y + if tight { 5 } else { m.pad.min(8) };
-    let tw = r.w.saturating_sub(m.pad * 2);
-    draw_eyebrow(fb, px, py, tw, "04 / SECURITY", pal.eyebrow, renderer);
-    let mut y = py
-        + m.cap_h
-        + (if tight {
-            2
-        } else if m.compact {
-            3
-        } else {
-            5
-        });
+    let pad = m.pad.clamp(7, 12);
+    let px = r.x + pad;
+    let tw = r.w.saturating_sub(pad * 2);
+    if tw < 24 {
+        return;
+    }
     match &spec.security {
         ProbeState::Pending => {
-            draw_pill(fb, px, y, "PROBING..", pal.warn, pal, m, renderer);
+            let py = r.y + r.h.saturating_sub(m.cap_h + 6) / 2;
+            draw_pill(fb, px, py, "PROBING..", pal.warn, pal, m, renderer);
         }
         ProbeState::Unavailable => {
-            renderer.draw_truncated(fb, "Not exposed", px, y, tw, TextRole::Body, pal.muted);
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "SEC n/a", px, py, tw, TextRole::Body, pal.muted);
         }
         ProbeState::Ready(sec) => {
             let sb_col = match sec.secure_boot {
@@ -1484,34 +1772,23 @@ fn draw_security_tile(
                 SecureBootSummary::SetupMode => pal.accent,
                 SecureBootSummary::Unsupported => pal.muted,
             };
-            draw_pill(fb, px, y, sec.secure_boot.badge(), sb_col, pal, m, renderer);
-            y += m.cap_h + (if tight { 8 } else { 12 });
             let tpm = match sec.tpm_present {
-                Some(true) => ("TPM 2.0 OK", pal.ok),
-                Some(false) => ("TPM: none", pal.muted),
-                None => ("TPM: n/a", pal.muted),
+                Some(true) => ("TPM 2.0", pal.ok),
+                Some(false) => ("No TPM", pal.muted),
+                None => ("TPM n/a", pal.muted),
             };
-            let tpm_role = if tight {
-                TextRole::Caption
-            } else {
-                TextRole::Body
-            };
-            if y + renderer.line_metrics(tpm_role).line_height <= r.y + r.h - 4 {
-                renderer.draw_truncated(fb, tpm.0, px, y, tw, tpm_role, tpm.1);
-            }
-            if !tight
-                && let Some(note) = &spec.policy_note
-                && r.y + r.h > y + m.body_h + m.cap_h + 8
+            let pill_h = m.cap_h + 6;
+            let has_note = spec.policy_note.is_some() && r.h >= pill_h + m.body_h + m.cap_h + 18;
+            let block_h = pill_h + 5 + m.body_h + if has_note { 3 + m.cap_h } else { 0 };
+            let mut y = r.y + r.h.saturating_sub(block_h) / 2;
+            draw_pill(fb, px, y, sec.secure_boot.badge(), sb_col, pal, m, renderer);
+            y += pill_h + 5;
+            renderer.draw_truncated(fb, tpm.0, px, y, tw, TextRole::Body, tpm.1);
+            if let Some(note) = &spec.policy_note
+                && has_note
             {
-                renderer.draw_truncated(
-                    fb,
-                    note,
-                    px,
-                    r.y + r.h - m.pad.min(8) - m.cap_h,
-                    tw,
-                    TextRole::Caption,
-                    pal.warn,
-                );
+                y += m.body_h + 3;
+                renderer.draw_truncated(fb, note, px, y, tw, TextRole::Caption, pal.warn);
             }
         }
     }
@@ -1526,34 +1803,43 @@ fn draw_network_tile(
     renderer: &mut TextRenderer<'_>,
 ) {
     draw_bento_panel(fb, r, pal.tint_net, pal.border, m.radius, pal.border_px());
-    let px = r.x + m.pad;
-    let tight = r.h < m.cap_h + m.head_h + m.body_h + 26;
-    let py = r.y + if tight { 5 } else { m.pad.min(8) };
-    let tw = r.w.saturating_sub(m.pad * 2);
-    draw_eyebrow(fb, px, py, tw, "05 / NETWORK", pal.eyebrow, renderer);
-    let mut y = py + m.cap_h + (if tight { 2 } else { 5 });
+    let pad = m.pad.clamp(7, 12);
+    let px = r.x + pad;
+    let tw = r.w.saturating_sub(pad * 2);
+    if tw < 24 {
+        return;
+    }
     match &spec.network {
         ProbeState::Pending => {
-            draw_pill(fb, px, y, "PROBING..", pal.warn, pal, m, renderer);
+            let py = r.y + r.h.saturating_sub(m.cap_h + 6) / 2;
+            draw_pill(fb, px, py, "PROBING..", pal.warn, pal, m, renderer);
         }
         ProbeState::Unavailable => {
-            renderer.draw_truncated(fb, "SNP not exposed", px, y, tw, TextRole::Body, pal.muted);
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "No SNP", px, py, tw, TextRole::Body, pal.muted);
         }
         ProbeState::Ready(nics) if nics.is_empty() => {
-            renderer.draw_truncated(fb, "Offline / no NIC", px, y, tw, TextRole::Body, pal.muted);
+            let py = r.y + r.h.saturating_sub(m.body_h) / 2;
+            renderer.draw_truncated(fb, "Offline", px, py, tw, TextRole::Body, pal.muted);
         }
         ProbeState::Ready(nics) => {
-            for nic in nics.iter().take(if tight { 1 } else { 2 }) {
+            let show = nics.len().min(2);
+            let mut block_h = 0u32;
+            for (i, nic) in nics.iter().take(show).enumerate() {
+                block_h += m.body_h;
+                if nic.address.is_some() {
+                    block_h += 2 + m.tech_h;
+                }
+                if i + 1 < show {
+                    block_h += 4;
+                }
+            }
+            let mut y = r.y + r.h.saturating_sub(block_h.min(r.h.saturating_sub(8))) / 2;
+            for nic in nics.iter().take(show) {
                 let kind = if nic.wireless { "WIFI" } else { "ETH" };
                 let st = if nic.up { "UP" } else { "DOWN" };
                 let col = if nic.up { pal.ok } else { pal.muted };
-                let role = if tight {
-                    TextRole::Caption
-                } else {
-                    TextRole::Body
-                };
-                let lh = renderer.line_metrics(role).line_height;
-                if y + lh > r.y + r.h - 4 {
+                if y + m.body_h > r.y + r.h - 4 {
                     break;
                 }
                 renderer.draw_truncated(
@@ -1562,10 +1848,10 @@ fn draw_network_tile(
                     px,
                     y,
                     tw,
-                    role,
+                    TextRole::Body,
                     col,
                 );
-                y += lh + 2;
+                y += m.body_h + 2;
                 if let Some(addr) = &nic.address
                     && y + m.tech_h <= r.y + r.h - 4
                 {
@@ -1600,43 +1886,36 @@ fn paint_schematic(
         fb.dot_grid(0, 0, w, h, grid_step, pal.grid_dot);
     }
 
-    let header_h = m.header_h;
     let footer_h = m.footer_h;
-    let header_hits = draw_header(
+    let x0 = m.pad;
+    let inner_w = w.saturating_sub(m.pad * 2);
+    let top_y = m.pad;
+    let footer_y = h.saturating_sub(footer_h);
+
+    let ic_h = (m.cap_h + m.body_h + m.tech_h + 28)
+        .max(m.scaled(82))
+        .min((h * 20 / 100).max(86));
+    let (hw_hit, ic_total_h) = draw_schematic_ics(
         fb,
-        w,
-        header_h,
-        "B // HARDWARE SCHEMATIC",
+        Rect {
+            x: x0,
+            y: top_y,
+            w: inner_w,
+            h: ic_h,
+        },
         spec,
         state,
-        opts.detail,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
 
-    let x0 = m.pad;
-    let inner_w = w.saturating_sub(m.pad * 2);
-    let top_y = header_h.saturating_add(m.gap);
-    let footer_y = h.saturating_sub(footer_h);
-    let work_h = footer_y.saturating_sub(top_y).saturating_sub(m.gap);
-
-    let ic_h = (m.cap_h + m.head_h + m.tech_h + 26)
-        .min((h * 20 / 100).max(66))
-        .max(66);
-    let bus_band_h = (m.cap_h + 12).max(if m.compact { 22 } else { 28 });
+    let bus_band_h = if m.compact { 14 } else { 18 };
+    let spine_y = top_y + ic_total_h + bus_band_h / 2;
 
     if paint {
-        let ic_area = Rect {
-            x: x0,
-            y: top_y,
-            w: inner_w,
-            h: ic_h,
-        };
-        draw_schematic_ics(fb, ic_area, spec, pal, m, renderer);
-
-        let spine_y = top_y + ic_h + bus_band_h / 2;
         let left_drop = x0 + inner_w / 10;
         let right_drop = x0 + inner_w - inner_w / 10;
         fb.hline(
@@ -1652,40 +1931,13 @@ fn paint_schematic(
             pal.border_strong,
         );
         let hub_x = x0 + inner_w / 2;
-        fb.vline(hub_x, top_y + ic_h, bus_band_h / 2, pal.accent);
-        fb.vline(hub_x + 1, top_y + ic_h, bus_band_h / 2, pal.accent);
-        fill_circle(fb, hub_x, spine_y, 3.5, pal.accent);
-
-        let bus_tag = "PCIE / SATA / USB STORAGE BUS";
-        let tag_w = renderer.measure(bus_tag, TextRole::Caption).width + 16;
-        let tag_h = m.cap_h + 6;
-        let tag_x = hub_x.saturating_sub(tag_w / 2);
-        let tag_y = spine_y.saturating_sub(tag_h / 2);
-        fb.fill_rect(tag_x, tag_y, tag_w, tag_h, pal.bg);
-        fb.rect_outline(
-            tag_x,
-            tag_y,
-            tag_w,
-            tag_h,
-            pal.border_px(),
-            pal.border_strong,
-        );
-        renderer.draw_centered(
-            fb,
-            bus_tag,
-            Rect {
-                x: tag_x,
-                y: tag_y,
-                w: tag_w,
-                h: tag_h,
-            },
-            TextRole::Caption,
-            pal.eyebrow,
-        );
+        fb.vline(hub_x, top_y + ic_total_h, bus_band_h / 2, pal.accent);
+        fb.vline(hub_x + 1, top_y + ic_total_h, bus_band_h / 2, pal.accent);
+        fill_circle(fb, hub_x, spine_y, 3.2, pal.accent);
     }
 
-    let storage_y = top_y + ic_h + bus_band_h;
-    let storage_h = work_h.saturating_sub(ic_h + bus_band_h);
+    let storage_y = top_y + ic_total_h + bus_band_h;
+    let storage_h = footer_y.saturating_sub(storage_y).saturating_sub(m.gap);
     let storage_rect = Rect {
         x: x0,
         y: storage_y,
@@ -1700,15 +1952,13 @@ fn paint_schematic(
         state,
         pal,
         m,
-        StorageStyle::Schematic {
-            spine_y: top_y + ic_h + bus_band_h / 2,
-        },
+        StorageStyle::Schematic { spine_y },
         opts,
         renderer,
         paint,
     );
-    header_hits.apply(&mut hit);
-    hit.actions = draw_footer(
+    hw_hit.apply(&mut hit);
+    let (actions, help_btn) = draw_footer(
         fb,
         Rect {
             x: 0,
@@ -1717,189 +1967,141 @@ fn paint_schematic(
             h: footer_h,
         },
         state,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
+    hit.actions = actions;
+    hit.help_button = help_btn;
     hit
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_schematic_ics(
     fb: &mut Framebuffer,
     area: Rect,
     spec: &SystemSpec,
+    state: &MenuState,
+    opts: ExperimentalOptions,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
-) {
-    let count = if m.compact { 4 } else { 5 };
-    let link_w = if m.compact { 10 } else { 16 };
-    let block_w = area.w.saturating_sub(link_w * (count as u32 - 1)) / count as u32;
-    let mid_y = area.y + area.h / 2;
+    paint: bool,
+) -> (HwStripHit, u32) {
+    let link_w: u32 = if m.compact { 10 } else { 14 };
+    let brand_w = brand_tile_min_width(area.h, spec, m, renderer);
+    let base_widths: [u32; 7] = [
+        brand_w,
+        m.scaled(222).max(176),
+        m.scaled(248).max(190),
+        m.scaled(124).max(98),
+        m.scaled(172).max(138),
+        m.scaled(148).max(118),
+        m.scaled(182).max(144),
+    ];
+    let total_links = link_w.saturating_mul(6);
+    let natural_w: u32 = base_widths.iter().sum::<u32>().saturating_add(total_links);
+    let scrollable_x = natural_w > area.w;
 
-    let mut x = area.x;
-    for idx in 0..count {
-        let bw = if idx + 1 == count {
-            area.x + area.w - x
-        } else {
-            block_w
-        };
-        let r = Rect {
-            x,
-            y: area.y,
-            w: bw,
-            h: area.h,
-        };
-        fb.fill_rect(r.x, r.y, r.w, r.h, pal.surface);
-        fb.rect_outline(r.x, r.y, r.w, r.h, pal.border_px(), pal.border_strong);
-        fb.corner_ticks(r.x, r.y, r.w, r.h, 6, pal.accent);
-
-        let px = r.x + 8;
-        let py = r.y + 6;
-        let tw = r.w.saturating_sub(16);
-        let l1_y = py + m.cap_h + 8;
-        let l2_y = r.y + r.h - m.tech_h - 6;
-
-        match idx {
-            0 => {
-                draw_ic_tag(fb, px, py, "U1", "CPU", pal.accent, pal, m, renderer);
-                let line1 = match &spec.cpu {
-                    ProbeState::Pending => "PROBING..".into(),
-                    ProbeState::Unavailable => "NOT EXPOSED".into(),
-                    ProbeState::Ready(c) => match c.cores {
-                        Some(n) => format!("{n}C · {}", c.arch.to_ascii_uppercase()),
-                        None => c.arch.to_ascii_uppercase(),
-                    },
-                };
-                let line2 = match &spec.cpu {
-                    ProbeState::Ready(c) => c.model.as_deref().unwrap_or("Model n/a"),
-                    _ => "",
-                };
-                let c1 = if matches!(spec.cpu, ProbeState::Pending) {
-                    pal.warn
-                } else {
-                    pal.text
-                };
-                renderer.draw_truncated(fb, &line1, px, l1_y, tw, TextRole::Heading, c1);
-                if !line2.is_empty() && l2_y > l1_y + m.head_h {
-                    renderer.draw_truncated(fb, line2, px, l2_y, tw, TextRole::Caption, pal.muted);
-                }
-            }
-            1 => {
-                draw_ic_tag(fb, px, py, "M1", "MEM+GPU", pal.focus, pal, m, renderer);
-                let line1 = match &spec.memory {
-                    ProbeState::Pending => "PROBING..".into(),
-                    ProbeState::Unavailable => "RAM N/A".into(),
-                    ProbeState::Ready(mem) => format_mib(mem.total_mib),
-                };
-                let line2 = match &spec.gpu {
-                    ProbeState::Pending => "GPU probing..",
-                    ProbeState::Unavailable => "GPU n/a",
-                    ProbeState::Ready(g) => g.first().map(String::as_str).unwrap_or("GOP only"),
-                };
-                renderer.draw_truncated(fb, &line1, px, l1_y, tw, TextRole::Heading, pal.text);
-                if l2_y > l1_y + m.head_h {
-                    renderer.draw_truncated(fb, line2, px, l2_y, tw, TextRole::Caption, pal.focus);
-                }
-            }
-            2 => {
-                draw_ic_tag(fb, px, py, "F1", "UEFI/GOP", pal.part_rec, pal, m, renderer);
-                let line1 = format!("{}×{}", spec.display.width, spec.display.height);
-                let line2 = match &spec.firmware {
-                    ProbeState::Pending => "FW probing..",
-                    ProbeState::Unavailable => "FW n/a",
-                    ProbeState::Ready(fw) => fw.vendor.as_deref().unwrap_or("UEFI"),
-                };
-                renderer.draw_truncated(fb, &line1, px, l1_y, tw, TextRole::Heading, pal.text);
-                if l2_y > l1_y + m.head_h {
-                    renderer.draw_truncated(fb, line2, px, l2_y, tw, TextRole::Caption, pal.muted);
-                }
-            }
-            3 => {
-                draw_ic_tag(fb, px, py, "S1", "SEC/TPM", pal.ok, pal, m, renderer);
-                let (l1, c1, l2): (&str, Rgba, &str) = match &spec.security {
-                    ProbeState::Pending => ("PROBING..", pal.warn, "TPM.."),
-                    ProbeState::Unavailable => ("N/A", pal.muted, "Not exposed"),
-                    ProbeState::Ready(s) => {
-                        let c = match s.secure_boot {
-                            SecureBootSummary::Enabled => pal.ok,
-                            SecureBootSummary::Disabled => pal.warn,
-                            _ => pal.muted,
-                        };
-                        let tpm = match s.tpm_present {
-                            Some(true) => "TPM 2.0 OK",
-                            Some(false) => "NO TPM",
-                            None => "TPM N/A",
-                        };
-                        (s.secure_boot.badge(), c, tpm)
-                    }
-                };
-                renderer.draw_truncated(fb, l1, px, l1_y, tw, TextRole::Heading, c1);
-                if l2_y > l1_y + m.head_h {
-                    renderer.draw_truncated(fb, l2, px, l2_y, tw, TextRole::Technical, pal.muted);
-                }
-            }
-            _ => {
-                draw_ic_tag(fb, px, py, "N1", "NET", pal.ok, pal, m, renderer);
-                let (l1, c1, l2) = match &spec.network {
-                    ProbeState::Pending => ("PROBING..".into(), pal.warn, String::new()),
-                    ProbeState::Unavailable => ("SNP N/A".into(), pal.muted, String::new()),
-                    ProbeState::Ready(nics) => match nics.first() {
-                        Some(nic) => (
-                            format!("{} {}", nic.name, if nic.up { "UP" } else { "DOWN" }),
-                            if nic.up { pal.ok } else { pal.muted },
-                            nic.address.clone().unwrap_or_else(|| "no IP".into()),
-                        ),
-                        None => ("OFFLINE".into(), pal.muted, "no NIC".into()),
-                    },
-                };
-                renderer.draw_truncated(fb, &l1, px, l1_y, tw, TextRole::Heading, c1);
-                if !l2.is_empty() && l2_y > l1_y + m.head_h {
-                    renderer.draw_truncated(fb, &l2, px, l2_y, tw, TextRole::Technical, pal.muted);
-                }
+    let widths: [u32; 7] = if !scrollable_x && area.w > total_links {
+        let avail = area.w.saturating_sub(total_links);
+        let sum_base = base_widths.iter().sum::<u32>().max(1);
+        let mut out = [0u32; 7];
+        let mut used = 0u32;
+        for i in 0..7 {
+            if i == 6 {
+                out[i] = avail.saturating_sub(used);
+            } else {
+                let w = ((avail as u64 * base_widths[i] as u64) / sum_base as u64) as u32;
+                out[i] = w;
+                used = used.saturating_add(w);
             }
         }
+        out
+    } else {
+        base_widths
+    };
 
-        if idx + 1 < count {
-            let lx = r.x + r.w;
-            fb.hline(lx, mid_y, link_w, pal.border_strong);
-            fill_circle(fb, lx, mid_y, 2.2, pal.accent);
-            fill_circle(fb, lx + link_w, mid_y, 2.2, pal.accent);
+    let content_w: u32 = widths.iter().sum::<u32>().saturating_add(total_links);
+    let max_scroll_x = content_w.saturating_sub(area.w);
+    let eff_scroll_x = opts.scroll_x.min(max_scroll_x);
+
+    let mut hw_hit = HwStripHit {
+        viewport: Some(area),
+        scroll_x: eff_scroll_x,
+        max_scroll_x,
+        ..HwStripHit::default()
+    };
+
+    if paint {
+        let mid_y = area.y + area.h / 2;
+        fb.set_viewport_xy(area.x, area.y, area.w, area.h, -(eff_scroll_x as i32), 0);
+        let mut x = area.x;
+        for (idx, &bw) in widths.iter().enumerate() {
+            let r = Rect {
+                x,
+                y: area.y,
+                w: bw,
+                h: area.h,
+            };
+            let screen_x0 = (r.x as i64) - (eff_scroll_x as i64);
+            let screen_x1 = screen_x0 + (r.w as i64) + (link_w as i64);
+            if screen_x1 > area.x as i64 && screen_x0 < (area.x + area.w) as i64 {
+                match idx {
+                    0 => draw_brand_tile(fb, r, spec, pal, m, renderer),
+                    1 => draw_cpu_tile(fb, r, spec, pal, m, renderer),
+                    2 => draw_gpu_tile(fb, r, spec, pal, m, renderer),
+                    3 => draw_memory_tile(fb, r, spec, pal, m, renderer),
+                    4 => draw_board_fw_tile(fb, r, spec, pal, m, renderer),
+                    5 => draw_security_tile(fb, r, spec, pal, m, renderer),
+                    _ => draw_network_tile(fb, r, spec, pal, m, renderer),
+                }
+                fb.corner_ticks(r.x, r.y, r.w, r.h, 6, pal.accent);
+                if idx + 1 < 7 {
+                    let lx = r.x + r.w;
+                    fb.hline(lx, mid_y, link_w, pal.border_strong);
+                    fill_circle(fb, lx, mid_y, 2.2, pal.accent);
+                    fill_circle(fb, lx + link_w, mid_y, 2.2, pal.accent);
+                }
+            }
+            x = x.saturating_add(bw).saturating_add(link_w);
         }
-        x = x.saturating_add(bw).saturating_add(link_w);
+        fb.clear_viewport();
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn draw_ic_tag(
-    fb: &mut Framebuffer,
-    x: u32,
-    y: u32,
-    code: &str,
-    name: &str,
-    accent: Rgba,
-    pal: &Palette,
-    m: Metrics,
-    renderer: &mut TextRenderer<'_>,
-) {
-    let cw = renderer.measure(code, TextRole::Technical).width + 10;
-    let h = m.cap_h.max(m.tech_h) + 4;
-    let badge_rect = Rect { x, y, w: cw, h };
-    draw_rrect(fb, badge_rect, 3, accent);
-    renderer.draw_centered(fb, code, badge_rect, TextRole::Technical, pal.on_accent);
-    renderer.draw_top(
-        fb,
-        name,
-        x + cw + 6,
-        y + h.saturating_sub(m.cap_h) / 2,
-        TextRole::Caption,
-        pal.eyebrow,
-    );
+    let total_h = if scrollable_x {
+        let sb_h = if m.compact { 12 } else { 14 };
+        let sb_gap = 4u32;
+        let sb_rect = Rect {
+            x: area.x,
+            y: area.y.saturating_add(area.h).saturating_add(sb_gap),
+            w: area.w,
+            h: sb_h,
+        };
+        draw_h_scrollbar(
+            fb,
+            sb_rect,
+            area,
+            content_w,
+            eff_scroll_x,
+            max_scroll_x,
+            state,
+            pal,
+            paint,
+            &mut hw_hit,
+        );
+        area.h.saturating_add(sb_gap).saturating_add(sb_h)
+    } else {
+        area.h
+    };
+
+    (hw_hit, total_h)
 }
 
 // ============================================================================
-// Experiment C: Storage-First Full-Width LBA Paragraph Canvases + Spec Strip
+// Experiment C: Storage-First Full-Width LBA Paragraph Canvases + Compact Strip
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
@@ -1918,48 +2120,33 @@ fn paint_storage_first(
     if paint {
         fb.fill(pal.bg);
     }
-    let header_h = m.header_h;
     let footer_h = m.footer_h;
-    let strip_h = if m.compact {
-        m.tech_h * 2 + 12
-    } else {
-        m.tech_h + 14
-    };
+    let strip_h = (m.cap_h + m.body_h + m.tech_h + 22)
+        .max(m.scaled(72))
+        .min((h * 16 / 100).max(74));
 
-    let header_hits = draw_header(
+    let x0 = m.pad;
+    let inner_w = w.saturating_sub(m.pad * 2);
+    let strip_y = m.pad;
+
+    let (hw_hit, strip_total_h) = draw_bento_hw_grid(
         fb,
-        w,
-        header_h,
-        "C // STORAGE-FIRST",
+        Rect {
+            x: x0,
+            y: strip_y,
+            w: inner_w,
+            h: strip_h,
+        },
         spec,
         state,
-        opts.detail,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
 
-    let x0 = m.pad;
-    let inner_w = w.saturating_sub(m.pad * 2);
-    let strip_y = header_h.saturating_add(m.gap);
-    if paint {
-        draw_compact_hw_strip(
-            fb,
-            Rect {
-                x: x0,
-                y: strip_y,
-                w: inner_w,
-                h: strip_h,
-            },
-            spec,
-            pal,
-            m,
-            renderer,
-        );
-    }
-
-    let storage_y = strip_y.saturating_add(strip_h).saturating_add(m.gap);
+    let storage_y = strip_y.saturating_add(strip_total_h).saturating_add(m.gap);
     let footer_y = h.saturating_sub(footer_h);
     let storage_h = footer_y.saturating_sub(storage_y).saturating_sub(m.gap);
 
@@ -1980,8 +2167,8 @@ fn paint_storage_first(
         renderer,
         paint,
     );
-    header_hits.apply(&mut hit);
-    hit.actions = draw_footer(
+    hw_hit.apply(&mut hit);
+    let (actions, help_btn) = draw_footer(
         fb,
         Rect {
             x: 0,
@@ -1990,142 +2177,15 @@ fn paint_storage_first(
             h: footer_h,
         },
         state,
+        opts,
         pal,
         m,
         renderer,
         paint,
     );
+    hit.actions = actions;
+    hit.help_button = help_btn;
     hit
-}
-
-fn draw_compact_hw_strip(
-    fb: &mut Framebuffer,
-    r: Rect,
-    spec: &SystemSpec,
-    pal: &Palette,
-    m: Metrics,
-    renderer: &mut TextRenderer<'_>,
-) {
-    draw_bento_panel(
-        fb,
-        r,
-        pal.surface,
-        pal.border,
-        m.radius.min(8),
-        pal.border_px(),
-    );
-    let cpu = match &spec.cpu {
-        ProbeState::Pending => "CPU: probing..".into(),
-        ProbeState::Unavailable => "CPU: n/a".into(),
-        ProbeState::Ready(c) => {
-            let short = c
-                .model
-                .as_deref()
-                .map(short_cpu_name)
-                .unwrap_or_else(|| c.arch.clone());
-            match c.cores {
-                Some(n) => format!("CPU {short} ({n}C)"),
-                None => format!("CPU {short}"),
-            }
-        }
-    };
-    let ram = match &spec.memory {
-        ProbeState::Pending => "RAM: ..".into(),
-        ProbeState::Unavailable => "RAM: n/a".into(),
-        ProbeState::Ready(mem) => format!("RAM {}", format_mib(mem.total_mib)),
-    };
-    let gpu = match &spec.gpu {
-        ProbeState::Pending => "GPU: ..".into(),
-        ProbeState::Unavailable => "GPU: n/a".into(),
-        ProbeState::Ready(g) => format!(
-            "GPU {}",
-            g.first()
-                .map(|s| short_gpu_name(s))
-                .unwrap_or_else(|| "GOP".into())
-        ),
-    };
-    let sec = match &spec.security {
-        ProbeState::Pending => "SEC: ..".into(),
-        ProbeState::Unavailable => "SEC: n/a".into(),
-        ProbeState::Ready(s) => {
-            let tpm = match s.tpm_present {
-                Some(true) => " TPM2",
-                Some(false) => " NO-TPM",
-                None => "",
-            };
-            format!("{}{tpm}", s.secure_boot.badge())
-        }
-    };
-    let net = match &spec.network {
-        ProbeState::Pending => "NET: ..".into(),
-        ProbeState::Unavailable => "NET: n/a".into(),
-        ProbeState::Ready(nics) => match nics.first() {
-            Some(nic) => format!(
-                "NET {} {}",
-                nic.name,
-                nic.address
-                    .as_deref()
-                    .unwrap_or(if nic.up { "UP" } else { "DOWN" })
-            ),
-            None => "NET offline".into(),
-        },
-    };
-    let disp = format!("GOP {}×{}", spec.display.width, spec.display.height);
-
-    let segments = [
-        (cpu, pal.accent),
-        (ram, pal.text),
-        (gpu, pal.focus),
-        (sec, pal.ok),
-        (net, pal.muted),
-        (disp, pal.eyebrow),
-    ];
-
-    if m.compact {
-        let cell_w = r.w / 3;
-        let row_h = r.h / 2;
-        for (i, (label, color)) in segments.iter().enumerate() {
-            let col = (i % 3) as u32;
-            let row = (i / 3) as u32;
-            let cx = r.x + col * cell_w + 8;
-            let cy = r.y + row * row_h + row_h.saturating_sub(m.tech_h) / 2;
-            if col > 0 && row == 0 {
-                fb.vline(
-                    r.x + col * cell_w,
-                    r.y + 4,
-                    r.h.saturating_sub(8),
-                    pal.border,
-                );
-            }
-            renderer.draw_truncated(
-                fb,
-                label,
-                cx,
-                cy,
-                cell_w.saturating_sub(14),
-                TextRole::Technical,
-                *color,
-            );
-        }
-    } else {
-        let cell_w = r.w / segments.len() as u32;
-        let ty = r.y + r.h.saturating_sub(m.tech_h) / 2;
-        for (i, (label, color)) in segments.iter().enumerate() {
-            let cx = r.x + i as u32 * cell_w;
-            if i > 0 {
-                fb.vline(cx, r.y + 5, r.h.saturating_sub(10), pal.border);
-            }
-            renderer.draw_truncated(
-                fb,
-                label,
-                cx + 8,
-                ty,
-                cell_w.saturating_sub(14),
-                TextRole::Technical,
-                *color,
-            );
-        }
-    }
 }
 
 // ============================================================================
@@ -2324,12 +2384,54 @@ fn draw_storage_workspace(
         ..LayoutHitMap::default()
     };
 
+    let bus_gutter = match style {
+        StorageStyle::Schematic { .. } => {
+            if m.compact {
+                12
+            } else {
+                18
+            }
+        }
+        _ => 0,
+    };
+    let bar_h = (m.cap_h + 10).clamp(22, 32);
+    let bar_gap = if m.compact { 4 } else { 6 };
+    let label_h = bar_h.saturating_add(bar_gap);
+    let bar_rect = Rect {
+        x: area.x.saturating_add(bus_gutter),
+        y: area.y,
+        w: area.w.saturating_sub(bus_gutter),
+        h: bar_h,
+    };
+    let work = Rect {
+        x: area.x.saturating_add(bus_gutter),
+        y: area.y.saturating_add(label_h),
+        w: area.w.saturating_sub(bus_gutter),
+        h: area.h.saturating_sub(label_h),
+    };
+
     let all_devices = match &spec.storage {
         ProbeState::Pending => {
+            let (cr, dr, bar_abort) = draw_storage_section_bar(
+                fb,
+                bar_rect,
+                Some("Probing storage..."),
+                state,
+                opts,
+                pal,
+                m,
+                renderer,
+                paint,
+            );
+            hit.detail_compact = cr;
+            hit.detail_detailed = dr;
+            if let Some(ar) = bar_abort {
+                hit.abort_buttons.push(ar);
+            }
             if paint {
                 draw_empty_storage_panel(
                     fb,
-                    area,
+                    work,
                     "PROBING STORAGE DEVICES...",
                     pal.warn,
                     pal,
@@ -2340,10 +2442,26 @@ fn draw_storage_workspace(
             return hit;
         }
         ProbeState::Unavailable => {
+            let (cr, dr, bar_abort) = draw_storage_section_bar(
+                fb,
+                bar_rect,
+                Some("Storage not exposed"),
+                state,
+                opts,
+                pal,
+                m,
+                renderer,
+                paint,
+            );
+            hit.detail_compact = cr;
+            hit.detail_detailed = dr;
+            if let Some(ar) = bar_abort {
+                hit.abort_buttons.push(ar);
+            }
             if paint {
                 draw_empty_storage_panel(
                     fb,
-                    area,
+                    work,
                     "No storage devices exposed by firmware",
                     pal.muted,
                     pal,
@@ -2354,10 +2472,26 @@ fn draw_storage_workspace(
             return hit;
         }
         ProbeState::Ready(list) if list.is_empty() => {
+            let (cr, dr, bar_abort) = draw_storage_section_bar(
+                fb,
+                bar_rect,
+                Some("No drives"),
+                state,
+                opts,
+                pal,
+                m,
+                renderer,
+                paint,
+            );
+            hit.detail_compact = cr;
+            hit.detail_detailed = dr;
+            if let Some(ar) = bar_abort {
+                hit.abort_buttons.push(ar);
+            }
             if paint {
                 draw_empty_storage_panel(
                     fb,
-                    area,
+                    work,
                     "No physical storage devices discovered",
                     pal.muted,
                     pal,
@@ -2385,27 +2519,6 @@ fn draw_storage_workspace(
         0
     } else {
         all_devices.len().saturating_sub(visible_devices.len())
-    };
-
-    let bus_gutter = match style {
-        StorageStyle::Schematic { .. } => {
-            if m.compact {
-                12
-            } else {
-                18
-            }
-        }
-        _ => 0,
-    };
-    let label_h = match style {
-        StorageStyle::Schematic { .. } => 0,
-        StorageStyle::Bento | StorageStyle::FullWidthRack => m.cap_h + 6,
-    };
-    let work = Rect {
-        x: area.x.saturating_add(bus_gutter),
-        y: area.y.saturating_add(label_h),
-        w: area.w.saturating_sub(bus_gutter),
-        h: area.h.saturating_sub(label_h),
     };
     hit.viewport_h = work.h;
 
@@ -2531,7 +2644,7 @@ fn draw_storage_workspace(
         .copied()
         .sum::<u32>()
         .saturating_add(total_gaps);
-    let scrollable = natural_total_h > work.h && rows > 1;
+    let scrollable = natural_total_h > work.h;
 
     // If everything fits comfortably inside `work.h`, stretch rows proportionally
     // to fill the canvas (in Compact mode, cap single-row drives with <=3 targets
@@ -2588,50 +2701,60 @@ fn draw_storage_workspace(
         h: work.h,
     };
 
-    if paint && matches!(style, StorageStyle::Bento | StorageStyle::FullWidthRack) {
-        let total_targets: usize = visible_devices
-            .iter()
-            .map(|(_, d)| d.boot_target_count())
-            .sum();
-        let scroll_hint = if scrollable { " · SCROLL DRIVES" } else { "" };
-        let title = match opts.detail {
-            StorageDetail::Compact => {
-                let prefix = match style {
-                    StorageStyle::FullWidthRack => "BOOTABLE DRIVES  //  ",
-                    _ => "OPERATING SYSTEMS BY DRIVE  //  ",
-                };
-                let hidden_note = if hidden_data_drives > 0 {
+    {
+        let hint_title = opts.show_hints.then(|| {
+            let total_targets: usize = visible_devices
+                .iter()
+                .map(|(_, d)| d.boot_target_count())
+                .sum();
+            let scroll_hint = if scrollable {
+                " · scroll vertically"
+            } else {
+                ""
+            };
+            match opts.detail {
+                StorageDetail::Compact => {
+                    let hidden_note = if hidden_data_drives > 0 {
+                        format!(
+                            " · {} data drive{} in Detailed",
+                            hidden_data_drives,
+                            if hidden_data_drives == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " · {} DATA DRIVE{} IN DETAILED",
-                        hidden_data_drives,
-                        if hidden_data_drives == 1 { "" } else { "S" }
+                        "{} drive{} · {} OS{hidden_note}{scroll_hint}",
+                        visible_devices.len(),
+                        if visible_devices.len() == 1 { "" } else { "s" },
+                        total_targets,
                     )
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{prefix}{} DRIVE{} · {} OS TARGET{}{hidden_note}{scroll_hint}",
+                }
+                StorageDetail::Detailed => format!(
+                    "LBA order · {} drive{} · {} boot target{}{scroll_hint}",
                     visible_devices.len(),
-                    if visible_devices.len() == 1 { "" } else { "S" },
+                    if visible_devices.len() == 1 { "" } else { "s" },
                     total_targets,
-                    if total_targets == 1 { "" } else { "S" },
-                )
+                    if total_targets == 1 { "" } else { "s" },
+                ),
             }
-            StorageDetail::Detailed => {
-                let prefix = match style {
-                    StorageStyle::FullWidthRack => "LBA STORAGE RACK  //  ",
-                    _ => "STORAGE TOPOLOGY (LBA ORDER)  //  ",
-                };
-                format!(
-                    "{prefix}{} DEVICE{} · {} BOOT TARGET{}{scroll_hint}",
-                    visible_devices.len(),
-                    if visible_devices.len() == 1 { "" } else { "S" },
-                    total_targets,
-                    if total_targets == 1 { "" } else { "S" },
-                )
-            }
-        };
-        draw_eyebrow(fb, area.x, area.y, area.w, &title, pal.eyebrow, renderer);
+        });
+        let (cr, dr, bar_abort) = draw_storage_section_bar(
+            fb,
+            bar_rect,
+            hint_title.as_deref(),
+            state,
+            opts,
+            pal,
+            m,
+            renderer,
+            paint,
+        );
+        hit.detail_compact = cr;
+        hit.detail_detailed = dr;
+        if let Some(ar) = bar_abort {
+            hit.abort_buttons.push(ar);
+        }
     }
 
     let col_w =
@@ -2737,6 +2860,7 @@ fn draw_storage_workspace(
                         dev,
                         state,
                         content_cursor,
+                        opts.show_hints,
                         pal,
                         m,
                         style,
@@ -2751,6 +2875,7 @@ fn draw_storage_workspace(
                             dev,
                             state,
                             content_cursor,
+                            opts.show_hints,
                             pal,
                             m,
                             style,
@@ -2834,6 +2959,158 @@ fn draw_storage_workspace(
     }
 
     hit
+}
+
+/// Renders the storage section control bar directly above the drive cards:
+/// right-aligned `[ Compact | Detailed ]` toggle scoped specifically to storage,
+/// active autoboot countdown pill + `[X]` abort button when a policy timer runs,
+/// and optional left-side hint summary when `?` (`show_hints`) is active.
+#[allow(clippy::too_many_arguments)]
+fn draw_storage_section_bar(
+    fb: &mut Framebuffer,
+    bar: Rect,
+    title: Option<&str>,
+    state: &MenuState,
+    opts: ExperimentalOptions,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+    paint: bool,
+) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+    if bar.w < 120 || bar.h < 16 {
+        return (None, None, None);
+    }
+
+    let c_lbl = if bar.w < 500 { "Cmp" } else { "Compact" };
+    let d_lbl = if bar.w < 500 { "Det" } else { "Detailed" };
+    let c_w = renderer.measure(c_lbl, TextRole::Caption).width + 16;
+    let d_w = renderer.measure(d_lbl, TextRole::Caption).width + 16;
+    let toggle_w = c_w + d_w + 4;
+    let show_toggle = toggle_w + 20 <= bar.w;
+
+    let (toggle_x, detail_compact, detail_detailed) = if show_toggle {
+        let tx = bar.x + bar.w.saturating_sub(toggle_w);
+        let seg_h = bar.h.saturating_sub(4).max(12);
+        let seg_y = bar.y + 2;
+        (
+            tx,
+            Some(Rect {
+                x: tx + 2,
+                y: seg_y,
+                w: c_w,
+                h: seg_h,
+            }),
+            Some(Rect {
+                x: tx + 2 + c_w,
+                y: seg_y,
+                w: d_w,
+                h: seg_h,
+            }),
+        )
+    } else {
+        (bar.x + bar.w, None, None)
+    };
+
+    // Place active policy autoboot countdown + `[X]` abort right to the left of the toggle.
+    let (abort_rect, countdown_x) = if let Some(ms) = state.countdown_ms {
+        let sz = bar.h.saturating_sub(2).clamp(18, 26);
+        let status = format!("BOOT IN {}s", ms.div_ceil(1000));
+        let status_w = renderer.measure(&status, TextRole::Caption).width + 12;
+        let ax = toggle_x.saturating_sub(sz + 8);
+        let sx = ax.saturating_sub(status_w + 5);
+        if sx > bar.x + 8 {
+            (
+                Some(Rect {
+                    x: ax,
+                    y: bar.y + bar.h.saturating_sub(sz) / 2,
+                    w: sz,
+                    h: sz,
+                }),
+                Some((sx, status, ms)),
+            )
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    if !paint {
+        return (detail_compact, detail_detailed, abort_rect);
+    }
+
+    let left_limit = countdown_x
+        .as_ref()
+        .map(|(sx, _, _)| *sx)
+        .unwrap_or(toggle_x);
+    if let Some(text) = title {
+        let title_max_w = left_limit.saturating_sub(bar.x + 10);
+        if title_max_w > 24 {
+            let ty = bar.y + bar.h.saturating_sub(m.cap_h) / 2;
+            draw_eyebrow(fb, bar.x, ty, title_max_w, text, pal.eyebrow, renderer);
+        }
+    }
+
+    let hover_cursor = if opts.overflow_drive.is_some() {
+        None
+    } else {
+        state.cursor
+    };
+
+    if let (Some(ar), Some((sx, status, ms))) = (abort_rect, countdown_x) {
+        let status_col = pal.accent.mix(pal.focus, autoboot_pulse(ms) / 3, 255);
+        let pill_h = m.cap_h + 6;
+        let pill_y = bar.y + bar.h.saturating_sub(pill_h) / 2;
+        draw_pill(fb, sx, pill_y, &status, status_col, pal, m, renderer);
+        let hov = hover_cursor.is_some_and(|(cx, cy)| ar.contains(cx, cy));
+        draw_abort_x_button(fb, ar, hov, pal);
+        if state.countdown_total_ms > 0 {
+            let fill_w = (bar.w as u64 * ms as u64 / state.countdown_total_ms as u64) as u32;
+            fb.fill_rect(
+                bar.x,
+                bar.y + bar.h.saturating_sub(2),
+                fill_w,
+                2,
+                pal.accent,
+            );
+        }
+    }
+
+    if let (Some(cr), Some(dr)) = (detail_compact, detail_detailed) {
+        let outer = Rect {
+            x: toggle_x,
+            y: bar.y,
+            w: toggle_w,
+            h: bar.h,
+        };
+        draw_bento_panel(
+            fb,
+            outer,
+            pal.surface_alt,
+            pal.border_strong,
+            6,
+            pal.border_px(),
+        );
+        for (seg_r, lbl, mode_val) in [
+            (cr, c_lbl, StorageDetail::Compact),
+            (dr, d_lbl, StorageDetail::Detailed),
+        ] {
+            let active = opts.detail == mode_val;
+            let hovered = hover_cursor.is_some_and(|(cx, cy)| seg_r.contains(cx, cy));
+            if active {
+                draw_rrect(fb, seg_r, 4, pal.focus);
+                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, pal.on_accent);
+            } else {
+                if hovered {
+                    draw_rrect(fb, seg_r, 4, pal.surface_selected);
+                }
+                let col = if hovered { pal.text } else { pal.muted };
+                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, col);
+            }
+        }
+    }
+
+    (detail_compact, detail_detailed, abort_rect)
 }
 
 fn shift_and_clip_rect(r: Rect, scroll_y: u32, viewport: Rect) -> Option<Rect> {
@@ -2935,6 +3212,7 @@ fn draw_compact_storage_device(
     dev: &StorageDevice,
     state: &MenuState,
     cursor: Option<(u32, u32)>,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     style: StorageStyle,
@@ -3162,7 +3440,8 @@ fn draw_compact_storage_device(
             let countdown = if selected { state.countdown_ms } else { None };
             let hovered = cursor.is_some_and(|(mx, my)| card_r.contains(mx, my));
             if let Some(ar) = draw_compact_os_card(
-                fb, card_r, item, selected, hovered, countdown, cursor, pal, m, renderer, paint,
+                fb, card_r, item, selected, hovered, countdown, cursor, show_hints, pal, m,
+                renderer, paint,
             ) {
                 abort_buttons.push(ar);
             }
@@ -3216,6 +3495,7 @@ fn draw_compact_os_card(
     hovered: bool,
     countdown_ms: Option<u32>,
     cursor: Option<(u32, u32)>,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
@@ -3300,7 +3580,7 @@ fn draw_compact_os_card(
             draw_pill(fb, pill_x, pill_y, &pill_txt, pill_col, pal, m, renderer);
             right_limit = pill_x.saturating_sub(8);
         }
-    } else if selected && r.w >= m.scaled(270) {
+    } else if show_hints && selected && r.w >= m.scaled(270) {
         let cue = if r.w >= m.scaled(360) {
             "ENTER / CLICK: BOOT"
         } else {
@@ -3537,6 +3817,7 @@ fn draw_overflow_popover(
     spec: &SystemSpec,
     drive_idx: usize,
     state: &MenuState,
+    opts: ExperimentalOptions,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
@@ -3559,7 +3840,7 @@ fn draw_overflow_popover(
     let header_h = m.head_h.max(m.tech_h + 8) + 8;
     let row_h = m.scaled(58).max(m.body_h + m.cap_h + 22);
     let row_gap = 8u32;
-    let footer_h = m.cap_h + 10;
+    let footer_h = if opts.show_hints { m.cap_h + 10 } else { 0 };
 
     let max_panel_w = w.saturating_sub(32).max(240);
     let panel_w = (w * 56 / 100)
@@ -3670,6 +3951,7 @@ fn draw_overflow_popover(
             hovered,
             countdown,
             state.cursor,
+            opts.show_hints,
             pal,
             m,
             renderer,
@@ -3685,7 +3967,7 @@ fn draw_overflow_popover(
         cur_y = cur_y.saturating_add(rh + row_gap);
     }
 
-    if paint {
+    if paint && opts.show_hints {
         let hint = "Click to select · Click again or Enter to boot · Esc or click outside to close";
         renderer.draw_truncated(
             fb,
@@ -3706,6 +3988,7 @@ fn draw_storage_device(
     dev: &StorageDevice,
     state: &MenuState,
     cursor: Option<(u32, u32)>,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     style: StorageStyle,
@@ -4030,6 +4313,7 @@ fn draw_storage_device(
                         cursor,
                         is_selected,
                         hovered,
+                        show_hints,
                         pal,
                         m,
                         renderer,
@@ -4073,6 +4357,7 @@ fn draw_storage_device(
                 cursor,
                 is_selected,
                 hovered,
+                show_hints,
                 pal,
                 m,
                 renderer,
@@ -4109,7 +4394,7 @@ fn draw_storage_device(
                 h: prov_h,
             };
             if let Some(hreg) = hovered_region {
-                draw_hover_lba_bar(fb, pr, dev, hreg, pal, m, renderer);
+                draw_hover_lba_bar(fb, pr, dev, hreg, show_hints, pal, m, renderer);
             } else if let Some((sel_reg, sel_target)) = dev.find_selected(state.selected) {
                 draw_provenance_bar(
                     fb,
@@ -4118,6 +4403,7 @@ fn draw_storage_device(
                     sel_reg,
                     sel_target,
                     state.countdown_ms.is_some(),
+                    show_hints,
                     pal,
                     m,
                     renderer,
@@ -4188,6 +4474,7 @@ fn draw_partition_content(
     cursor: Option<(u32, u32)>,
     is_selected: bool,
     hovered: bool,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
@@ -4393,7 +4680,7 @@ fn draw_partition_content(
                     draw_pill(fb, bx, pill_y, &badge, bcol, pal, m, renderer);
                     right_edge = bx.saturating_sub(8);
                 }
-            } else if paint {
+            } else if paint && show_hints {
                 let boot_badge = if is_selected && tw >= m.scaled(185) {
                     Some("ENTER / CLICK: BOOT")
                 } else if hovered && tw >= m.scaled(165) {
@@ -4786,11 +5073,13 @@ fn draw_abort_x_button(fb: &mut Framebuffer, r: Rect, hovered: bool, pal: &Palet
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_hover_lba_bar(
     fb: &mut Framebuffer,
     r: Rect,
     dev: &StorageDevice,
     reg: &DiskRegion,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
@@ -4808,20 +5097,24 @@ fn draw_hover_lba_bar(
     let (line1, line2, col2) = match &reg.kind {
         RegionKind::Unallocated => (
             format!(
-                "INSPECT: UNALLOCATED GAP  ·  LBA {}..{}  ·  {} ({} sectors × {}B)",
+                "UNALLOCATED  ·  LBA {}..{}  ·  {} ({} × {}B)",
                 reg.start_lba,
                 reg.end_lba,
                 format_bytes(reg.size_bytes),
                 reg.end_lba.saturating_sub(reg.start_lba),
                 dev.sector_size,
             ),
-            "Non-bootable free space preserved in exact LBA order".into(),
+            if show_hints {
+                Some("Unallocated gap in ascending LBA order".into())
+            } else {
+                None
+            },
             pal.muted,
         ),
         RegionKind::Partition(p) => {
             let fs = p.fs.as_deref().unwrap_or(part_short_tag(p));
             let line1 = format!(
-                "INSPECT: {}p{} {}  ·  {} ({fs})  ·  LBA {}..{}",
+                "{}p{} {}  ·  {} ({fs})  ·  LBA {}..{}",
                 dev.device_name,
                 p.index,
                 p.label,
@@ -4831,19 +5124,22 @@ fn draw_hover_lba_bar(
             );
             let line2 = if !p.boot_targets.is_empty() {
                 let names: Vec<&str> = p.boot_targets.iter().map(|t| t.title.as_str()).collect();
-                format!(
-                    "BOOT TARGETS: {}  ·  Click to select · Click again or Enter to boot",
+                Some(if show_hints {
+                    format!(
+                        "{}  ·  Click to select · Click again or Enter to boot",
+                        names.join(", ")
+                    )
+                } else {
                     names.join(", ")
-                )
+                })
             } else if p.loader_count > 0 {
-                format!(
-                    "EFI SYSTEM PARTITION  ·  Hosts {} EFI bootloaders",
-                    p.loader_count
-                )
+                Some(format!("ESP  ·  {} EFI loaders", p.loader_count))
             } else if let Some(free) = p.free_bytes {
-                format!("Non-bootable partition  ·  {} free", format_bytes(free))
+                Some(format!("{} free", format_bytes(free)))
+            } else if show_hints {
+                Some("Non-bootable partition".into())
             } else {
-                "Non-bootable partition preserved in exact LBA order".into()
+                None
             };
             let col2 = if !p.boot_targets.is_empty() {
                 pal.focus
@@ -4853,17 +5149,14 @@ fn draw_hover_lba_bar(
             (line1, line2, col2)
         }
     };
-    let ty = r.y + r.h.saturating_sub(m.tech_h + m.cap_h + 2) / 2;
-    renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
-    renderer.draw_truncated(
-        fb,
-        &line2,
-        ix,
-        ty + m.tech_h + 2,
-        iw,
-        TextRole::Caption,
-        col2,
-    );
+    if let Some(l2) = line2 {
+        let ty = r.y + r.h.saturating_sub(m.tech_h + m.cap_h + 2) / 2;
+        renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
+        renderer.draw_truncated(fb, &l2, ix, ty + m.tech_h + 2, iw, TextRole::Caption, col2);
+    } else {
+        let ty = r.y + r.h.saturating_sub(m.tech_h) / 2;
+        renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4874,6 +5167,7 @@ fn draw_provenance_bar(
     reg: &DiskRegion,
     target: &BootTargetView,
     counting_down: bool,
+    show_hints: bool,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
@@ -4883,7 +5177,7 @@ fn draw_provenance_bar(
     let iw = r.w.saturating_sub(20);
     let line1 = match (target.esp_part, target.os_part) {
         (Some(esp), Some(os)) if esp != os => format!(
-            "SELECTED: {}  ·  EFI: {}p{} ({}) -> OS: {}p{}  ·  LBA {}..{} ({})",
+            "{}  ·  EFI: {}p{} ({}) -> OS: {}p{}  ·  LBA {}..{} ({})",
             target.title,
             dev.device_name,
             esp,
@@ -4895,7 +5189,7 @@ fn draw_provenance_bar(
             format_bytes(reg.size_bytes),
         ),
         (Some(esp), _) => format!(
-            "SELECTED: {}  ·  EFI: {}p{} ({})  ·  LBA {}..{} ({})",
+            "{}  ·  EFI: {}p{} ({})  ·  LBA {}..{} ({})",
             target.title,
             dev.device_name,
             esp,
@@ -4905,242 +5199,69 @@ fn draw_provenance_bar(
             format_bytes(reg.size_bytes),
         ),
         (None, _) => format!(
-            "SELECTED: {}  ·  {}  ·  LBA {}..{}",
+            "{}  ·  {}  ·  LBA {}..{}",
             target.title, target.loader_file, reg.start_lba, reg.end_lba
         ),
     };
-    let action_hint = if counting_down {
-        "Enter / click again to boot now  ·  Esc / [X] to abort autoboot"
-    } else {
-        "Enter or click again to boot  ·  Tab for power actions"
-    };
-    let line2 = match &target.note {
-        Some(note) => format!("STATUS: {note}  ·  {action_hint}  ·  C for SBM Core"),
-        None => format!("STATUS: READY  ·  {action_hint}"),
-    };
-    let ty = r.y + r.h.saturating_sub(m.tech_h + m.cap_h + 2) / 2;
-    renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
-    renderer.draw_truncated(
-        fb,
-        &line2,
-        ix,
-        ty + m.tech_h + 2,
-        iw,
-        TextRole::Caption,
-        if target.healthy { pal.ok } else { pal.danger },
-    );
-}
-
-// ============================================================================
-// Header, Footer & Helpers
-// ============================================================================
-
-struct HeaderHits {
-    abort: Option<Rect>,
-    detail_compact: Option<Rect>,
-    detail_detailed: Option<Rect>,
-}
-
-impl HeaderHits {
-    fn apply(self, hit: &mut LayoutHitMap) {
-        if let Some(r) = self.abort {
-            hit.abort_buttons.push(r);
-        }
-        hit.detail_compact = self.detail_compact;
-        hit.detail_detailed = self.detail_detailed;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_header(
-    fb: &mut Framebuffer,
-    w: u32,
-    h: u32,
-    mode_tag: &str,
-    spec: &SystemSpec,
-    state: &MenuState,
-    detail: StorageDetail,
-    pal: &Palette,
-    m: Metrics,
-    renderer: &mut TextRenderer<'_>,
-    paint: bool,
-) -> HeaderHits {
-    let tag_h = m.cap_h + 6;
-    let tag_y = h.saturating_sub(tag_h) / 2;
-
-    let abort_rect = state.countdown_ms.map(|_| {
-        let sz = tag_h.clamp(18, 28);
-        Rect {
-            x: w.saturating_sub(m.pad + sz),
-            y: h.saturating_sub(sz) / 2,
-            w: sz,
-            h: sz,
-        }
-    });
-
-    let status = match state.countdown_ms {
-        Some(ms) => format!("BOOT IN {}s", ms.div_ceil(1000)),
-        None => spec
-            .discovery_status
-            .clone()
-            .unwrap_or_else(|| "READY".into()),
-    };
-    let status_w = renderer.measure(&status, TextRole::Caption).width + 12;
-    let status_right = abort_rect
-        .map(|ar| ar.x.saturating_sub(5))
-        .unwrap_or_else(|| w.saturating_sub(m.pad));
-    let status_x = status_right.saturating_sub(status_w);
-
-    let x = m.pad;
-    let bw = renderer.measure("SBM", TextRole::Heading).width;
-    let tag_x = x + bw + 10;
-    let c_lbl = if w < 720 { "Cmp" } else { "Compact" };
-    let d_lbl = if w < 720 { "Det" } else { "Detailed" };
-    let c_w = renderer.measure(c_lbl, TextRole::Caption).width + 14;
-    let d_w = renderer.measure(d_lbl, TextRole::Caption).width + 14;
-    let toggle_w = c_w + d_w + 4;
-
-    // Pick full or abbreviated layout badge if needed so the Compact/Detailed
-    // toggle always fits cleanly without colliding with the status pill.
-    let full_tag_w = renderer.measure(mode_tag, TextRole::Caption).width + 12;
-    let eff_tag = if tag_x + full_tag_w + 8 + toggle_w + 8 <= status_x {
-        mode_tag
-    } else if mode_tag.starts_with('A') {
-        "A: BENTO"
-    } else if mode_tag.starts_with('B') {
-        "B: SCHEM"
-    } else {
-        "C: STOR"
-    };
-    let eff_tag_w = renderer.measure(eff_tag, TextRole::Caption).width + 12;
-    let toggle_x = tag_x + eff_tag_w + 8;
-    let show_toggle = toggle_x + toggle_w + 6 <= status_x;
-    let (detail_compact, detail_detailed) = if show_toggle {
-        let seg_h = tag_h.saturating_sub(4).max(12);
-        let seg_y = tag_y + 2;
-        (
-            Some(Rect {
-                x: toggle_x + 2,
-                y: seg_y,
-                w: c_w,
-                h: seg_h,
-            }),
-            Some(Rect {
-                x: toggle_x + 2 + c_w,
-                y: seg_y,
-                w: d_w,
-                h: seg_h,
-            }),
-        )
-    } else {
-        (None, None)
-    };
-
-    if !paint {
-        return HeaderHits {
-            abort: abort_rect,
-            detail_compact,
-            detail_detailed,
-        };
-    }
-
-    fb.fill_rect(0, 0, w, h, pal.header);
-    fb.hline(0, h.saturating_sub(1), w, pal.border);
-
-    let by = h.saturating_sub(m.head_h) / 2;
-    renderer.draw_top(fb, "SBM", x, by, TextRole::Heading, pal.accent);
-    draw_pill(fb, tag_x, tag_y, eff_tag, pal.focus, pal, m, renderer);
-
-    // Tactile `[ Compact | Detailed ]` segmented view toggle.
-    if let (Some(cr), Some(dr)) = (detail_compact, detail_detailed) {
-        let outer = Rect {
-            x: toggle_x,
-            y: tag_y,
-            w: toggle_w,
-            h: tag_h,
-        };
-        draw_bento_panel(
-            fb,
-            outer,
-            pal.surface_alt,
-            pal.border_strong,
-            6,
-            pal.border_px(),
-        );
-        for (seg_r, lbl, mode_val) in [
-            (cr, c_lbl, StorageDetail::Compact),
-            (dr, d_lbl, StorageDetail::Detailed),
-        ] {
-            let active = detail == mode_val;
-            let hovered = state.cursor.is_some_and(|(cx, cy)| seg_r.contains(cx, cy));
-            if active {
-                draw_rrect(fb, seg_r, 4, pal.focus);
-                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, pal.on_accent);
+    let line2: Option<String> = match (&target.note, show_hints) {
+        (Some(note), true) => {
+            let hint = if counting_down {
+                "Enter / click again to boot  ·  Esc / [X] to abort"
             } else {
-                if hovered {
-                    draw_rrect(fb, seg_r, 4, pal.surface_selected);
-                }
-                let col = if hovered { pal.text } else { pal.muted };
-                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, col);
-            }
+                "Enter / click again to boot  ·  C for SBM Core"
+            };
+            Some(format!("{note}  ·  {hint}"))
         }
-    }
-
-    let host_x = if show_toggle {
-        toggle_x + toggle_w + 10
-    } else {
-        tag_x + eff_tag_w + 10
+        (Some(note), false) => Some(note.clone()),
+        (None, true) => Some(
+            if counting_down {
+                "Enter / click again to boot  ·  Esc / [X] to abort"
+            } else {
+                "Enter / click again to boot  ·  Tab for power actions"
+            }
+            .into(),
+        ),
+        (None, false) => None,
     };
-    let status_col = if let Some(ms) = state.countdown_ms {
-        pal.accent.mix(pal.focus, autoboot_pulse(ms) / 3, 255)
-    } else if spec.discovery_status.is_some() {
-        pal.warn
-    } else {
-        pal.ok
-    };
-
-    if status_x > host_x + 40 {
+    if let Some(l2) = line2 {
+        let ty = r.y + r.h.saturating_sub(m.tech_h + m.cap_h + 2) / 2;
+        renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
         renderer.draw_truncated(
             fb,
-            &spec.host_label,
-            host_x,
-            h.saturating_sub(m.cap_h) / 2,
-            status_x.saturating_sub(host_x + 12),
+            &l2,
+            ix,
+            ty + m.tech_h + 2,
+            iw,
             TextRole::Caption,
-            pal.muted,
+            if !target.healthy {
+                pal.danger
+            } else if target.note.is_some() {
+                pal.warn
+            } else {
+                pal.muted
+            },
         );
-    }
-
-    draw_pill(fb, status_x, tag_y, &status, status_col, pal, m, renderer);
-
-    if let Some(ar) = abort_rect {
-        let hov = state.cursor.is_some_and(|(cx, cy)| ar.contains(cx, cy));
-        draw_abort_x_button(fb, ar, hov, pal);
-    }
-
-    if let Some(left) = state.countdown_ms
-        && state.countdown_total_ms > 0
-    {
-        let fill_w = (w as u64 * left as u64 / state.countdown_total_ms as u64) as u32;
-        fb.fill_rect(0, h.saturating_sub(2), fill_w, 2, pal.accent);
-    }
-
-    HeaderHits {
-        abort: abort_rect,
-        detail_compact,
-        detail_detailed,
+    } else {
+        let ty = r.y + r.h.saturating_sub(m.tech_h) / 2;
+        renderer.draw_truncated(fb, &line1, ix, ty, iw, TextRole::Technical, pal.text);
     }
 }
 
+// ============================================================================
+// Footer & Helpers
+// ============================================================================
+
+#[allow(clippy::too_many_arguments)]
 fn draw_footer(
     fb: &mut Framebuffer,
     r: Rect,
     state: &MenuState,
+    opts: ExperimentalOptions,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
-) -> Vec<Rect> {
+) -> (Vec<Rect>, Option<Rect>) {
     if paint {
         fb.fill_rect(r.x, r.y, r.w, r.h, pal.header);
         fb.hline(r.x, r.y, r.w, pal.border);
@@ -5168,23 +5289,61 @@ fn draw_footer(
     let total_w = btn_w * 3 + gap * 2;
     let start_x = r.x + r.w.saturating_sub(m.pad + total_w);
 
-    let hint = if m.compact {
-        "1-4/F4 layout · V view · F7 font · F8 HC · +/- scale · T theme · F1 help"
-    } else {
-        "1-4/F4 layout · V compact/detailed · F2 scen · F6 disc · F7 font · F8 HC · +/- scale · T theme · F1 help"
+    // Left-aligned `[ ? ]` toggle button to show/hide optional helper text.
+    let help_w = btn_h.clamp(22, 32);
+    let help_rect = Rect {
+        x: r.x + m.pad,
+        y: btn_y,
+        w: help_w,
+        h: btn_h,
     };
+    let help_btn = (help_rect.x + help_rect.w + 8 <= start_x).then_some(help_rect);
 
     if paint {
-        let hint_w = start_x.saturating_sub(r.x + m.pad + 10);
-        renderer.draw_truncated(
-            fb,
-            hint,
-            r.x + m.pad,
-            r.y + r.h.saturating_sub(m.cap_h) / 2,
-            hint_w,
-            TextRole::Caption,
-            pal.muted,
-        );
+        if let Some(hr) = help_btn {
+            let hov = state.cursor.is_some_and(|(cx, cy)| hr.contains(cx, cy));
+            let (fill, border, fg) = if opts.show_hints {
+                (pal.focus, pal.focus, pal.on_accent)
+            } else if hov {
+                (pal.surface_hover, pal.border_strong, pal.text)
+            } else {
+                (pal.surface_alt, pal.border, pal.muted)
+            };
+            draw_bento_panel(
+                fb,
+                hr,
+                fill,
+                border,
+                6,
+                if opts.show_hints || pal.high_contrast {
+                    2
+                } else {
+                    1
+                },
+            );
+            renderer.draw_centered(fb, "?", hr, TextRole::Body, fg);
+        }
+
+        if opts.show_hints {
+            let hint = if m.compact {
+                "1-4 layout · V view · ? hints · T theme · +/- scale · F1 keys"
+            } else {
+                "1-4 layout · V compact/detailed · ? hints · F2 scen · F6 disc · F7 font · F8 HC · +/- scale · T theme · F1 keys"
+            };
+            let hint_x = help_btn.map(|hr| hr.x + hr.w + 10).unwrap_or(r.x + m.pad);
+            let hint_w = start_x.saturating_sub(hint_x + 10);
+            if hint_w > 24 {
+                renderer.draw_truncated(
+                    fb,
+                    hint,
+                    hint_x,
+                    r.y + r.h.saturating_sub(m.cap_h) / 2,
+                    hint_w,
+                    TextRole::Caption,
+                    pal.muted,
+                );
+            }
+        }
     }
 
     let mut actions = Vec::with_capacity(3);
@@ -5223,7 +5382,7 @@ fn draw_footer(
             renderer.draw_centered(fb, label, br, TextRole::Caption, text_col);
         }
     }
-    actions
+    (actions, help_btn)
 }
 
 fn draw_eyebrow(
@@ -5353,19 +5512,6 @@ fn format_sectors(sectors: u64) -> String {
     }
 }
 
-fn short_cpu_name(full: &str) -> String {
-    full.replace("(R)", "")
-        .replace("(TM)", "")
-        .replace("Intel ", "")
-        .replace("AMD ", "")
-        .trim()
-        .to_string()
-}
-
-fn short_gpu_name(full: &str) -> String {
-    full.split(" (").next().unwrap_or(full).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5405,6 +5551,7 @@ mod tests {
         let win_len = 1_000 * 2_097_152;
         SystemSpec {
             host_label: "ThinkPad X1 Carbon".into(),
+            sbm_version: "26.11.27#12".into(),
             cpu,
             memory,
             board: ProbeState::Ready(BoardSpec {
@@ -5414,7 +5561,7 @@ mod tests {
             gpu: ProbeState::Ready(vec!["Intel Arc 140V".into()]),
             firmware: ProbeState::Ready(FirmwareSpec {
                 vendor: Some("Lenovo (EDK II)".into()),
-                version: "0.1.0".into(),
+                version: "26.11.27#12".into(),
                 arch: "x86_64".into(),
             }),
             display: DisplaySpec {
@@ -5745,5 +5892,78 @@ mod tests {
         );
         assert!(det_map.overflow_buttons.is_empty());
         assert_eq!(det_map.zones.len(), 5);
+    }
+
+    #[test]
+    fn top_grid_scrolls_horizontally_toggle_is_below_grid_and_help_btn_toggles_hints() {
+        let spec = sample_spec(false, false);
+        let state = MenuState::new(0, true, Some(5_000));
+        let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, 800, UiScale::default());
+
+        let mut fb_clean = Framebuffer::new(1280, 800);
+        let map = paint_experimental_with(
+            &mut fb_clean,
+            LayoutMode::Bento,
+            &spec,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+
+        // Top hardware strip overflows at 1280px and exposes horizontal scrollbar controls.
+        let hw = map.hw_viewport.expect("top hardware viewport");
+        assert!(
+            map.max_scroll_x > 0,
+            "7-widget top strip should scroll horizontally at 1280px"
+        );
+        let hr = map.hw_scroll_right.expect("right horizontal scroll button");
+        assert_eq!(
+            map.hit_test_experimental(hr.x + hr.w / 2, hr.y + hr.h / 2),
+            ExperimentalHit::ScrollXDelta(160)
+        );
+
+        // Compact/Detailed toggle lives right above the storage section (below the top hardware grid).
+        let cr = map.detail_compact.expect("Compact toggle");
+        assert!(
+            cr.y >= hw.y + hw.h,
+            "Compact/Detailed toggle (y={}) must sit below the top hardware grid (bottom={})",
+            cr.y,
+            hw.y + hw.h
+        );
+
+        // Scrolling horizontally shifts pixels inside the top strip.
+        let mut fb_scrolled = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_scrolled,
+            LayoutMode::Bento,
+            &spec,
+            &state,
+            ExperimentalOptions {
+                scroll_x: map.max_scroll_x,
+                ..ExperimentalOptions::default()
+            },
+            &mut renderer,
+        );
+        assert_ne!(fb_clean.px, fb_scrolled.px);
+
+        // Clicking `?` button hits ToggleHints and reveals optional helper text.
+        let hb = map.help_button.expect("`?` toggle button");
+        assert_eq!(
+            map.hit_test_experimental(hb.x + hb.w / 2, hb.y + hb.h / 2),
+            ExperimentalHit::ToggleHints
+        );
+        let mut fb_hints = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_hints,
+            LayoutMode::Bento,
+            &spec,
+            &state,
+            ExperimentalOptions {
+                show_hints: true,
+                ..ExperimentalOptions::default()
+            },
+            &mut renderer,
+        );
+        assert_ne!(fb_clean.px, fb_hints.px);
     }
 }

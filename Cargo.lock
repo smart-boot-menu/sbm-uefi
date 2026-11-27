@@ -548,6 +548,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ace1a365f55004297f2cf24acfd96d02966246ca423385273b58a7dc873ee14d"
+
+[[package]]
 name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -644,6 +650,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "libm",
+ "qrcode",
  "ttf-parser",
 ]
 

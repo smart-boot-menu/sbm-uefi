@@ -718,18 +718,14 @@ fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
                 2,
                 "{mode:?} should expose both top-right and partition [X] abort buttons"
             );
-            let header_x = map
-                .abort_buttons
-                .iter()
-                .find(|r| r.y < 50)
-                .copied()
-                .unwrap();
-            let part_x = map
-                .abort_buttons
-                .iter()
-                .find(|r| r.y >= 50)
-                .copied()
-                .unwrap();
+            let mut btns = map.abort_buttons.clone();
+            btns.sort_by_key(|r| r.y);
+            let header_x = btns[0];
+            let part_x = btns[1];
+            assert!(
+                header_x.y < part_x.y,
+                "{mode:?} storage-bar [X] must sit above partition [X]"
+            );
             let target_btn = if click_which == 0 { header_x } else { part_x };
             let cx = target_btn.x + target_btn.w / 2;
             let cy = target_btn.y + target_btn.h / 2;
@@ -1194,4 +1190,103 @@ fn compact_default_detail_toggle_and_four_slot_hamburger_overflow_work() {
     assert_eq!(s2.detail, StorageDetail::Compact);
     let _ = s2.key(Key::Char('v'), W, H);
     assert_eq!(s2.detail, StorageDetail::Detailed);
+}
+
+#[test]
+fn top_hardware_grid_2d_scroll_hints_toggle_and_0sfs_version_work() {
+    use sbm_gfx::hardware::{ExperimentalHit, layout_experimental_with};
+    use sbm_menu::Pointer;
+    use sbm_preview::LayoutMode;
+
+    let mut s = session("lba-stress");
+    s.set_layout(LayoutMode::Bento);
+    assert!(!s.show_hints, "optional hints must be hidden by default");
+
+    let spec = s.system_spec(W, H);
+    assert!(
+        spec.sbm_version.contains('#') || spec.sbm_version.ends_with(" LTS"),
+        "expected 0SFS version in SystemSpec, got {:?}",
+        spec.sbm_version
+    );
+
+    let mut tr = sbm_gfx::TextRenderer::new(s.font_mode, H, s.scale);
+    let map0 = layout_experimental_with(
+        LayoutMode::Bento,
+        W,
+        H,
+        &spec,
+        &s.state,
+        s.experimental_options(),
+        &mut tr,
+    );
+    let hw = map0.hw_viewport.expect("top hardware strip viewport");
+    let detail_c = map0.detail_compact.expect("Compact toggle");
+    assert!(
+        detail_c.y >= hw.y + hw.h,
+        "Compact/Detailed toggle must sit below the top hardware grid, not in a top bar"
+    );
+    assert!(
+        map0.max_scroll_x > 0,
+        "7 hardware widgets at 1280x800 should expose horizontal scrolling"
+    );
+    assert!(s.over_hw_grid(hw.x + 12, hw.y + 12, W, H));
+    assert!(!s.over_hw_grid(hw.x + 12, H - 12, W, H));
+
+    // Horizontal scrolling via scroll_x_by, scrollbar arrow click, thumb drag, and `[` / `]` keys.
+    let fb0 = render(&s, W, H);
+    assert_eq!(s.scroll_x_by(180, W, H), Effect::Redraw);
+    assert!(s.scroll_x > 0);
+    let fb_scrolled = render(&s, W, H);
+    assert_ne!(fb0.px, fb_scrolled.px);
+
+    let left_btn = map0.hw_scroll_left.expect("horizontal left arrow");
+    let _ = s.pointer(
+        Pointer {
+            x: left_btn.x + left_btn.w / 2,
+            y: left_btn.y + left_btn.h / 2,
+            moved: true,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert!(s.scroll_x < 180);
+
+    let track = map0.hw_scroll_track.expect("horizontal scroll track");
+    assert!(s.on_hw_scroll_track(track.x + track.w / 2, track.y + track.h / 2, W, H));
+    let _ = s.scroll_x_drag(track.x + track.w, W, H);
+    assert_eq!(s.scroll_x, map0.max_scroll_x);
+
+    assert_eq!(s.key(Key::Char('['), W, H), Effect::Redraw);
+    assert!(s.scroll_x < map0.max_scroll_x);
+    assert_eq!(s.key(Key::Char(']'), W, H), Effect::Redraw);
+
+    // Clicking `[ ? ]` button and pressing `?` toggle optional helper text cleanly.
+    let help_btn = map0.help_button.expect("footer [ ? ] button");
+    let hx = help_btn.x + help_btn.w / 2;
+    let hy = help_btn.y + help_btn.h / 2;
+    assert_eq!(
+        map0.hit_test_experimental(hx, hy),
+        ExperimentalHit::ToggleHints
+    );
+    let fb_no_hints = render(&s, W, H);
+    assert_eq!(
+        s.pointer(
+            Pointer {
+                x: hx,
+                y: hy,
+                moved: true,
+                clicked: true,
+            },
+            W,
+            H,
+        ),
+        Effect::Redraw
+    );
+    assert!(s.show_hints);
+    let fb_with_hints = render(&s, W, H);
+    assert_ne!(fb_no_hints.px, fb_with_hints.px);
+
+    assert_eq!(s.key(Key::Char('?'), W, H), Effect::Redraw);
+    assert!(!s.show_hints);
 }

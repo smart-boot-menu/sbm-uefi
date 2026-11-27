@@ -271,6 +271,7 @@ pub fn build_system_spec(
 
     SystemSpec {
         host_label,
+        sbm_version: VERSION.into(),
         cpu,
         memory,
         board,

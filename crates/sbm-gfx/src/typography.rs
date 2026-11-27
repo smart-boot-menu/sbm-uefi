@@ -906,12 +906,13 @@ fn composite_bitmap(
     let cy0 = cy0 as i32;
     let cx1 = cx1 as i32;
     let cy1 = cy1 as i32;
+    let sx0 = x0.saturating_add(fb.x_bias());
     let sy0 = y0.saturating_add(fb.y_bias());
 
     let start_dy = (cy0 - sy0).max(0) as usize;
     let end_dy = (cy1 - sy0).clamp(0, height as i32) as usize;
-    let start_dx = (cx0 - x0).max(0) as usize;
-    let end_dx = (cx1 - x0).clamp(0, width as i32) as usize;
+    let start_dx = (cx0 - sx0).max(0) as usize;
+    let end_dx = (cx1 - sx0).clamp(0, width as i32) as usize;
     if start_dy >= end_dy || start_dx >= end_dx {
         return;
     }
@@ -922,7 +923,7 @@ fn composite_bitmap(
         for dx in start_dx..end_dx {
             let alpha = coverage[row + dx];
             if alpha != 0 {
-                fb.blend_pixel_linear_screen((x0 + dx as i32) as u32, py, color, alpha);
+                fb.blend_pixel_linear_screen((sx0 + dx as i32) as u32, py, color, alpha);
             }
         }
     }

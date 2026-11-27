@@ -19,7 +19,9 @@ use sbm_gfx::{
 };
 use sbm_types::{BootTargetId, BootTargetKind, CpuArch, OsFamily, SecureBootState};
 
-pub const VERSION: &str = "0.1.0";
+/// Software version computed from Git history at build time using the 0SFS
+/// `YY.MM.DD#N` (or `YY.MM.DD LTS`) versioning system (`build.rs`).
+pub const VERSION: &str = env!("SBM_VERSION");
 
 pub struct MenuEntry {
     pub disk: usize,
@@ -435,6 +437,29 @@ mod tests {
                 "SECURITY_VIOLATION"
             )
             .contains("Secure Boot rejected the file.")
+        );
+    }
+
+    #[test]
+    fn version_follows_0sfs_commit_or_lts_format() {
+        let b = VERSION.as_bytes();
+        let is_date_prefix = b.len() >= 10
+            && b[0].is_ascii_digit()
+            && b[1].is_ascii_digit()
+            && b[2] == b'.'
+            && b[3].is_ascii_digit()
+            && b[4].is_ascii_digit()
+            && b[5] == b'.'
+            && b[6].is_ascii_digit()
+            && b[7].is_ascii_digit();
+        let is_commit = is_date_prefix
+            && b[8] == b'#'
+            && b[9..].iter().all(u8::is_ascii_digit)
+            && VERSION[9..].parse::<u32>().is_ok_and(|n| n >= 1);
+        let is_lts = is_date_prefix && &b[8..] == b" LTS";
+        assert!(
+            is_commit || is_lts,
+            "VERSION must follow 0SFS YY.MM.DD#N or YY.MM.DD LTS format, got {VERSION:?}"
         );
     }
 }

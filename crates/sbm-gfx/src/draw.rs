@@ -48,6 +48,7 @@ pub struct Framebuffer {
     pub height: u32,
     pub px: Vec<u32>,
     clip: (u32, u32, u32, u32),
+    x_bias: i32,
     y_bias: i32,
 }
 
@@ -59,23 +60,32 @@ impl Framebuffer {
             height,
             px: alloc::vec![0; len],
             clip: (0, 0, width, height),
+            x_bias: 0,
             y_bias: 0,
         }
     }
 
     /// Constrain subsequent draw calls to `(x, y, w, h)` while translating all
-    /// content `y` coordinates by `y_bias` (pixel-exact scrollable viewports).
+    /// content `y` coordinates by `y_bias` (pixel-exact vertically scrollable viewports).
     pub fn set_viewport(&mut self, x: u32, y: u32, w: u32, h: u32, y_bias: i32) {
+        self.set_viewport_xy(x, y, w, h, 0, y_bias);
+    }
+
+    /// Constrain subsequent draw calls to `(x, y, w, h)` while translating content
+    /// coordinates by `(x_bias, y_bias)` (pixel-exact 2D scrollable viewports).
+    pub fn set_viewport_xy(&mut self, x: u32, y: u32, w: u32, h: u32, x_bias: i32, y_bias: i32) {
         let x0 = x.min(self.width);
         let y0 = y.min(self.height);
         let x1 = x.saturating_add(w).min(self.width);
         let y1 = y.saturating_add(h).min(self.height);
         self.clip = (x0, y0, x1, y1);
+        self.x_bias = x_bias;
         self.y_bias = y_bias;
     }
 
     pub fn clear_viewport(&mut self) {
         self.clip = (0, 0, self.width, self.height);
+        self.x_bias = 0;
         self.y_bias = 0;
     }
 
@@ -83,6 +93,12 @@ impl Framebuffer {
     #[inline]
     pub const fn clip_bounds(&self) -> (u32, u32, u32, u32) {
         self.clip
+    }
+
+    /// Active horizontal translation in screen pixels (negative when scrolled right).
+    #[inline]
+    pub const fn x_bias(&self) -> i32 {
+        self.x_bias
     }
 
     /// Active vertical translation in screen pixels (negative when scrolled down).
@@ -108,8 +124,10 @@ impl Framebuffer {
             return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip;
-        let x0 = x.max(cx0).min(cx1);
-        let x1 = x.saturating_add(w).min(cx1);
+        let sx0 = (x as i64) + (self.x_bias as i64);
+        let sx1 = sx0 + (w as i64);
+        let x0 = sx0.max(cx0 as i64).min(cx1 as i64) as u32;
+        let x1 = sx1.max(cx0 as i64).min(cx1 as i64) as u32;
         if x0 >= x1 {
             return;
         }
@@ -127,9 +145,10 @@ impl Framebuffer {
     #[inline]
     pub fn plot(&mut self, x: u32, y: u32, color: Rgba) {
         let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx = (x as i64) + (self.x_bias as i64);
         let sy = (y as i64) + (self.y_bias as i64);
-        if x >= cx0 && x < cx1 && sy >= cy0 as i64 && sy < cy1 as i64 {
-            self.px[((sy as u32) * self.width + x) as usize] = color.0;
+        if sx >= cx0 as i64 && sx < cx1 as i64 && sy >= cy0 as i64 && sy < cy1 as i64 {
+            self.px[((sy as u32) * self.width + (sx as u32)) as usize] = color.0;
         }
     }
 
@@ -183,11 +202,12 @@ impl Framebuffer {
             return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx = (x as i64) + (self.x_bias as i64);
         let sy = (y as i64) + (self.y_bias as i64);
-        if x < cx0 || x >= cx1 || sy < cy0 as i64 || sy >= cy1 as i64 {
+        if sx < cx0 as i64 || sx >= cx1 as i64 || sy < cy0 as i64 || sy >= cy1 as i64 {
             return;
         }
-        self.blend_pixel_screen(x, sy as u32, color, alpha);
+        self.blend_pixel_screen(sx as u32, sy as u32, color, alpha);
     }
 
     /// Linear-light (gamma ~2.0) alpha-composite for stem-weight-consistent
@@ -198,19 +218,22 @@ impl Framebuffer {
             return;
         }
         let (cx0, cy0, cx1, cy1) = self.clip;
+        let sx = (x as i64) + (self.x_bias as i64);
         let sy = (y as i64) + (self.y_bias as i64);
-        if x < cx0 || x >= cx1 || sy < cy0 as i64 || sy >= cy1 as i64 {
+        if sx < cx0 as i64 || sx >= cx1 as i64 || sy < cy0 as i64 || sy >= cy1 as i64 {
             return;
         }
-        self.blend_pixel_linear_screen(x, sy as u32, color, alpha);
+        self.blend_pixel_linear_screen(sx as u32, sy as u32, color, alpha);
     }
 
     #[cfg(feature = "experimental-layouts")]
     pub fn fill_hatch(&mut self, x: u32, y: u32, w: u32, h: u32, step: u32, color: Rgba) {
         let step = step.max(4);
         let (cx0, cy0, cx1, cy1) = self.clip;
-        let x0 = x.max(cx0).min(cx1);
-        let x1 = x.saturating_add(w).min(cx1);
+        let sx0 = (x as i64) + (self.x_bias as i64);
+        let sx1 = sx0 + (w as i64);
+        let x0 = sx0.max(cx0 as i64).min(cx1 as i64) as u32;
+        let x1 = sx1.max(cx0 as i64).min(cx1 as i64) as u32;
         if x0 >= x1 {
             return;
         }
@@ -222,7 +245,8 @@ impl Framebuffer {
         for py in y0..y1 {
             let content_y = (py as i64 - self.y_bias as i64).rem_euclid(step_i) as u32;
             for px in x0..x1 {
-                if (px + content_y).is_multiple_of(step) {
+                let content_x = (px as i64 - self.x_bias as i64).rem_euclid(step_i) as u32;
+                if (content_x + content_y).is_multiple_of(step) {
                     self.px[(py * self.width + px) as usize] = color.0;
                 }
             }
@@ -427,18 +451,21 @@ mod tests {
     }
 
     #[test]
-    fn viewport_clips_and_translates_y_for_all_pixel_blends() {
-        let mut fb = Framebuffer::new(20, 20);
+    fn viewport_clips_and_translates_xy_for_all_pixel_blends() {
+        let mut fb = Framebuffer::new(24, 24);
         let bg = Rgba::rgb(0, 0, 0);
         let fg = Rgba::rgb(200, 100, 50);
         fb.fill(bg);
-        fb.set_viewport(4, 4, 10, 10, -20);
-        // Content y=26 -> screen y=6 (inside viewport [4, 14))
-        fb.blend_pixel(8, 26, fg, 255);
-        // Content y=22 -> screen y=2 (above viewport clip!)
-        fb.blend_pixel(8, 22, fg, 255);
+        fb.set_viewport_xy(4, 4, 10, 10, -16, -20);
+        // Content (24, 26) -> screen (8, 6) (inside viewport [4, 14) x [4, 14))
+        fb.blend_pixel(24, 26, fg, 255);
+        // Content (18, 26) -> screen (2, 6) (left of viewport clip!)
+        fb.blend_pixel(18, 26, fg, 255);
+        // Content (24, 22) -> screen (8, 2) (above viewport clip!)
+        fb.blend_pixel(24, 22, fg, 255);
         fb.clear_viewport();
         assert_eq!(fb.pixel(8, 6), Some(fg));
+        assert_eq!(fb.pixel(2, 6), Some(bg));
         assert_eq!(fb.pixel(8, 2), Some(bg));
     }
 }

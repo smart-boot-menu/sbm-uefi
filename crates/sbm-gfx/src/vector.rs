@@ -479,18 +479,24 @@ pub fn fill_path(fb: &mut Framebuffer, path: &VectorPath, color: Rgba) {
         return;
     };
     let (cx0, cy0, cx1, cy1) = fb.clip_bounds();
+    let x_bias = fb.x_bias() as f32;
     let y_bias = fb.y_bias() as f32;
-    let x0 = (libm::floorf(min_x) as i32).max(cx0 as i32);
-    let y0 = (libm::floorf(min_y + y_bias) as i32).max(cy0 as i32);
-    let x1 = (libm::ceilf(max_x) as i32).min(cx1 as i32);
-    let y1 = (libm::ceilf(max_y + y_bias) as i32).min(cy1 as i32);
-    if x1 <= x0 || y1 <= y0 {
+    let rx0 = libm::floorf(min_x + x_bias) as i32;
+    let rx1 = libm::ceilf(max_x + x_bias) as i32;
+    let vis_x0 = rx0.max(cx0 as i32);
+    let vis_y0 = (libm::floorf(min_y + y_bias) as i32).max(cy0 as i32);
+    let vis_x1 = rx1.min(cx1 as i32);
+    let vis_y1 = (libm::ceilf(max_y + y_bias) as i32).min(cy1 as i32);
+    if vis_x1 <= vis_x0 || vis_y1 <= vis_y0 {
         return;
     }
-    let w = (x1 - x0) as usize;
-    let h = (y1 - y0) as usize;
-    let ox = x0 as f32;
-    let oy = y0 as f32 - y_bias;
+    // Keep the full horizontal span of the path inside the rasterizer so
+    // `ab_glyph_rasterizer` never receives negative X coordinates (which would
+    // corrupt winding or overflow) and never wraps past `w` onto the next row.
+    let w = (rx1 - rx0 + 2).max(1) as usize;
+    let h = (vis_y1 - vis_y0) as usize;
+    let ox = rx0 as f32 - x_bias;
+    let oy = vis_y0 as f32 - y_bias;
 
     let mut raster = Rasterizer::new(w, h);
     let mut start = Point { x: 0.0, y: 0.0 };
@@ -562,12 +568,15 @@ pub fn fill_path(fb: &mut Framebuffer, path: &VectorPath, color: Rgba) {
         }
     }
 
-    let base_x = x0 as u32;
-    let base_y = y0 as u32;
+    let base_y = vis_y0 as u32;
     raster.for_each_pixel_2d(|dx, dy, cov| {
+        let sx = rx0 + dx as i32;
+        if sx < vis_x0 || sx >= vis_x1 {
+            return;
+        }
         let alpha = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         if alpha > 0 {
-            fb.blend_pixel_screen(base_x + dx, base_y + dy, color, alpha);
+            fb.blend_pixel_screen(sx as u32, base_y + dy, color, alpha);
         }
     });
 }
@@ -874,6 +883,42 @@ pub fn draw_vector_chevron(fb: &mut Framebuffer, x: u32, y: u32, size: u32, up: 
     fill_path(fb, &path, color);
 }
 
+/// Draw a crisp antialiased left/right chevron inside `(x, y, size, size)`.
+pub fn draw_vector_chevron_h(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    size: u32,
+    left: bool,
+    color: Rgba,
+) {
+    if size < 5 {
+        return;
+    }
+    let s = size as f32;
+    let xf = x as f32;
+    let yf = y as f32;
+    let cy = yf + s * 0.5;
+    let inset_y = (s * 0.18).max(1.5);
+    let w = (s * 0.46).max(3.0);
+    let x_left = xf + (s - w) * 0.5;
+    let x_right = x_left + w;
+
+    let mut path = VectorPath::with_capacity(4);
+    if left {
+        path.move_to(x_left, cy)
+            .line_to(x_right, yf + inset_y)
+            .line_to(x_right, yf + s - inset_y)
+            .close();
+    } else {
+        path.move_to(x_right, cy)
+            .line_to(x_left, yf + s - inset_y)
+            .line_to(x_left, yf + inset_y)
+            .close();
+    }
+    fill_path(fb, &path, color);
+}
+
 /// Draw a crisp antialiased 3-bar hamburger menu icon inside `(x, y, size, size)`.
 pub fn draw_vector_hamburger(fb: &mut Framebuffer, x: u32, y: u32, size: u32, color: Rgba) {
     if size < 8 {
@@ -890,6 +935,243 @@ pub fn draw_vector_hamburger(fb: &mut Framebuffer, x: u32, y: u32, size: u32, co
         let by = y0.saturating_add(i.saturating_mul(bar_h + gap));
         fill_rounded_rect(fb, x.saturating_add(inset_x), by, bar_w, bar_h, r, color);
     }
+}
+
+/// Draw a resolution-independent CPU processor microchip logo inside a rounded
+/// badge `(x, y, size, size)`: hollow silicon package, inner die core, and
+/// protruding pins on all four edges.
+pub fn draw_vector_cpu_logo(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    size: u32,
+    badge_bg: Rgba,
+    fg: Rgba,
+) {
+    if size < 12 {
+        return;
+    }
+    let xf = x as f32;
+    let yf = y as f32;
+    let s = size as f32;
+    let badge_r = (s * 0.24).max(3.0);
+    let bg = VectorPath::rounded_rect(xf, yf, s, s, badge_r);
+    fill_path(fb, &bg, badge_bg);
+
+    let cx = xf + s * 0.5;
+    let cy = yf + s * 0.5;
+    let inset = s * 0.14;
+    let inner = s - inset * 2.0;
+
+    // Central silicon package (hollow frame + solid inner die).
+    let body = inner * 0.62;
+    let bx = cx - body * 0.5;
+    let by = cy - body * 0.5;
+    let body_r = (body * 0.15).max(1.2);
+    let stroke = (s * 0.082).max(1.4);
+
+    let mut glyph = VectorPath::with_capacity(64);
+    glyph.push_rounded_rect(bx, by, body, body, body_r);
+    let hole = body - stroke * 2.0;
+    if hole > 2.2 {
+        glyph.push_rounded_rect_ccw(
+            bx + stroke,
+            by + stroke,
+            hole,
+            hole,
+            (body_r - stroke * 0.4).max(0.4),
+        );
+        let die = (hole * 0.54).max(1.6);
+        glyph.push_rounded_rect(
+            cx - die * 0.5,
+            cy - die * 0.5,
+            die,
+            die,
+            (die * 0.18).max(0.5),
+        );
+    }
+
+    // Protruding contact pins (3 per side at >=20px, 2 per side at tiny sizes).
+    let pin_len = ((inner - body) * 0.52).max(1.8);
+    let pin_w = (s * 0.068).max(1.2);
+    let pin_r = (pin_w * 0.35).max(0.4);
+    let offsets_3 = [-0.28 * body, 0.0, 0.28 * body];
+    let offsets_2 = [-0.20 * body, 0.20 * body];
+    let offsets: &[f32] = if size >= 20 { &offsets_3 } else { &offsets_2 };
+
+    for &off in offsets {
+        // Top & bottom pins
+        let px = cx + off - pin_w * 0.5;
+        glyph.push_rounded_rect(px, by - pin_len + 0.4, pin_w, pin_len, pin_r);
+        glyph.push_rounded_rect(px, by + body - 0.4, pin_w, pin_len, pin_r);
+        // Left & right pins
+        let py = cy + off - pin_w * 0.5;
+        glyph.push_rounded_rect(bx - pin_len + 0.4, py, pin_len, pin_w, pin_r);
+        glyph.push_rounded_rect(bx + body - 0.4, py, pin_len, pin_w, pin_r);
+    }
+
+    fill_path(fb, &glyph, fg);
+}
+
+/// Draw a resolution-independent discrete GPU graphics-card logo inside a
+/// rounded badge `(x, y, size, size)`: horizontal card shroud, left L-shaped
+/// PCIe I/O bracket, keyed bottom PCIe x16 edge connector, and cooling fans.
+pub fn draw_vector_gpu_logo(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    size: u32,
+    badge_bg: Rgba,
+    fg: Rgba,
+) {
+    if size < 12 {
+        return;
+    }
+    let xf = x as f32;
+    let yf = y as f32;
+    let s = size as f32;
+    let badge_r = (s * 0.24).max(3.0);
+    let bg = VectorPath::rounded_rect(xf, yf, s, s, badge_r);
+    fill_path(fb, &bg, badge_bg);
+
+    let cy = yf + s * 0.5;
+    let inset = s * 0.13;
+    let inner = s - inset * 2.0;
+
+    let bt = (s * 0.068).max(1.3);
+    let card_x = xf + inset + bt * 1.45;
+    let card_w = (inner - bt * 1.45).max(6.0);
+    let card_h = inner * 0.56;
+    let card_y = cy - card_h * 0.54;
+    let card_r = (card_h * 0.16).max(1.2);
+
+    // 1. Shroud + left L-bracket + keyed bottom PCIe x16 edge fingers.
+    let mut body = VectorPath::with_capacity(32);
+    body.push_rounded_rect(card_x, card_y, card_w, card_h, card_r);
+    // Left I/O mounting bracket stem + top lip
+    let brk_x = card_x - bt * 0.85;
+    let brk_y = card_y - bt * 1.15;
+    body.push_rounded_rect(brk_x, brk_y, bt, card_h + bt * 1.95, bt * 0.3);
+    body.push_rounded_rect(xf + inset, brk_y, bt * 1.55, bt, bt * 0.3);
+    // Keyed PCIe x16 edge fingers along the bottom edge
+    let pcie_h = (s * 0.088).max(1.6);
+    let pcie_y = card_y + card_h - 0.4;
+    let pcie_r = (pcie_h * 0.28).max(0.4);
+    body.push_rounded_rect(
+        card_x + card_w * 0.10,
+        pcie_y,
+        card_w * 0.48,
+        pcie_h,
+        pcie_r,
+    );
+    body.push_rounded_rect(
+        card_x + card_w * 0.66,
+        pcie_y,
+        card_w * 0.19,
+        pcie_h,
+        pcie_r,
+    );
+    fill_path(fb, &body, fg);
+
+    // 2. Cut out circular fan apertures in badge_bg, then draw fan hubs + blades in fg.
+    let fan_cy = card_y + card_h * 0.5;
+    let dual_fan = size >= 22;
+    let (centers_buf, count, fan_r): ([(f32, f32); 2], usize, f32) = if dual_fan {
+        let r = (card_h * 0.34).min(card_w * 0.185);
+        (
+            [
+                (card_x + card_w * 0.28, fan_cy),
+                (card_x + card_w * 0.72, fan_cy),
+            ],
+            2,
+            r,
+        )
+    } else {
+        let r = (card_h * 0.36).min(card_w * 0.28);
+        ([(card_x + card_w * 0.50, fan_cy), (0.0, 0.0)], 1, r)
+    };
+
+    if fan_r >= 1.8 {
+        let mut holes = VectorPath::with_capacity(12);
+        for &(fcx, fcy) in &centers_buf[..count] {
+            holes.push_circle(fcx, fcy, fan_r);
+        }
+        fill_path(fb, &holes, badge_bg);
+
+        let hub_r = (fan_r * 0.35).max(1.05);
+        let blade_hw = (fan_r * 0.14).clamp(0.45, 1.0);
+        // 3 evenly spaced turbine spokes (30°, 150°, 270°) — pure no_std constants.
+        const SPOKES: [(f32, f32); 3] = [(0.866_025_4, 0.5), (-0.866_025_4, 0.5), (0.0, -1.0)];
+        let mut hubs = VectorPath::with_capacity(32);
+        for &(fcx, fcy) in &centers_buf[..count] {
+            hubs.push_circle(fcx, fcy, hub_r);
+            if fan_r >= 3.0 {
+                let tip_r = fan_r * 0.96;
+                for &(dx, dy) in &SPOKES {
+                    let px = -dy * blade_hw;
+                    let py = dx * blade_hw;
+                    let tx = fcx + dx * tip_r;
+                    let ty = fcy + dy * tip_r;
+                    hubs.move_to(fcx + px, fcy + py)
+                        .line_to(tx + px * 0.7, ty + py * 0.7)
+                        .line_to(tx - px * 0.7, ty - py * 0.7)
+                        .line_to(fcx - px, fcy - py)
+                        .close();
+                }
+            }
+        }
+        fill_path(fb, &hubs, fg);
+    }
+}
+
+/// Draw a crisp, camera-scannable ISO/IEC 18004 QR code encoding `data` inside
+/// a rounded white quiet-zone square `(x, y, size, size)` using integer-pixel
+/// modules (no subpixel blur). Returns `true` if the QR code fit and rendered.
+#[cfg(feature = "experimental-layouts")]
+pub fn draw_vector_qr(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    size: u32,
+    data: &str,
+    light: Rgba,
+    dark: Rgba,
+) -> bool {
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)
+    else {
+        return false;
+    };
+    let mods = code.width() as u32;
+    if mods == 0 || size < mods + 4 {
+        return false;
+    }
+    // Use at least a 2-module quiet zone when space allows, falling back to 1-module
+    // padding on tiny squares so modules stay integer-aligned and sharp.
+    let quiet = if size >= mods + 4 { 2 } else { 1 };
+    let total_mods = mods + quiet * 2;
+    let module_px = (size / total_mods).max(1);
+    let qr_px = mods * module_px;
+    if qr_px + 2 > size {
+        return false;
+    }
+    let radius = (size / 10).clamp(3, 8);
+    fill_rounded_rect(fb, x, y, size, size, radius, light);
+    let ox = x.saturating_add(size.saturating_sub(qr_px) / 2);
+    let oy = y.saturating_add(size.saturating_sub(qr_px) / 2);
+    for my in 0..mods {
+        for mx in 0..mods {
+            if code[(mx as usize, my as usize)] == qrcode::Color::Dark {
+                fb.fill_rect(
+                    ox.saturating_add(mx.saturating_mul(module_px)),
+                    oy.saturating_add(my.saturating_mul(module_px)),
+                    module_px,
+                    module_px,
+                    dark,
+                );
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1026,5 +1308,59 @@ mod tests {
                 "emblem {hint}/{title} had no foreground ink"
             );
         }
+    }
+
+    #[test]
+    fn cpu_and_gpu_vector_logos_render_distinct_ink() {
+        let bg = Rgba::rgb(0x10, 0x14, 0x1A);
+        let badge = Rgba::rgb(0xE8, 0xB6, 0x47);
+        let fg = Rgba::rgb(0x0B, 0x10, 0x14);
+        for size in [16u32, 24, 34] {
+            let mut fb_cpu = Framebuffer::new(size + 8, size + 8);
+            fb_cpu.fill(bg);
+            draw_vector_cpu_logo(&mut fb_cpu, 4, 4, size, badge, fg);
+            assert!(
+                fb_cpu.px.contains(&badge.0) && fb_cpu.px.contains(&fg.0),
+                "cpu logo size {size} missing badge or foreground ink"
+            );
+
+            let mut fb_gpu = Framebuffer::new(size + 8, size + 8);
+            fb_gpu.fill(bg);
+            draw_vector_gpu_logo(&mut fb_gpu, 4, 4, size, badge, fg);
+            assert!(
+                fb_gpu.px.contains(&badge.0) && fb_gpu.px.contains(&fg.0),
+                "gpu logo size {size} missing badge or foreground ink"
+            );
+            assert_ne!(
+                fb_cpu.px, fb_gpu.px,
+                "cpu and gpu logos must be visually distinct at size {size}"
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-layouts")]
+    #[test]
+    fn qr_code_renders_finder_patterns_inside_quiet_zone() {
+        let mut fb = Framebuffer::new(96, 96);
+        let bg = Rgba::rgb(0x10, 0x14, 0x1A);
+        let light = Rgba::rgb(0xFF, 0xFF, 0xFF);
+        let dark = Rgba::rgb(0x0B, 0x10, 0x14);
+        fb.fill(bg);
+        assert!(draw_vector_qr(
+            &mut fb,
+            8,
+            8,
+            72,
+            "https://g-AI.org/Smart-Boot-Manager",
+            light,
+            dark,
+        ));
+        let light_count = fb.px.iter().filter(|&&p| p == light.0).count();
+        let dark_count = fb.px.iter().filter(|&&p| p == dark.0).count();
+        assert!(
+            light_count > 1000,
+            "expected white quiet zone and light modules"
+        );
+        assert!(dark_count > 500, "expected dark QR code modules");
     }
 }

@@ -40,6 +40,9 @@ Options
   --discovery     instant (default), progressive, slow, or sparse (missing SMBIOS)
   --delay-ms      total progressive discovery duration in ms
   --at-ms         headless: capture progressive discovery at N ms after boot
+  --scroll        headless: initial vertical storage scroll offset in pixels
+  --scroll-x      headless: initial horizontal hardware-strip scroll offset in pixels
+  --hints         reveal optional helper text on startup (same as clicking [ ? ])
   --theme         dark, light, or both (headless comparison)
   --display       window follows the window size; WxH renders a fixed virtual display
   --size          window or headless size (default 1280x800)
@@ -63,6 +66,8 @@ pub struct Options {
     pub discovery: DiscoverySchedule,
     pub at_ms: Option<u32>,
     pub scroll: u32,
+    pub scroll_x: u32,
+    pub hints: bool,
     pub dark: bool,
     pub both_themes: bool,
     pub fixed: Option<(u32, u32)>,
@@ -147,6 +152,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         discovery: DiscoverySchedule::default(),
         at_ms: None,
         scroll: 0,
+        scroll_x: 0,
+        hints: false,
         dark: true,
         both_themes: false,
         fixed: None,
@@ -245,6 +252,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
             "--screen" => opts.screen = value()?,
             "--keys" => opts.keys = value()?,
             "--scroll" => opts.scroll = value()?.parse().map_err(|_| "invalid --scroll")?,
+            "--scroll-x" => opts.scroll_x = value()?.parse().map_err(|_| "invalid --scroll-x")?,
+            "--hints" => opts.hints = true,
             "--out" => opts.out = Some(PathBuf::from(value()?)),
             "--core-bin" => opts.core_bin = PathBuf::from(value()?),
             "--exit-after-ms" => {
@@ -376,6 +385,16 @@ fn headless(opts: &Options) -> Result<(), String> {
                                         );
                                         continue;
                                     };
+                                    if opts.hints {
+                                        session.set_show_hints(true);
+                                    }
+                                    if opts.scroll_x > 0 {
+                                        let _ = session.scroll_x_by(
+                                            opts.scroll_x as i32,
+                                            width,
+                                            height,
+                                        );
+                                    }
                                     if opts.scroll > 0 {
                                         let _ =
                                             session.scroll_by(opts.scroll as i32, width, height);

@@ -85,7 +85,9 @@ pub struct Session {
     pub scale: UiScale,
     renderer: RefCell<TextRenderer<'static>>,
     pub elapsed_ms: u32,
+    pub scroll_x: u32,
     pub scroll_y: u32,
+    pub show_hints: bool,
     menu_us: u64,
     boots: u32,
     pub last_reason: &'static str,
@@ -129,7 +131,9 @@ impl Session {
             scale,
             renderer: RefCell::new(TextRenderer::new(font_mode, 800, scale)),
             elapsed_ms: 0,
+            scroll_x: 0,
             scroll_y: 0,
+            show_hints: false,
             menu_us: 0,
             boots: 1,
             last_reason: "menu",
@@ -142,6 +146,7 @@ impl Session {
 
     pub fn set_layout(&mut self, layout: LayoutMode) {
         self.layout = layout;
+        self.scroll_x = 0;
         self.scroll_y = 0;
         self.overflow_drive = None;
     }
@@ -164,11 +169,21 @@ impl Session {
         };
     }
 
+    pub fn set_show_hints(&mut self, show: bool) {
+        self.show_hints = show;
+    }
+
+    pub fn toggle_hints(&mut self) {
+        self.show_hints = !self.show_hints;
+    }
+
     pub fn experimental_options(&self) -> ExperimentalOptions {
         ExperimentalOptions {
+            scroll_x: self.scroll_x,
             scroll_y: self.scroll_y,
             high_contrast: self.high_contrast,
             detail: self.detail,
+            show_hints: self.show_hints,
             overflow_drive: if self.detail == StorageDetail::Compact {
                 self.overflow_drive
             } else {
@@ -194,6 +209,7 @@ impl Session {
     pub fn set_scale(&mut self, scale: UiScale) {
         self.scale = scale;
         self.renderer.borrow_mut().set_scale(scale);
+        self.scroll_x = 0;
         self.scroll_y = 0;
         self.overflow_drive = None;
     }
@@ -238,6 +254,76 @@ impl Session {
             opts,
             &mut renderer,
         )
+    }
+
+    /// Scroll the top hardware widget strip horizontally by `delta` pixels.
+    pub fn scroll_x_by(&mut self, delta: i32, width: u32, height: u32) -> Effect {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+            || delta == 0
+        {
+            return Effect::None;
+        }
+        let map = self.experimental_hit_map(width, height);
+        let next = (self.scroll_x as i64 + delta as i64).clamp(0, map.max_scroll_x as i64) as u32;
+        if next != self.scroll_x {
+            self.scroll_x = next;
+            Effect::Redraw
+        } else {
+            Effect::None
+        }
+    }
+
+    /// True when `(x, y)` is inside the horizontally scrollable top hardware widget strip.
+    pub fn over_hw_grid(&self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+        {
+            return false;
+        }
+        let map = self.experimental_hit_map(width, height);
+        map.max_scroll_x > 0
+            && (map.hw_viewport.is_some_and(|r| r.contains(x, y))
+                || map.hw_scroll_track.is_some_and(|r| r.contains(x, y)))
+    }
+
+    /// True when `(x, y)` lies on the horizontal hardware scrollbar track (starts drag).
+    pub fn on_hw_scroll_track(&self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+        {
+            return false;
+        }
+        let map = self.experimental_hit_map(width, height);
+        map.hw_scroll_track.is_some_and(|r| r.contains(x, y))
+    }
+
+    /// Scrub `scroll_x` continuously while dragging the horizontal scrollbar thumb.
+    pub fn scroll_x_drag(&mut self, x: u32, width: u32, height: u32) -> Effect {
+        if self.sim.is_some()
+            || self.state.screen != Screen::Menu
+            || self.layout == LayoutMode::Classic
+        {
+            return Effect::None;
+        }
+        let map = self.experimental_hit_map(width, height);
+        if let Some(track) = map.hw_scroll_track
+            && map.max_scroll_x > 0
+        {
+            let thumb_w = map.hw_scroll_thumb.map(|t| t.w).unwrap_or(28);
+            let travel = track.w.saturating_sub(thumb_w).max(1);
+            let rel = x.saturating_sub(track.x + thumb_w / 2).min(travel);
+            let target = ((rel as u64 * map.max_scroll_x as u64) / travel as u64) as u32;
+            let clamped = target.min(map.max_scroll_x);
+            if clamped != self.scroll_x {
+                self.scroll_x = clamped;
+                return Effect::Redraw;
+            }
+        }
+        Effect::None
     }
 
     /// Scroll the multi-drive storage workspace vertically by `delta` pixels.
@@ -323,6 +409,7 @@ impl Session {
         self.boots += 1;
         self.sim = None;
         self.elapsed_ms = 0;
+        self.scroll_x = 0;
         self.scroll_y = 0;
         self.overflow_drive = None;
         self.core_plan = None;
@@ -373,6 +460,17 @@ impl Session {
                 self.state.countdown_ms = None;
                 self.toggle_detail();
                 return Effect::Redraw;
+            }
+            if matches!(key, Key::Char('?')) {
+                self.state.countdown_ms = None;
+                self.toggle_hints();
+                return Effect::Redraw;
+            }
+            if matches!(key, Key::Char('[')) {
+                return self.scroll_x_by(-160, width, height);
+            }
+            if matches!(key, Key::Char(']')) {
+                return self.scroll_x_by(160, width, height);
             }
         }
         let input = menu_input(
@@ -425,6 +523,22 @@ impl Session {
                     ExperimentalHit::CloseOverflow if pointer.clicked => {
                         self.overflow_drive = None;
                         return Effect::Redraw;
+                    }
+                    ExperimentalHit::ToggleHints if pointer.clicked => {
+                        self.state.countdown_ms = None;
+                        self.toggle_hints();
+                        return Effect::Redraw;
+                    }
+                    ExperimentalHit::ScrollXDelta(delta) if pointer.clicked => {
+                        return self.scroll_x_by(delta, width, height);
+                    }
+                    ExperimentalHit::ScrollXTo(target) if pointer.clicked => {
+                        let clamped = target.min(map.max_scroll_x);
+                        if clamped != self.scroll_x {
+                            self.scroll_x = clamped;
+                            return Effect::Redraw;
+                        }
+                        None
                     }
                     ExperimentalHit::ScrollDelta(delta) if pointer.clicked => {
                         return self.scroll_by(delta, width, height);

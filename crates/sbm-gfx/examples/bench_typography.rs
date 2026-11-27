@@ -240,6 +240,7 @@ fn bench_experimental_layouts() {
 
     let make_spec = |w: u32, h: u32| SystemSpec {
         host_label: "Workstation LBA Stress".into(),
+        sbm_version: "26.11.27#12".into(),
         cpu: ProbeState::Ready(CpuSpec {
             model: Some("AMD Ryzen 9 9950X".into()),
             arch: "x86_64".into(),
