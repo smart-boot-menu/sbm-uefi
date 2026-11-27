@@ -874,6 +874,24 @@ pub fn draw_vector_chevron(fb: &mut Framebuffer, x: u32, y: u32, size: u32, up: 
     fill_path(fb, &path, color);
 }
 
+/// Draw a crisp antialiased 3-bar hamburger menu icon inside `(x, y, size, size)`.
+pub fn draw_vector_hamburger(fb: &mut Framebuffer, x: u32, y: u32, size: u32, color: Rgba) {
+    if size < 8 {
+        return;
+    }
+    let inset_x = (size / 6).max(2);
+    let bar_w = size.saturating_sub(inset_x * 2).max(4);
+    let bar_h = (size / 8).clamp(2, 4);
+    let gap = ((size.saturating_sub(bar_h * 3)) / 4).max(2);
+    let total_h = bar_h * 3 + gap * 2;
+    let y0 = y.saturating_add(size.saturating_sub(total_h) / 2);
+    let r = bar_h / 2;
+    for i in 0..3u32 {
+        let by = y0.saturating_add(i.saturating_mul(bar_h + gap));
+        fill_rounded_rect(fb, x.saturating_add(inset_x), by, bar_w, bar_h, r, color);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

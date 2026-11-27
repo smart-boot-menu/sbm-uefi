@@ -19,9 +19,69 @@ use crate::state::{Focus, MenuState};
 use crate::theme::Theme;
 use crate::typography::{FontMode, TextRenderer, TextRole, UiScale};
 use crate::vector::{
-    draw_vector_chevron, draw_vector_close_x, draw_vector_emblem, draw_vector_lock, fill_circle,
-    fill_ortho_polygon, fill_rounded_panel, fill_rounded_rect, stroke_ortho_polygon,
+    draw_vector_chevron, draw_vector_close_x, draw_vector_emblem, draw_vector_hamburger,
+    draw_vector_lock, fill_circle, fill_ortho_polygon, fill_rounded_panel, fill_rounded_rect,
+    stroke_ortho_polygon,
 };
+
+/// How storage devices display their contents in experimental hardware dashboards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StorageDetail {
+    /// Approachable default: clean rectangular OS cards inside each bootable
+    /// drive (max 4 slots per drive, with a 4th hamburger overflow tile when
+    /// a drive hosts more than 4 OS targets). Non-OS partitions and unallocated
+    /// space are hidden.
+    #[default]
+    Compact,
+    /// Technical partition topology: full LBA-ordered paragraph-wrapped
+    /// orthogonal polygons for every partition and explicit hatched unallocated
+    /// region across all drives.
+    Detailed,
+}
+
+impl StorageDetail {
+    pub const ALL: [Self; 2] = [Self::Compact, Self::Detailed];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Detailed => "detailed",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Detailed => "Detailed",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Compact => Self::Detailed,
+            Self::Detailed => Self::Compact,
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "compact" | "simple" | "os" => Some(Self::Compact),
+            "detailed" | "full" | "lba" | "partitions" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
+}
+
+/// View options passed to experimental dashboard layout & painting routines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExperimentalOptions {
+    pub scroll_y: u32,
+    pub high_contrast: bool,
+    pub detail: StorageDetail,
+    /// Index in `spec.storage` of the drive whose Compact-mode hamburger
+    /// overflow menu (`>4` OS targets) is currently open.
+    pub overflow_drive: Option<usize>,
+}
 
 /// Selectable menu layout for interactive design comparison.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -301,18 +361,25 @@ pub struct CardHitZone {
 }
 
 /// Interactive hit result for experimental layouts (extends [`Hit`] with
-/// autoboot abort `[X]` buttons and drive-list scrollbar controls).
+/// autoboot abort `[X]` buttons, Compact/Detailed toggle, overflow menu, and
+/// drive-list scrollbar controls).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExperimentalHit {
     None,
     Card(usize),
     Action(usize),
-    /// Clicking either the top-right `[X]` or the flashing partition's `[X]`.
+    /// Clicking either the top-right `[X]` or the flashing target's `[X]`.
     AbortAutoboot,
     /// Clicking the scrollbar up/down arrow buttons (signed pixel delta).
     ScrollDelta(i32),
     /// Clicking on the scrollbar track to jump to a specific scroll offset.
     ScrollTo(u32),
+    /// Clicking the header `[ Compact | Detailed ]` segmented toggle.
+    SetDetail(StorageDetail),
+    /// Clicking the 4th-slot hamburger overflow tile on a drive with >4 OS targets.
+    ToggleOverflow(usize),
+    /// Clicking the overflow popover's `[X]` button or clicking outside the popover.
+    CloseOverflow,
 }
 
 /// Interactive hit regions produced by any layout so mouse + keyboard stay
@@ -321,8 +388,17 @@ pub enum ExperimentalHit {
 pub struct LayoutHitMap {
     pub zones: Vec<CardHitZone>,
     pub actions: Vec<Rect>,
-    /// Clickable `[X]` abort-autoboot buttons (top-right countdown pill + flashing partition).
+    /// Clickable `[X]` abort-autoboot buttons (top-right countdown pill + flashing target).
     pub abort_buttons: Vec<Rect>,
+    /// Clickable header `[ Compact | Detailed ]` toggle segments.
+    pub detail_compact: Option<Rect>,
+    pub detail_detailed: Option<Rect>,
+    /// Clickable 4th-slot hamburger overflow tiles `(drive_index, rect)` in Compact mode.
+    pub overflow_buttons: Vec<(usize, Rect)>,
+    /// Open Compact-mode overflow popover geometry & interactive rows.
+    pub overflow_panel: Option<Rect>,
+    pub overflow_close: Option<Rect>,
+    pub overflow_zones: Vec<CardHitZone>,
     pub scroll_up: Option<Rect>,
     pub scroll_down: Option<Rect>,
     pub scroll_track: Option<Rect>,
@@ -337,6 +413,16 @@ pub struct LayoutHitMap {
 
 impl LayoutHitMap {
     pub fn hit_test(&self, x: u32, y: u32) -> Hit {
+        if let Some(panel) = self.overflow_panel {
+            for zone in &self.overflow_zones {
+                if zone.segments.iter().any(|s| s.contains(x, y)) {
+                    return Hit::Card(zone.card_index);
+                }
+            }
+            if panel.contains(x, y) {
+                return Hit::None;
+            }
+        }
         // Explicit multi-target pills win over their parent polygon body.
         for zone in self.zones.iter().filter(|z| z.priority) {
             if zone.segments.iter().any(|s| s.contains(x, y)) {
@@ -356,12 +442,51 @@ impl LayoutHitMap {
         Hit::None
     }
 
-    /// Full hit test including `[X]` autoboot abort buttons and scrollbar controls.
+    /// Full hit test including `[X]` autoboot abort buttons, Compact/Detailed
+    /// toggle, overflow menu, and scrollbar controls.
     pub fn hit_test_experimental(&self, x: u32, y: u32) -> ExperimentalHit {
+        if let Some(panel) = self.overflow_panel {
+            if self.overflow_close.is_some_and(|r| r.contains(x, y)) {
+                return ExperimentalHit::CloseOverflow;
+            }
+            if self
+                .abort_buttons
+                .iter()
+                .any(|r| panel.contains(r.x, r.y) && r.contains(x, y))
+            {
+                return ExperimentalHit::AbortAutoboot;
+            }
+            for zone in &self.overflow_zones {
+                if zone.segments.iter().any(|s| s.contains(x, y)) {
+                    return ExperimentalHit::Card(zone.card_index);
+                }
+            }
+            if panel.contains(x, y) {
+                return ExperimentalHit::None;
+            }
+            if self.detail_compact.is_some_and(|r| r.contains(x, y)) {
+                return ExperimentalHit::SetDetail(StorageDetail::Compact);
+            }
+            if self.detail_detailed.is_some_and(|r| r.contains(x, y)) {
+                return ExperimentalHit::SetDetail(StorageDetail::Detailed);
+            }
+            return ExperimentalHit::CloseOverflow;
+        }
         // Abort `[X]` buttons always take highest priority so clicking `[X]` on
-        // the flashing partition aborts autoboot instead of launching it.
+        // the flashing target aborts autoboot instead of launching it.
         if self.abort_buttons.iter().any(|r| r.contains(x, y)) {
             return ExperimentalHit::AbortAutoboot;
+        }
+        if self.detail_compact.is_some_and(|r| r.contains(x, y)) {
+            return ExperimentalHit::SetDetail(StorageDetail::Compact);
+        }
+        if self.detail_detailed.is_some_and(|r| r.contains(x, y)) {
+            return ExperimentalHit::SetDetail(StorageDetail::Detailed);
+        }
+        for &(drive_idx, rect) in &self.overflow_buttons {
+            if rect.contains(x, y) {
+                return ExperimentalHit::ToggleOverflow(drive_idx);
+            }
         }
         if self.scroll_up.is_some_and(|r| r.contains(x, y)) {
             return ExperimentalHit::ScrollDelta(-110);
@@ -695,7 +820,7 @@ impl Metrics {
     }
 }
 
-/// Compute hit-map without rendering pixels (default typography/contrast).
+/// Compute hit-map without rendering pixels (default typography/contrast, Compact view).
 pub fn layout_experimental(
     mode: LayoutMode,
     width: u32,
@@ -706,7 +831,7 @@ pub fn layout_experimental(
     layout_experimental_scrolled(mode, width, height, spec, state, 0)
 }
 
-/// Compute hit-map at a specific vertical drive-list scroll offset (default typography/contrast).
+/// Compute hit-map at a specific vertical drive-list scroll offset (default typography/contrast, Compact view).
 pub fn layout_experimental_scrolled(
     mode: LayoutMode,
     width: u32,
@@ -722,13 +847,15 @@ pub fn layout_experimental_scrolled(
         height,
         spec,
         state,
-        scroll_y,
-        false,
+        ExperimentalOptions {
+            scroll_y,
+            ..ExperimentalOptions::default()
+        },
         &mut renderer,
     )
 }
 
-/// Compute hit-map honoring the active [`TextRenderer`] scale/font and contrast mode.
+/// Compute hit-map honoring the active [`TextRenderer`] scale/font and [`ExperimentalOptions`].
 #[allow(clippy::too_many_arguments)]
 pub fn layout_experimental_with(
     mode: LayoutMode,
@@ -736,27 +863,17 @@ pub fn layout_experimental_with(
     height: u32,
     spec: &SystemSpec,
     state: &MenuState,
-    scroll_y: u32,
-    high_contrast: bool,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
 ) -> LayoutHitMap {
     renderer.set_display_height(height);
     let mut dummy = Framebuffer::new(0, 0);
     render_mode(
-        &mut dummy,
-        width,
-        height,
-        mode,
-        spec,
-        state,
-        scroll_y,
-        high_contrast,
-        renderer,
-        false,
+        &mut dummy, width, height, mode, spec, state, opts, renderer, false,
     )
 }
 
-/// Render an experimental layout and return its interactive hit-map (default typography/contrast).
+/// Render an experimental layout and return its interactive hit-map (default typography/contrast, Compact view).
 pub fn paint_experimental(
     fb: &mut Framebuffer,
     mode: LayoutMode,
@@ -766,7 +883,7 @@ pub fn paint_experimental(
     paint_experimental_scrolled(fb, mode, spec, state, 0)
 }
 
-/// Render an experimental layout at a vertical scroll offset (default typography/contrast).
+/// Render an experimental layout at a vertical scroll offset (default typography/contrast, Compact view).
 pub fn paint_experimental_scrolled(
     fb: &mut Framebuffer,
     mode: LayoutMode,
@@ -775,7 +892,17 @@ pub fn paint_experimental_scrolled(
     scroll_y: u32,
 ) -> LayoutHitMap {
     let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, fb.height, UiScale::default());
-    paint_experimental_with(fb, mode, spec, state, scroll_y, false, &mut renderer)
+    paint_experimental_with(
+        fb,
+        mode,
+        spec,
+        state,
+        ExperimentalOptions {
+            scroll_y,
+            ..ExperimentalOptions::default()
+        },
+        &mut renderer,
+    )
 }
 
 /// Render an experimental layout using the unified [`TextRenderer`] and vector backend.
@@ -785,26 +912,14 @@ pub fn paint_experimental_with(
     mode: LayoutMode,
     spec: &SystemSpec,
     state: &MenuState,
-    scroll_y: u32,
-    high_contrast: bool,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
 ) -> LayoutHitMap {
     let (w, h) = (fb.width, fb.height);
     renderer.set_display_height(h);
-    let map = render_mode(
-        fb,
-        w,
-        h,
-        mode,
-        spec,
-        state,
-        scroll_y,
-        high_contrast,
-        renderer,
-        true,
-    );
+    let map = render_mode(fb, w, h, mode, spec, state, opts, renderer, true);
     if let Some((x, y)) = state.cursor {
-        let pal = Palette::resolve(state.dark, high_contrast);
+        let pal = Palette::resolve(state.dark, opts.high_contrast);
         draw_cursor(fb, x, y, pal.focus);
     }
     map
@@ -818,24 +933,31 @@ fn render_mode(
     mode: LayoutMode,
     spec: &SystemSpec,
     state: &MenuState,
-    scroll_y: u32,
-    high_contrast: bool,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
 ) -> LayoutHitMap {
-    let pal = Palette::resolve(state.dark, high_contrast);
+    let pal = Palette::resolve(state.dark, opts.high_contrast);
     let m = Metrics::for_renderer(w, h, renderer);
-    match mode {
+    let mut hit = match mode {
         LayoutMode::Bento | LayoutMode::Classic => {
-            paint_bento(fb, w, h, spec, state, &pal, m, scroll_y, renderer, paint)
+            paint_bento(fb, w, h, spec, state, &pal, m, opts, renderer, paint)
         }
         LayoutMode::Schematic => {
-            paint_schematic(fb, w, h, spec, state, &pal, m, scroll_y, renderer, paint)
+            paint_schematic(fb, w, h, spec, state, &pal, m, opts, renderer, paint)
         }
         LayoutMode::Storage => {
-            paint_storage_first(fb, w, h, spec, state, &pal, m, scroll_y, renderer, paint)
+            paint_storage_first(fb, w, h, spec, state, &pal, m, opts, renderer, paint)
         }
+    };
+    if opts.detail == StorageDetail::Compact
+        && let Some(drive_idx) = opts.overflow_drive
+    {
+        draw_overflow_popover(
+            fb, w, h, spec, drive_idx, state, &pal, m, renderer, paint, &mut hit,
+        );
     }
+    hit
 }
 
 /// Smooth triangle-wave pulse `0..=255` driven by remaining autoboot countdown ms.
@@ -864,7 +986,7 @@ fn paint_bento(
     state: &MenuState,
     pal: &Palette,
     m: Metrics,
-    scroll_y: u32,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
 ) -> LayoutHitMap {
@@ -873,13 +995,14 @@ fn paint_bento(
     }
     let header_h = m.header_h;
     let footer_h = m.footer_h;
-    let header_abort = draw_header(
+    let header_hits = draw_header(
         fb,
         w,
         header_h,
         "A // HARDWARE BENTO",
         spec,
         state,
+        opts.detail,
         pal,
         m,
         renderer,
@@ -931,13 +1054,11 @@ fn paint_bento(
         pal,
         m,
         StorageStyle::Bento,
-        scroll_y,
+        opts,
         renderer,
         paint,
     );
-    if let Some(r) = header_abort {
-        hit.abort_buttons.push(r);
-    }
+    header_hits.apply(&mut hit);
     hit.actions = draw_footer(
         fb,
         Rect {
@@ -1469,7 +1590,7 @@ fn paint_schematic(
     state: &MenuState,
     pal: &Palette,
     m: Metrics,
-    scroll_y: u32,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
 ) -> LayoutHitMap {
@@ -1481,13 +1602,14 @@ fn paint_schematic(
 
     let header_h = m.header_h;
     let footer_h = m.footer_h;
-    let header_abort = draw_header(
+    let header_hits = draw_header(
         fb,
         w,
         header_h,
         "B // HARDWARE SCHEMATIC",
         spec,
         state,
+        opts.detail,
         pal,
         m,
         renderer,
@@ -1581,13 +1703,11 @@ fn paint_schematic(
         StorageStyle::Schematic {
             spine_y: top_y + ic_h + bus_band_h / 2,
         },
-        scroll_y,
+        opts,
         renderer,
         paint,
     );
-    if let Some(r) = header_abort {
-        hit.abort_buttons.push(r);
-    }
+    header_hits.apply(&mut hit);
     hit.actions = draw_footer(
         fb,
         Rect {
@@ -1791,7 +1911,7 @@ fn paint_storage_first(
     state: &MenuState,
     pal: &Palette,
     m: Metrics,
-    scroll_y: u32,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
 ) -> LayoutHitMap {
@@ -1806,13 +1926,14 @@ fn paint_storage_first(
         m.tech_h + 14
     };
 
-    let header_abort = draw_header(
+    let header_hits = draw_header(
         fb,
         w,
         header_h,
         "C // STORAGE-FIRST",
         spec,
         state,
+        opts.detail,
         pal,
         m,
         renderer,
@@ -1855,13 +1976,11 @@ fn paint_storage_first(
         pal,
         m,
         StorageStyle::FullWidthRack,
-        scroll_y,
+        opts,
         renderer,
         paint,
     );
-    if let Some(r) = header_abort {
-        hit.abort_buttons.push(r);
-    }
+    header_hits.apply(&mut hit);
     hit.actions = draw_footer(
         fb,
         Rect {
@@ -2196,7 +2315,7 @@ fn draw_storage_workspace(
     pal: &Palette,
     m: Metrics,
     style: StorageStyle,
-    scroll_y: u32,
+    opts: ExperimentalOptions,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
 ) -> LayoutHitMap {
@@ -2205,7 +2324,7 @@ fn draw_storage_workspace(
         ..LayoutHitMap::default()
     };
 
-    let devices = match &spec.storage {
+    let all_devices = match &spec.storage {
         ProbeState::Pending => {
             if paint {
                 draw_empty_storage_panel(
@@ -2251,6 +2370,23 @@ fn draw_storage_workspace(
         ProbeState::Ready(list) => list,
     };
 
+    // In Compact mode, hide data-only drives that hold no bootable OS targets
+    // whenever at least one bootable drive exists, keeping the menu calm and focused.
+    let mut visible_devices: Vec<(usize, &StorageDevice)> = match opts.detail {
+        StorageDetail::Detailed => all_devices.iter().enumerate().collect(),
+        StorageDetail::Compact => all_devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.boot_target_count() > 0)
+            .collect(),
+    };
+    let hidden_data_drives = if visible_devices.is_empty() {
+        visible_devices = all_devices.iter().enumerate().collect();
+        0
+    } else {
+        all_devices.len().saturating_sub(visible_devices.len())
+    };
+
     let bus_gutter = match style {
         StorageStyle::Schematic { .. } => {
             if m.compact {
@@ -2273,10 +2409,10 @@ fn draw_storage_workspace(
     };
     hit.viewport_h = work.h;
 
-    let n = devices.len();
+    let n = visible_devices.len();
     let cols: usize = match style {
         // Storage-first always uses 1 full-width column so every disk has maximum
-        // horizontal canvas for paragraph-style LBA polygon wrapping!
+        // horizontal canvas for OS cards or LBA polygon wrapping.
         StorageStyle::FullWidthRack => 1,
         StorageStyle::Bento | StorageStyle::Schematic { .. } => {
             if n == 1 {
@@ -2296,58 +2432,97 @@ fn draw_storage_workspace(
     hit.cols = used_cols;
     let rows = n.div_ceil(used_cols);
 
-    // Compute natural comfortable height for every row based on its region count,
-    // boot target richness, and active UI scale so scaled / multi-drive setups scroll cleanly.
+    // Compute natural comfortable height for every row based on active detail mode,
+    // target richness, and active UI scale so scaled / multi-drive setups scroll cleanly.
     let mut row_weights = Vec::with_capacity(rows);
     let mut row_heights = Vec::with_capacity(rows);
     for row in 0..rows {
         let row_start = row * used_cols;
         let row_end = (row_start + used_cols).min(n);
-        let row_devs = &devices[row_start..row_end];
-        let max_score = row_devs
-            .iter()
-            .map(|d| {
-                let r_pts = d.regions.len().clamp(1, 10) as u32 * 3;
-                let t_pts = d.boot_target_count().min(4) as u32 * 6;
-                (8 + r_pts + t_pts).min(36)
-            })
-            .max()
-            .unwrap_or(10);
-        let max_regions = row_devs.iter().map(|d| d.regions.len()).max().unwrap_or(1);
+        let row_devs = &visible_devices[row_start..row_end];
         let max_targets = row_devs
             .iter()
-            .map(StorageDevice::boot_target_count)
+            .map(|(_, d)| d.boot_target_count())
             .max()
             .unwrap_or(0);
-        let base_h: u32 = match style {
-            StorageStyle::FullWidthRack => {
-                if m.compact {
-                    155
-                } else if m.wide {
-                    255
+        match opts.detail {
+            StorageDetail::Compact => {
+                let slots = max_targets.clamp(1, 4) as u32;
+                let weight = (8 + slots * 5).min(28);
+                let base_h: u32 = match style {
+                    StorageStyle::FullWidthRack => {
+                        if m.compact {
+                            118
+                        } else if m.wide {
+                            170
+                        } else {
+                            146
+                        }
+                    }
+                    StorageStyle::Bento | StorageStyle::Schematic { .. } => {
+                        if m.compact {
+                            126
+                        } else if m.wide {
+                            184
+                        } else {
+                            154
+                        }
+                    }
+                };
+                let extra = if slots >= 3 && used_cols >= 2 {
+                    if m.compact { 38 } else { 54 }
                 } else {
-                    205
-                }
+                    0
+                };
+                row_weights.push(weight);
+                row_heights.push(m.scaled(base_h.saturating_add(extra)));
             }
-            StorageStyle::Bento | StorageStyle::Schematic { .. } => {
-                if m.compact {
-                    165
-                } else if m.wide {
-                    265
+            StorageDetail::Detailed => {
+                let max_score = row_devs
+                    .iter()
+                    .map(|(_, d)| {
+                        let r_pts = d.regions.len().clamp(1, 10) as u32 * 3;
+                        let t_pts = d.boot_target_count().min(4) as u32 * 6;
+                        (8 + r_pts + t_pts).min(36)
+                    })
+                    .max()
+                    .unwrap_or(10);
+                let max_regions = row_devs
+                    .iter()
+                    .map(|(_, d)| d.regions.len())
+                    .max()
+                    .unwrap_or(1);
+                let base_h: u32 = match style {
+                    StorageStyle::FullWidthRack => {
+                        if m.compact {
+                            155
+                        } else if m.wide {
+                            255
+                        } else {
+                            205
+                        }
+                    }
+                    StorageStyle::Bento | StorageStyle::Schematic { .. } => {
+                        if m.compact {
+                            165
+                        } else if m.wide {
+                            265
+                        } else {
+                            215
+                        }
+                    }
+                };
+                let rich_bonus = if max_regions >= 6 || max_targets >= 3 {
+                    if m.compact { 34 } else { 52 }
+                } else if max_regions >= 3 || max_targets >= 1 {
+                    if m.compact { 16 } else { 26 }
                 } else {
-                    215
-                }
+                    0
+                };
+                row_weights.push(max_score);
+                row_heights.push(m.scaled(base_h.saturating_add(rich_bonus)));
             }
-        };
-        let rich_bonus = if max_regions >= 6 || max_targets >= 3 {
-            if m.compact { 34 } else { 52 }
-        } else if max_regions >= 3 || max_targets >= 1 {
-            if m.compact { 16 } else { 26 }
-        } else {
-            0
-        };
-        row_weights.push(max_score);
-        row_heights.push(m.scaled(base_h.saturating_add(rich_bonus)));
+        }
     }
 
     let total_gaps = m.gap.saturating_mul(rows.saturating_sub(1) as u32);
@@ -2359,10 +2534,24 @@ fn draw_storage_workspace(
     let scrollable = natural_total_h > work.h && rows > 1;
 
     // If everything fits comfortably inside `work.h`, stretch rows proportionally
-    // to fill 100% of the available canvas.
+    // to fill the canvas (in Compact mode, cap single-row drives with <=3 targets
+    // so the drive chassis stays sleek instead of becoming an empty tall cave).
     if !scrollable {
         let total_weight: u32 = row_weights.iter().sum::<u32>().max(1);
-        let avail_h = work.h.saturating_sub(total_gaps);
+        let mut avail_h = work.h.saturating_sub(total_gaps);
+        if opts.detail == StorageDetail::Compact && rows == 1 {
+            let max_slots = visible_devices
+                .iter()
+                .map(|(_, d)| d.boot_target_count().min(4))
+                .max()
+                .unwrap_or(1);
+            let max_single_row_h = if max_slots >= 4 {
+                m.scaled(360)
+            } else {
+                m.scaled(240)
+            };
+            avail_h = avail_h.min(max_single_row_h);
+        }
         let mut used = 0u32;
         for row in 0..rows {
             let rh = if row + 1 == rows {
@@ -2381,7 +2570,7 @@ fn draw_storage_workspace(
         .sum::<u32>()
         .saturating_add(total_gaps);
     let max_scroll_y = content_h.saturating_sub(work.h);
-    let eff_scroll_y = scroll_y.min(max_scroll_y);
+    let eff_scroll_y = opts.scroll_y.min(max_scroll_y);
     hit.scroll_y = eff_scroll_y;
     hit.max_scroll_y = max_scroll_y;
 
@@ -2400,30 +2589,63 @@ fn draw_storage_workspace(
     };
 
     if paint && matches!(style, StorageStyle::Bento | StorageStyle::FullWidthRack) {
-        let total_targets: usize = devices.iter().map(StorageDevice::boot_target_count).sum();
-        let prefix = match style {
-            StorageStyle::FullWidthRack => "LBA STORAGE RACK  //  ",
-            _ => "STORAGE TOPOLOGY (LBA ORDER)  //  ",
-        };
+        let total_targets: usize = visible_devices
+            .iter()
+            .map(|(_, d)| d.boot_target_count())
+            .sum();
         let scroll_hint = if scrollable { " · SCROLL DRIVES" } else { "" };
-        let title = format!(
-            "{prefix}{} DEVICE{} · {} BOOT TARGET{}{scroll_hint}",
-            devices.len(),
-            if devices.len() == 1 { "" } else { "S" },
-            total_targets,
-            if total_targets == 1 { "" } else { "S" },
-        );
+        let title = match opts.detail {
+            StorageDetail::Compact => {
+                let prefix = match style {
+                    StorageStyle::FullWidthRack => "BOOTABLE DRIVES  //  ",
+                    _ => "OPERATING SYSTEMS BY DRIVE  //  ",
+                };
+                let hidden_note = if hidden_data_drives > 0 {
+                    format!(
+                        " · {} DATA DRIVE{} IN DETAILED",
+                        hidden_data_drives,
+                        if hidden_data_drives == 1 { "" } else { "S" }
+                    )
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{prefix}{} DRIVE{} · {} OS TARGET{}{hidden_note}{scroll_hint}",
+                    visible_devices.len(),
+                    if visible_devices.len() == 1 { "" } else { "S" },
+                    total_targets,
+                    if total_targets == 1 { "" } else { "S" },
+                )
+            }
+            StorageDetail::Detailed => {
+                let prefix = match style {
+                    StorageStyle::FullWidthRack => "LBA STORAGE RACK  //  ",
+                    _ => "STORAGE TOPOLOGY (LBA ORDER)  //  ",
+                };
+                format!(
+                    "{prefix}{} DEVICE{} · {} BOOT TARGET{}{scroll_hint}",
+                    visible_devices.len(),
+                    if visible_devices.len() == 1 { "" } else { "S" },
+                    total_targets,
+                    if total_targets == 1 { "" } else { "S" },
+                )
+            }
+        };
         draw_eyebrow(fb, area.x, area.y, area.w, &title, pal.eyebrow, renderer);
     }
 
     let col_w =
         content_w.saturating_sub(m.gap.saturating_mul(used_cols as u32 - 1)) / used_cols as u32;
 
-    let content_cursor = state.cursor.and_then(|(cx, cy)| {
-        content_viewport
-            .contains(cx, cy)
-            .then_some((cx, cy.saturating_add(eff_scroll_y)))
-    });
+    let content_cursor = if opts.overflow_drive.is_some() {
+        None
+    } else {
+        state.cursor.and_then(|(cx, cy)| {
+            content_viewport
+                .contains(cx, cy)
+                .then_some((cx, cy.saturating_add(eff_scroll_y)))
+        })
+    };
 
     let clip_rect = Rect {
         x: area.x,
@@ -2453,9 +2675,9 @@ fn draw_storage_workspace(
 
         let row_start = row * used_cols;
         let row_end = (row_start + used_cols).min(n);
-        if devices[row_start..row_end]
+        if visible_devices[row_start..row_end]
             .iter()
-            .any(|dev| dev.has_selected(state.selected))
+            .any(|(_, dev)| dev.has_selected(state.selected))
         {
             hit.selected_drive_band = Some((row_top, row_bottom));
         }
@@ -2466,7 +2688,7 @@ fn draw_storage_workspace(
             last_tap_y = row_mid_y;
 
             if paint && let StorageStyle::Schematic { .. } = style {
-                let row_dev = &devices[row_start];
+                let (_, row_dev) = visible_devices[row_start];
                 let tap_col = bus_color(&row_dev.bus, row_dev.removable, pal);
                 fb.hline(trunk_x, row_mid_y, work.x.saturating_sub(trunk_x), tap_col);
                 fill_circle(fb, trunk_x, row_mid_y, 3.0, tap_col);
@@ -2478,7 +2700,7 @@ fn draw_storage_workspace(
                 if idx >= n {
                     break;
                 }
-                let dev = &devices[idx];
+                let (drive_idx, dev) = visible_devices[idx];
                 let dx = work.x + (col as u32) * (col_w + m.gap);
                 let dw = if col + 1 == used_cols {
                     work.x + content_w - dx
@@ -2507,18 +2729,37 @@ fn draw_storage_workspace(
                     }
                 }
 
-                let (dev_zones, dev_aborts) = draw_storage_device(
-                    fb,
-                    rect,
-                    dev,
-                    state,
-                    content_cursor,
-                    pal,
-                    m,
-                    style,
-                    renderer,
-                    paint,
-                );
+                let (dev_zones, dev_aborts, overflow_btn) = match opts.detail {
+                    StorageDetail::Compact => draw_compact_storage_device(
+                        fb,
+                        rect,
+                        drive_idx,
+                        dev,
+                        state,
+                        content_cursor,
+                        pal,
+                        m,
+                        style,
+                        opts.overflow_drive == Some(drive_idx),
+                        renderer,
+                        paint,
+                    ),
+                    StorageDetail::Detailed => {
+                        let (z, a) = draw_storage_device(
+                            fb,
+                            rect,
+                            dev,
+                            state,
+                            content_cursor,
+                            pal,
+                            m,
+                            style,
+                            renderer,
+                            paint,
+                        );
+                        (z, a, None)
+                    }
+                };
                 for zone in dev_zones {
                     let clipped: Vec<Rect> = zone
                         .segments
@@ -2537,6 +2778,11 @@ fn draw_storage_workspace(
                     if let Some(sr) = shift_and_clip_rect(abort_r, eff_scroll_y, content_viewport) {
                         hit.abort_buttons.push(sr);
                     }
+                }
+                if let Some(btn_r) = overflow_btn
+                    && let Some(sr) = shift_and_clip_rect(btn_r, eff_scroll_y, content_viewport)
+                {
+                    hit.overflow_buttons.push((drive_idx, sr));
                 }
             }
         }
@@ -2610,6 +2856,847 @@ fn shift_and_clip_rect(r: Rect, scroll_y: u32, viewport: Rect) -> Option<Rect> {
         w: (x1 - x0) as u32,
         h: (y1 - y0) as u32,
     })
+}
+
+/// One bootable target inside a drive together with friendly partition metadata
+/// for Compact-mode rendering (no raw partition indices or LBA jargon).
+struct CompactTarget<'a> {
+    target: &'a BootTargetView,
+    size_bytes: Option<u64>,
+    fs: Option<&'a str>,
+    encrypted: Option<&'a str>,
+}
+
+/// Collect bootable targets hosted by `dev` for Compact mode:
+/// actual OS targets first (in exact ascending LBA order), then standalone
+/// recovery targets (in exact ascending LBA order). Non-OS partitions and
+/// unallocated gaps are omitted.
+fn compact_drive_targets(dev: &StorageDevice) -> Vec<CompactTarget<'_>> {
+    let mut os_targets = Vec::new();
+    let mut rec_targets = Vec::new();
+    for reg in &dev.regions {
+        let RegionKind::Partition(part) = &reg.kind else {
+            continue;
+        };
+        for target in &part.boot_targets {
+            let entry = CompactTarget {
+                target,
+                size_bytes: target.os_part.map(|_| reg.size_bytes),
+                fs: if target.os_part.is_some() {
+                    part.fs.as_deref()
+                } else {
+                    None
+                },
+                encrypted: part.encrypted.as_deref(),
+            };
+            if target.is_recovery {
+                rec_targets.push(entry);
+            } else {
+                os_targets.push(entry);
+            }
+        }
+    }
+    os_targets.extend(rec_targets);
+    os_targets
+}
+
+fn compact_target_subtitle(item: &CompactTarget<'_>) -> String {
+    if !item.target.healthy {
+        return "Unavailable · integrity error".into();
+    }
+    if item.target.is_recovery {
+        return "Recovery & diagnostics".into();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(bytes) = item.size_bytes {
+        parts.push(format_bytes(bytes));
+    }
+    if let Some(fs) = item.fs {
+        parts.push(fs.to_string());
+    }
+    if let Some(enc) = item.encrypted {
+        parts.push(enc.to_string());
+    }
+    if parts.is_empty() {
+        item.target.family.clone()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Render a drive card in Compact mode: clean rectangular OS widgets only
+/// (max 4 slots per drive; when >4 targets exist, the 4th slot is a hamburger
+/// overflow button that reveals the remaining OSes).
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_storage_device(
+    fb: &mut Framebuffer,
+    r: Rect,
+    _drive_idx: usize,
+    dev: &StorageDevice,
+    state: &MenuState,
+    cursor: Option<(u32, u32)>,
+    pal: &Palette,
+    m: Metrics,
+    style: StorageStyle,
+    overflow_open: bool,
+    renderer: &mut TextRenderer<'_>,
+    paint: bool,
+) -> (Vec<CardHitZone>, Vec<Rect>, Option<Rect>) {
+    let mut zones = Vec::new();
+    let mut abort_buttons = Vec::new();
+    let has_selected = state.focus == Focus::Cards && dev.has_selected(state.selected);
+    let bus_col = bus_color(&dev.bus, dev.removable, pal);
+
+    if paint {
+        let border = if has_selected {
+            pal.border_strong
+        } else {
+            pal.border
+        };
+        match style {
+            StorageStyle::Schematic { .. } => {
+                fb.fill_rect(r.x, r.y, r.w, r.h, pal.surface);
+                fb.rect_outline(r.x, r.y, r.w, r.h, pal.border_px(), border);
+                fb.corner_ticks(r.x, r.y, r.w, r.h, 7, bus_col);
+            }
+            StorageStyle::Bento | StorageStyle::FullWidthRack => {
+                draw_bento_panel(fb, r, pal.surface, border, m.radius, pal.border_px());
+                let inset = m.radius.min(r.h / 2);
+                fb.fill_rect(
+                    r.x + pal.border_px(),
+                    r.y + inset,
+                    3,
+                    r.h.saturating_sub(inset * 2),
+                    bus_col,
+                );
+            }
+        }
+    }
+
+    let pad = if m.compact { 8 } else { 10 };
+    let px = r.x + pad + 3;
+    let inner_w = r.w.saturating_sub(pad * 2 + 4);
+    let header_h = m.body_h.max(m.tech_h + 6) + 6;
+    let y0 = r.y + pad.min(8);
+
+    // 1. Clean Device Header Row: [NVME0] [NVME] Model   |   Capacity (no LBA sector noise)
+    if paint {
+        let cap = format_bytes(dev.size_bytes);
+        let cap_w = renderer.measure(&cap, TextRole::Technical).width;
+        let desig_w = draw_badge_solid(
+            fb,
+            px,
+            y0,
+            &dev.designator,
+            bus_col,
+            pal.on_accent,
+            m,
+            renderer,
+        );
+        let bus_tag = if dev.removable {
+            format!("{} REM", dev.bus.to_ascii_uppercase())
+        } else {
+            dev.bus.to_ascii_uppercase()
+        };
+        let bus_w = draw_pill(
+            fb,
+            px + desig_w + 5,
+            y0,
+            &bus_tag,
+            bus_col,
+            pal,
+            m,
+            renderer,
+        );
+        let model_x = px + desig_w + bus_w + 12;
+        let model_max = (px + inner_w)
+            .saturating_sub(cap_w + 10)
+            .saturating_sub(model_x);
+        let model = dev.model.as_deref().unwrap_or("Storage device");
+        let model_col = if dev.model.is_some() {
+            pal.text
+        } else {
+            pal.muted
+        };
+        let model_y = y0 + header_h.saturating_sub(m.body_h + 4) / 2;
+        renderer.draw_truncated(
+            fb,
+            model,
+            model_x,
+            model_y,
+            model_max,
+            TextRole::Body,
+            model_col,
+        );
+        renderer.draw_top(
+            fb,
+            &cap,
+            px + inner_w.saturating_sub(cap_w),
+            y0 + header_h.saturating_sub(m.tech_h + 4) / 2,
+            TextRole::Technical,
+            pal.accent,
+        );
+    }
+
+    let body_y = y0.saturating_add(header_h).saturating_add(2);
+    let body_h =
+        r.y.saturating_add(r.h)
+            .saturating_sub(pad)
+            .saturating_sub(body_y);
+    let body = Rect {
+        x: px,
+        y: body_y,
+        w: inner_w,
+        h: body_h,
+    };
+    if body.w < 40 || body.h < 28 {
+        return (zones, abort_buttons, None);
+    }
+
+    let targets = compact_drive_targets(dev);
+    if targets.is_empty() {
+        if paint {
+            draw_bento_panel(fb, body, pal.surface_alt, pal.border, 8, pal.border_px());
+            renderer.draw_centered(
+                fb,
+                "No operating systems found on this drive",
+                body,
+                TextRole::Caption,
+                pal.muted,
+            );
+        }
+        return (zones, abort_buttons, None);
+    }
+
+    // Max 4 slots per drive in Compact mode:
+    // - 1..=4 targets -> render all directly.
+    // - >4 targets    -> render first 3 OS cards + 4th hamburger overflow card.
+    const MAX_SLOTS: usize = 4;
+    let has_overflow = targets.len() > MAX_SLOTS;
+    let direct_count = if has_overflow {
+        MAX_SLOTS - 1
+    } else {
+        targets.len()
+    };
+    let slots = if has_overflow {
+        MAX_SLOTS
+    } else {
+        direct_count
+    };
+
+    let gap: u32 = if m.compact { 6 } else { 8 };
+    let t_cols: usize = match slots {
+        1 => 1,
+        2 => {
+            if body.w >= m.scaled(340) {
+                2
+            } else {
+                1
+            }
+        }
+        3 => {
+            if body.w >= m.scaled(640) {
+                3
+            } else if body.w >= m.scaled(340) {
+                2
+            } else {
+                1
+            }
+        }
+        _ => {
+            if body.h >= m.scaled(190) && body.w >= m.scaled(340) {
+                // Tall drive canvas: prefer a balanced 2x2 grid so every OS
+                // card has generous horizontal room for titles, sizes, and badges.
+                2
+            } else if body.w >= m.scaled(860) {
+                4
+            } else if body.w >= m.scaled(340) {
+                2
+            } else {
+                1
+            }
+        }
+    };
+    let t_rows = slots.div_ceil(t_cols);
+    let row_gap_total = gap.saturating_mul(t_rows.saturating_sub(1) as u32);
+    let max_card_h = if t_rows == 1 {
+        m.scaled(136)
+    } else {
+        m.scaled(124)
+    };
+    let raw_card_h = body.h.saturating_sub(row_gap_total) / (t_rows as u32);
+    let card_h = raw_card_h.min(max_card_h).max(34).min(body.h);
+    let block_h = card_h
+        .saturating_mul(t_rows as u32)
+        .saturating_add(row_gap_total);
+    let start_y = body.y.saturating_add(body.h.saturating_sub(block_h) / 2);
+
+    let mut overflow_btn = None;
+    for slot in 0..slots {
+        let row = slot / t_cols;
+        let col = slot % t_cols;
+        let cols_in_row = if row + 1 == t_rows {
+            slots - row * t_cols
+        } else {
+            t_cols
+        };
+        let col_gap_total = gap.saturating_mul(cols_in_row.saturating_sub(1) as u32);
+        let cw = body.w.saturating_sub(col_gap_total) / (cols_in_row as u32);
+        let cx = body.x.saturating_add((col as u32) * (cw + gap));
+        let card_w = if col + 1 == cols_in_row {
+            body.x.saturating_add(body.w).saturating_sub(cx)
+        } else {
+            cw
+        };
+        let cy = start_y.saturating_add((row as u32) * (card_h + gap));
+        let card_r = Rect {
+            x: cx,
+            y: cy,
+            w: card_w,
+            h: card_h,
+        };
+
+        if slot < direct_count {
+            let item = &targets[slot];
+            let selected = state.focus == Focus::Cards && state.selected == item.target.card_index;
+            let countdown = if selected { state.countdown_ms } else { None };
+            let hovered = cursor.is_some_and(|(mx, my)| card_r.contains(mx, my));
+            if let Some(ar) = draw_compact_os_card(
+                fb, card_r, item, selected, hovered, countdown, cursor, pal, m, renderer, paint,
+            ) {
+                abort_buttons.push(ar);
+            }
+            zones.push(CardHitZone {
+                card_index: item.target.card_index,
+                segments: vec![card_r],
+                priority: true,
+            });
+        } else {
+            // 4th slot: hamburger overflow card revealing targets[3..].
+            let hidden = &targets[direct_count..];
+            let selected_hidden = if state.focus == Focus::Cards {
+                hidden
+                    .iter()
+                    .find(|it| it.target.card_index == state.selected)
+            } else {
+                None
+            };
+            let countdown = selected_hidden.and(state.countdown_ms);
+            let hovered = cursor.is_some_and(|(mx, my)| card_r.contains(mx, my));
+            if let Some(ar) = draw_compact_overflow_tile(
+                fb,
+                card_r,
+                hidden,
+                selected_hidden,
+                overflow_open,
+                hovered,
+                countdown,
+                cursor,
+                pal,
+                m,
+                renderer,
+                paint,
+            ) {
+                abort_buttons.push(ar);
+            }
+            overflow_btn = Some(card_r);
+        }
+    }
+
+    (zones, abort_buttons, overflow_btn)
+}
+
+/// Clean rectangular OS widget shared by Compact drive cards and the overflow popover.
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_os_card(
+    fb: &mut Framebuffer,
+    r: Rect,
+    item: &CompactTarget<'_>,
+    selected: bool,
+    hovered: bool,
+    countdown_ms: Option<u32>,
+    cursor: Option<(u32, u32)>,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+    paint: bool,
+) -> Option<Rect> {
+    let abort_rect = countdown_ms.map(|_| {
+        let sz = r.h.saturating_sub(14).clamp(18, 24);
+        Rect {
+            x: r.x + r.w.saturating_sub(sz + 8),
+            y: r.y + r.h.saturating_sub(sz) / 2,
+            w: sz,
+            h: sz,
+        }
+    });
+    if !paint {
+        return abort_rect;
+    }
+
+    let target = item.target;
+    let pulse = countdown_ms.map(autoboot_pulse);
+    let accent = if !target.healthy {
+        pal.danger
+    } else if target.is_recovery {
+        pal.part_rec
+    } else if target.hint == "windows" {
+        pal.part_win
+    } else {
+        pal.part_linux
+    };
+    let fill = if let Some(p) = pulse {
+        pal.surface_selected.mix(pal.accent, p * 75 / 255, 255)
+    } else if selected {
+        pal.surface_selected
+    } else if hovered {
+        pal.surface_alt.mix(accent, 18, 255)
+    } else {
+        pal.surface_alt
+    };
+    let border = if let Some(p) = pulse {
+        pal.focus.mix(pal.accent, p, 255)
+    } else if selected {
+        pal.focus
+    } else if hovered {
+        pal.border_strong
+    } else if !target.healthy {
+        pal.danger
+    } else {
+        pal.border
+    };
+    let border_w = if selected || pal.high_contrast { 2 } else { 1 };
+    draw_bento_panel(fb, r, fill, border, 8, border_w);
+
+    let pad_x = if m.compact { 8 } else { 10 };
+    let icon_sz = r.h.saturating_sub(14).clamp(20, 38);
+    let ix = r.x + pad_x;
+    let iy = r.y + r.h.saturating_sub(icon_sz) / 2;
+    draw_vector_emblem(
+        fb,
+        &target.hint,
+        &target.title,
+        ix,
+        iy,
+        icon_sz,
+        accent,
+        pal.on_accent,
+    );
+
+    // Optional right-aligned status pill (`AUTO Ns` + `[X]`, or `ENTER TO BOOT` when selected).
+    let mut right_limit = abort_rect
+        .map(|ar| ar.x.saturating_sub(6))
+        .unwrap_or_else(|| r.x + r.w.saturating_sub(pad_x));
+    let tx = ix + icon_sz + pad_x;
+
+    if let Some(ms) = countdown_ms {
+        let pill_txt = format!("AUTO {}s", ms.div_ceil(1000));
+        let pill_w = renderer.measure(&pill_txt, TextRole::Caption).width + 12;
+        if right_limit.saturating_sub(tx) >= pill_w + 90 {
+            let pill_h = m.cap_h + 6;
+            let pill_x = right_limit.saturating_sub(pill_w);
+            let pill_y = r.y + r.h.saturating_sub(pill_h) / 2;
+            let pill_col = pal.accent.mix(pal.focus, pulse.unwrap_or(0) / 3, 255);
+            draw_pill(fb, pill_x, pill_y, &pill_txt, pill_col, pal, m, renderer);
+            right_limit = pill_x.saturating_sub(8);
+        }
+    } else if selected && r.w >= m.scaled(270) {
+        let cue = if r.w >= m.scaled(360) {
+            "ENTER / CLICK: BOOT"
+        } else {
+            "SELECTED"
+        };
+        let pill_w = renderer.measure(cue, TextRole::Caption).width + 12;
+        if right_limit.saturating_sub(tx) >= pill_w + 100 {
+            let pill_h = m.cap_h + 6;
+            let pill_x = right_limit.saturating_sub(pill_w);
+            let pill_y = r.y + r.h.saturating_sub(pill_h) / 2;
+            draw_pill(fb, pill_x, pill_y, cue, pal.focus, pal, m, renderer);
+            right_limit = pill_x.saturating_sub(8);
+        }
+    } else if !target.healthy {
+        let cue = "CORRUPT";
+        let pill_w = renderer.measure(cue, TextRole::Caption).width + 12;
+        if right_limit.saturating_sub(tx) >= pill_w + 80 {
+            let pill_h = m.cap_h + 6;
+            let pill_x = right_limit.saturating_sub(pill_w);
+            let pill_y = r.y + r.h.saturating_sub(pill_h) / 2;
+            draw_pill(fb, pill_x, pill_y, cue, pal.danger, pal, m, renderer);
+            right_limit = pill_x.saturating_sub(8);
+        }
+    }
+
+    let tw = right_limit.saturating_sub(tx);
+    let title_role = if r.h >= m.head_h + m.cap_h + 16 && tw >= 110 {
+        TextRole::Heading
+    } else {
+        TextRole::Body
+    };
+    let title_h = renderer.line_metrics(title_role).line_height;
+    let title_text = if selected {
+        format!("> {}", target.title)
+    } else {
+        target.title.clone()
+    };
+    let title_col = if countdown_ms.is_some() {
+        pal.accent
+    } else if selected {
+        pal.focus
+    } else if !target.healthy {
+        pal.danger
+    } else {
+        pal.text
+    };
+
+    let sub = compact_target_subtitle(item);
+    if r.h >= title_h + m.cap_h + 10 {
+        let block_h = title_h + m.cap_h + 3;
+        let ty = r.y + r.h.saturating_sub(block_h) / 2;
+        renderer.draw_truncated(fb, &title_text, tx, ty, tw, title_role, title_col);
+        let sy = ty + title_h + 3;
+        let mut sx = tx;
+        let mut sw = tw;
+        if item.encrypted.is_some() && sw > 18 {
+            let lock_sz = m.cap_h.clamp(10, 14);
+            draw_vector_lock(
+                fb,
+                sx,
+                sy + m.cap_h.saturating_sub(lock_sz) / 2,
+                lock_sz,
+                pal.part_win,
+            );
+            sx = sx.saturating_add(lock_sz + 4);
+            sw = sw.saturating_sub(lock_sz + 4);
+        }
+        let sub_col = if !target.healthy {
+            pal.danger
+        } else {
+            pal.muted
+        };
+        renderer.draw_truncated(fb, &sub, sx, sy, sw, TextRole::Caption, sub_col);
+    } else {
+        let ty = r.y + r.h.saturating_sub(title_h) / 2;
+        renderer.draw_truncated(fb, &title_text, tx, ty, tw, title_role, title_col);
+    }
+
+    if let Some(ar) = abort_rect {
+        let hov = cursor.is_some_and(|(mx, my)| ar.contains(mx, my));
+        draw_abort_x_button(fb, ar, hov, pal);
+    }
+    abort_rect
+}
+
+/// 4th-slot hamburger overflow widget shown in Compact mode when a drive has >4 OS targets.
+#[allow(clippy::too_many_arguments)]
+fn draw_compact_overflow_tile(
+    fb: &mut Framebuffer,
+    r: Rect,
+    hidden: &[CompactTarget<'_>],
+    selected_hidden: Option<&CompactTarget<'_>>,
+    overflow_open: bool,
+    hovered: bool,
+    countdown_ms: Option<u32>,
+    cursor: Option<(u32, u32)>,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+    paint: bool,
+) -> Option<Rect> {
+    let abort_rect = countdown_ms.map(|_| {
+        let sz = r.h.saturating_sub(14).clamp(18, 24);
+        Rect {
+            x: r.x + r.w.saturating_sub(sz + 8),
+            y: r.y + r.h.saturating_sub(sz) / 2,
+            w: sz,
+            h: sz,
+        }
+    });
+    if !paint {
+        return abort_rect;
+    }
+
+    let active = overflow_open || selected_hidden.is_some();
+    let pulse = countdown_ms.map(autoboot_pulse);
+    let fill = if let Some(p) = pulse {
+        pal.surface_selected.mix(pal.accent, p * 75 / 255, 255)
+    } else if active {
+        pal.surface_selected
+    } else if hovered {
+        pal.surface_alt.mix(pal.focus, 22, 255)
+    } else {
+        pal.surface_alt
+    };
+    let border = if let Some(p) = pulse {
+        pal.focus.mix(pal.accent, p, 255)
+    } else if active {
+        pal.focus
+    } else if hovered {
+        pal.border_strong
+    } else {
+        pal.border
+    };
+    draw_bento_panel(
+        fb,
+        r,
+        fill,
+        border,
+        8,
+        if active || pal.high_contrast { 2 } else { 1 },
+    );
+
+    let pad_x = if m.compact { 8 } else { 10 };
+    let icon_sz = r.h.saturating_sub(14).clamp(20, 36);
+    let ix = r.x + pad_x;
+    let iy = r.y + r.h.saturating_sub(icon_sz) / 2;
+    let badge_bg = if active { pal.focus } else { pal.border_strong };
+    let bar_fg = if active { pal.on_accent } else { pal.text };
+    fill_rounded_rect(fb, ix, iy, icon_sz, icon_sz, (icon_sz / 5).max(3), badge_bg);
+    draw_vector_hamburger(fb, ix + 2, iy + 2, icon_sz.saturating_sub(4), bar_fg);
+
+    let tx = ix + icon_sz + pad_x;
+    let right_limit = abort_rect
+        .map(|ar| ar.x.saturating_sub(6))
+        .unwrap_or_else(|| r.x + r.w.saturating_sub(pad_x));
+    let tw = right_limit.saturating_sub(tx);
+
+    let heading = match selected_hidden {
+        Some(sel) => format!(
+            "> {} (+{})",
+            sel.target.title,
+            hidden.len().saturating_sub(1)
+        ),
+        None => format!("+{} more", hidden.len()),
+    };
+    let names: String = hidden
+        .iter()
+        .map(|it| it.target.title.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sub = if overflow_open {
+        format!("Showing: {names}")
+    } else {
+        names
+    };
+
+    let title_role = if r.h >= m.head_h + m.cap_h + 16 && tw >= 110 {
+        TextRole::Heading
+    } else {
+        TextRole::Body
+    };
+    let title_h = renderer.line_metrics(title_role).line_height;
+    let title_col = if countdown_ms.is_some() {
+        pal.accent
+    } else if active {
+        pal.focus
+    } else {
+        pal.text
+    };
+    if r.h >= title_h + m.cap_h + 10 {
+        let block_h = title_h + m.cap_h + 3;
+        let ty = r.y + r.h.saturating_sub(block_h) / 2;
+        renderer.draw_truncated(fb, &heading, tx, ty, tw, title_role, title_col);
+        renderer.draw_truncated(
+            fb,
+            &sub,
+            tx,
+            ty + title_h + 3,
+            tw,
+            TextRole::Caption,
+            pal.muted,
+        );
+    } else {
+        let ty = r.y + r.h.saturating_sub(title_h) / 2;
+        renderer.draw_truncated(fb, &heading, tx, ty, tw, title_role, title_col);
+    }
+
+    if let Some(ar) = abort_rect {
+        let hov = cursor.is_some_and(|(mx, my)| ar.contains(mx, my));
+        draw_abort_x_button(fb, ar, hov, pal);
+    }
+    abort_rect
+}
+
+/// Dim the rendered backdrop lightly behind a Compact-mode overflow popover.
+fn dim_framebuffer(fb: &mut Framebuffer, dark: bool) {
+    let scale: u32 = if dark { 140 } else { 196 };
+    for px in &mut fb.px {
+        let r = (((*px >> 16) & 0xFF) * scale) >> 8;
+        let g = (((*px >> 8) & 0xFF) * scale) >> 8;
+        let b = ((*px & 0xFF) * scale) >> 8;
+        *px = (r << 16) | (g << 8) | b;
+    }
+}
+
+/// Render the Compact-mode hamburger overflow popover showing the remaining OS
+/// targets (`targets[3..]`) for `drive_idx`, populating `hit.overflow_*`.
+#[allow(clippy::too_many_arguments)]
+fn draw_overflow_popover(
+    fb: &mut Framebuffer,
+    w: u32,
+    h: u32,
+    spec: &SystemSpec,
+    drive_idx: usize,
+    state: &MenuState,
+    pal: &Palette,
+    m: Metrics,
+    renderer: &mut TextRenderer<'_>,
+    paint: bool,
+    hit: &mut LayoutHitMap,
+) {
+    let ProbeState::Ready(devices) = &spec.storage else {
+        return;
+    };
+    let Some(dev) = devices.get(drive_idx) else {
+        return;
+    };
+    let targets = compact_drive_targets(dev);
+    if targets.len() <= 4 {
+        return;
+    }
+    let overflow = &targets[3..];
+
+    let pad = if m.compact { 12 } else { 16 };
+    let header_h = m.head_h.max(m.tech_h + 8) + 8;
+    let row_h = m.scaled(58).max(m.body_h + m.cap_h + 22);
+    let row_gap = 8u32;
+    let footer_h = m.cap_h + 10;
+
+    let max_panel_w = w.saturating_sub(32).max(240);
+    let panel_w = (w * 56 / 100)
+        .max(m.scaled(400).min(max_panel_w))
+        .min(max_panel_w);
+    let max_panel_h = h.saturating_sub(48).max(160);
+    let rows_h = (overflow.len() as u32)
+        .saturating_mul(row_h)
+        .saturating_add(row_gap.saturating_mul(overflow.len().saturating_sub(1) as u32));
+    let desired_h = pad + header_h + 10 + rows_h + 12 + footer_h + pad;
+    let panel_h = desired_h.min(max_panel_h);
+    let panel = Rect {
+        x: w.saturating_sub(panel_w) / 2,
+        y: h.saturating_sub(panel_h) / 2,
+        w: panel_w,
+        h: panel_h,
+    };
+
+    let close_sz = header_h.saturating_sub(6).clamp(20, 28);
+    let close_r = Rect {
+        x: panel.x + panel.w.saturating_sub(pad + close_sz),
+        y: panel.y + pad + header_h.saturating_sub(close_sz) / 2,
+        w: close_sz,
+        h: close_sz,
+    };
+
+    hit.overflow_panel = Some(panel);
+    hit.overflow_close = Some(close_r);
+
+    if paint {
+        dim_framebuffer(fb, state.dark);
+        fill_rounded_panel(
+            fb, panel.x, panel.y, panel.w, panel.h, 12, 2, pal.header, pal.focus,
+        );
+        let bus_col = bus_color(&dev.bus, dev.removable, pal);
+        let hx = panel.x + pad;
+        let hy = panel.y + pad;
+        let dw = draw_badge_solid(
+            fb,
+            hx,
+            hy + header_h.saturating_sub(m.tech_h + 6) / 2,
+            &dev.designator,
+            bus_col,
+            pal.on_accent,
+            m,
+            renderer,
+        );
+        let model = dev.model.as_deref().unwrap_or(&dev.device_name);
+        let title = format!("{model} · {} more OS", overflow.len());
+        let title_x = hx + dw + 10;
+        let title_w = close_r.x.saturating_sub(title_x + 8);
+        renderer.draw_truncated(
+            fb,
+            &title,
+            title_x,
+            hy + header_h.saturating_sub(m.head_h) / 2,
+            title_w,
+            TextRole::Heading,
+            pal.text,
+        );
+        let close_hov = state
+            .cursor
+            .is_some_and(|(cx, cy)| close_r.contains(cx, cy));
+        let close_bg = if close_hov {
+            pal.danger
+        } else {
+            pal.surface_alt
+        };
+        let close_fg = if close_hov { pal.on_accent } else { pal.text };
+        draw_bento_panel(fb, close_r, close_bg, pal.border_strong, 6, pal.border_px());
+        draw_vector_close_x(
+            fb,
+            close_r.x + 2,
+            close_r.y + 2,
+            close_r.w.saturating_sub(4),
+            close_fg,
+        );
+        fb.hline(
+            panel.x + pad,
+            hy + header_h + 3,
+            panel.w.saturating_sub(pad * 2),
+            pal.border,
+        );
+    }
+
+    let mut cur_y = panel.y + pad + header_h + 10;
+    let max_row_y = panel.y + panel.h.saturating_sub(pad + footer_h + 6);
+    let inner_w = panel.w.saturating_sub(pad * 2);
+    for item in overflow {
+        if cur_y.saturating_add(34) > max_row_y {
+            break;
+        }
+        let rh = row_h.min(max_row_y.saturating_sub(cur_y));
+        let row_r = Rect {
+            x: panel.x + pad,
+            y: cur_y,
+            w: inner_w,
+            h: rh,
+        };
+        let selected = state.focus == Focus::Cards && state.selected == item.target.card_index;
+        let countdown = if selected { state.countdown_ms } else { None };
+        let hovered = state.cursor.is_some_and(|(mx, my)| row_r.contains(mx, my));
+        if let Some(ar) = draw_compact_os_card(
+            fb,
+            row_r,
+            item,
+            selected,
+            hovered,
+            countdown,
+            state.cursor,
+            pal,
+            m,
+            renderer,
+            paint,
+        ) {
+            hit.abort_buttons.push(ar);
+        }
+        hit.overflow_zones.push(CardHitZone {
+            card_index: item.target.card_index,
+            segments: vec![row_r],
+            priority: true,
+        });
+        cur_y = cur_y.saturating_add(rh + row_gap);
+    }
+
+    if paint {
+        let hint = "Click to select · Click again or Enter to boot · Esc or click outside to close";
+        renderer.draw_truncated(
+            fb,
+            hint,
+            panel.x + pad,
+            panel.y + panel.h.saturating_sub(pad + m.cap_h),
+            inner_w,
+            TextRole::Caption,
+            pal.muted,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3848,6 +4935,22 @@ fn draw_provenance_bar(
 // Header, Footer & Helpers
 // ============================================================================
 
+struct HeaderHits {
+    abort: Option<Rect>,
+    detail_compact: Option<Rect>,
+    detail_detailed: Option<Rect>,
+}
+
+impl HeaderHits {
+    fn apply(self, hit: &mut LayoutHitMap) {
+        if let Some(r) = self.abort {
+            hit.abort_buttons.push(r);
+        }
+        hit.detail_compact = self.detail_compact;
+        hit.detail_detailed = self.detail_detailed;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_header(
     fb: &mut Framebuffer,
@@ -3856,11 +4959,12 @@ fn draw_header(
     mode_tag: &str,
     spec: &SystemSpec,
     state: &MenuState,
+    detail: StorageDetail,
     pal: &Palette,
     m: Metrics,
     renderer: &mut TextRenderer<'_>,
     paint: bool,
-) -> Option<Rect> {
+) -> HeaderHits {
     let tag_h = m.cap_h + 6;
     let tag_y = h.saturating_sub(tag_h) / 2;
 
@@ -3874,27 +4978,118 @@ fn draw_header(
         }
     });
 
-    if !paint {
-        return abort_rect;
-    }
-
-    fb.fill_rect(0, 0, w, h, pal.header);
-    fb.hline(0, h.saturating_sub(1), w, pal.border);
-
-    let x = m.pad;
-    let by = h.saturating_sub(m.head_h) / 2;
-    let bw = renderer.draw_top(fb, "SBM", x, by, TextRole::Heading, pal.accent);
-
-    let tag_x = x + bw + 10;
-    let tag_w = draw_pill(fb, tag_x, tag_y, mode_tag, pal.focus, pal, m, renderer);
-
-    let host_x = tag_x + tag_w + 10;
     let status = match state.countdown_ms {
         Some(ms) => format!("BOOT IN {}s", ms.div_ceil(1000)),
         None => spec
             .discovery_status
             .clone()
             .unwrap_or_else(|| "READY".into()),
+    };
+    let status_w = renderer.measure(&status, TextRole::Caption).width + 12;
+    let status_right = abort_rect
+        .map(|ar| ar.x.saturating_sub(5))
+        .unwrap_or_else(|| w.saturating_sub(m.pad));
+    let status_x = status_right.saturating_sub(status_w);
+
+    let x = m.pad;
+    let bw = renderer.measure("SBM", TextRole::Heading).width;
+    let tag_x = x + bw + 10;
+    let c_lbl = if w < 720 { "Cmp" } else { "Compact" };
+    let d_lbl = if w < 720 { "Det" } else { "Detailed" };
+    let c_w = renderer.measure(c_lbl, TextRole::Caption).width + 14;
+    let d_w = renderer.measure(d_lbl, TextRole::Caption).width + 14;
+    let toggle_w = c_w + d_w + 4;
+
+    // Pick full or abbreviated layout badge if needed so the Compact/Detailed
+    // toggle always fits cleanly without colliding with the status pill.
+    let full_tag_w = renderer.measure(mode_tag, TextRole::Caption).width + 12;
+    let eff_tag = if tag_x + full_tag_w + 8 + toggle_w + 8 <= status_x {
+        mode_tag
+    } else if mode_tag.starts_with('A') {
+        "A: BENTO"
+    } else if mode_tag.starts_with('B') {
+        "B: SCHEM"
+    } else {
+        "C: STOR"
+    };
+    let eff_tag_w = renderer.measure(eff_tag, TextRole::Caption).width + 12;
+    let toggle_x = tag_x + eff_tag_w + 8;
+    let show_toggle = toggle_x + toggle_w + 6 <= status_x;
+    let (detail_compact, detail_detailed) = if show_toggle {
+        let seg_h = tag_h.saturating_sub(4).max(12);
+        let seg_y = tag_y + 2;
+        (
+            Some(Rect {
+                x: toggle_x + 2,
+                y: seg_y,
+                w: c_w,
+                h: seg_h,
+            }),
+            Some(Rect {
+                x: toggle_x + 2 + c_w,
+                y: seg_y,
+                w: d_w,
+                h: seg_h,
+            }),
+        )
+    } else {
+        (None, None)
+    };
+
+    if !paint {
+        return HeaderHits {
+            abort: abort_rect,
+            detail_compact,
+            detail_detailed,
+        };
+    }
+
+    fb.fill_rect(0, 0, w, h, pal.header);
+    fb.hline(0, h.saturating_sub(1), w, pal.border);
+
+    let by = h.saturating_sub(m.head_h) / 2;
+    renderer.draw_top(fb, "SBM", x, by, TextRole::Heading, pal.accent);
+    draw_pill(fb, tag_x, tag_y, eff_tag, pal.focus, pal, m, renderer);
+
+    // Tactile `[ Compact | Detailed ]` segmented view toggle.
+    if let (Some(cr), Some(dr)) = (detail_compact, detail_detailed) {
+        let outer = Rect {
+            x: toggle_x,
+            y: tag_y,
+            w: toggle_w,
+            h: tag_h,
+        };
+        draw_bento_panel(
+            fb,
+            outer,
+            pal.surface_alt,
+            pal.border_strong,
+            6,
+            pal.border_px(),
+        );
+        for (seg_r, lbl, mode_val) in [
+            (cr, c_lbl, StorageDetail::Compact),
+            (dr, d_lbl, StorageDetail::Detailed),
+        ] {
+            let active = detail == mode_val;
+            let hovered = state.cursor.is_some_and(|(cx, cy)| seg_r.contains(cx, cy));
+            if active {
+                draw_rrect(fb, seg_r, 4, pal.focus);
+                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, pal.on_accent);
+            } else {
+                if hovered {
+                    draw_rrect(fb, seg_r, 4, pal.surface_selected);
+                }
+                let col = if hovered { pal.text } else { pal.muted };
+                renderer.draw_centered(fb, lbl, seg_r, TextRole::Caption, col);
+            }
+        }
+    }
+
+    let host_x = if show_toggle {
+        toggle_x + toggle_w + 10
+    } else {
+        tag_x + eff_tag_w + 10
     };
     let status_col = if let Some(ms) = state.countdown_ms {
         pal.accent.mix(pal.focus, autoboot_pulse(ms) / 3, 255)
@@ -3903,11 +5098,6 @@ fn draw_header(
     } else {
         pal.ok
     };
-    let status_w = renderer.measure(&status, TextRole::Caption).width + 12;
-    let status_right = abort_rect
-        .map(|ar| ar.x.saturating_sub(5))
-        .unwrap_or_else(|| w.saturating_sub(m.pad));
-    let status_x = status_right.saturating_sub(status_w);
 
     if status_x > host_x + 40 {
         renderer.draw_truncated(
@@ -3935,7 +5125,11 @@ fn draw_header(
         fb.fill_rect(0, h.saturating_sub(2), fill_w, 2, pal.accent);
     }
 
-    abort_rect
+    HeaderHits {
+        abort: abort_rect,
+        detail_compact,
+        detail_detailed,
+    }
 }
 
 fn draw_footer(
@@ -3975,9 +5169,9 @@ fn draw_footer(
     let start_x = r.x + r.w.saturating_sub(m.pad + total_w);
 
     let hint = if m.compact {
-        "1-4/F4 layout · F7 font · F8 HC · +/- scale · T theme · F1 help"
+        "1-4/F4 layout · V view · F7 font · F8 HC · +/- scale · T theme · F1 help"
     } else {
-        "1-4/F4 layout · F2 scen · F6 disc · F7 font · F8 HC · +/- scale · T theme · F1 help"
+        "1-4/F4 layout · V compact/detailed · F2 scen · F6 disc · F7 font · F8 HC · +/- scale · T theme · F1 help"
     };
 
     if paint {
@@ -4369,26 +5563,187 @@ mod tests {
             for scale_pct in [75u16, 100, 150, 200] {
                 let mut renderer = TextRenderer::new(font_mode, 800, UiScale::new(scale_pct));
                 for mode in LayoutMode::EXPERIMENTS {
-                    for high_contrast in [false, true] {
-                        let mut fb = Framebuffer::new(1280, 800);
-                        let map = paint_experimental_with(
-                            &mut fb,
-                            mode,
-                            &spec,
-                            &state,
-                            0,
-                            high_contrast,
-                            &mut renderer,
-                        );
-                        assert!(
-                            map.zones.len() >= 2,
-                            "{font_mode:?} scale={scale_pct} {mode:?} hc={high_contrast}"
-                        );
-                        assert_eq!(map.actions.len(), 3);
-                        assert!(!map.abort_buttons.is_empty());
+                    for detail in StorageDetail::ALL {
+                        for high_contrast in [false, true] {
+                            let mut fb = Framebuffer::new(1280, 800);
+                            let map = paint_experimental_with(
+                                &mut fb,
+                                mode,
+                                &spec,
+                                &state,
+                                ExperimentalOptions {
+                                    high_contrast,
+                                    detail,
+                                    ..ExperimentalOptions::default()
+                                },
+                                &mut renderer,
+                            );
+                            assert!(
+                                map.zones.len() >= 2,
+                                "{font_mode:?} scale={scale_pct} {mode:?} {detail:?} hc={high_contrast}"
+                            );
+                            assert_eq!(map.actions.len(), 3);
+                            assert!(!map.abort_buttons.is_empty());
+                            assert!(map.detail_compact.is_some());
+                            assert!(map.detail_detailed.is_some());
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn compact_mode_caps_at_four_slots_with_hamburger_overflow_menu() {
+        let mut spec = sample_spec(false, false);
+        let ProbeState::Ready(ref mut devs) = spec.storage else {
+            unreachable!();
+        };
+        // Add 3 more OS targets so the single drive hosts 5 total targets (>4).
+        let base_end = devs[0].regions.last().unwrap().end_lba;
+        for (i, name) in ["Arch Linux", "Fedora Linux", "Ubuntu"]
+            .into_iter()
+            .enumerate()
+        {
+            let start = base_end + (i as u64) * 20_000_000;
+            let end = start + 18_000_000;
+            devs[0].regions.push(DiskRegion {
+                start_lba: start,
+                end_lba: end,
+                size_bytes: (end - start) * 512,
+                kind: RegionKind::Partition(PartitionView {
+                    index: 3 + i,
+                    label: name.into(),
+                    kind: PartitionKind::Linux,
+                    fs: Some("ext4".into()),
+                    free_bytes: None,
+                    encrypted: None,
+                    is_recovery: false,
+                    detected_os: Some(name.into()),
+                    loader_count: 0,
+                    boot_targets: vec![BootTargetView {
+                        card_index: 2 + i,
+                        title: name.into(),
+                        family: "Linux".into(),
+                        hint: "linux".into(),
+                        loader_file: "shimx64.efi".into(),
+                        esp_part: Some(1),
+                        os_part: Some(3 + i),
+                        healthy: true,
+                        is_recovery: false,
+                        note: None,
+                    }],
+                }),
+            });
+        }
+        // Also append a data-only second drive that must be hidden in Compact mode.
+        devs.push(StorageDevice {
+            designator: "SATA0".into(),
+            device_name: "sda".into(),
+            bus: "sata".into(),
+            removable: false,
+            model: Some("Archive SSD".into()),
+            size_bytes: 1_000_000_000_000,
+            sector_size: 512,
+            total_sectors: 1_000_000_000_000 / 512,
+            regions: vec![DiskRegion {
+                start_lba: 2048,
+                end_lba: 500_000_000,
+                size_bytes: 256_000_000_000,
+                kind: RegionKind::Partition(PartitionView {
+                    index: 1,
+                    label: "Archive".into(),
+                    kind: PartitionKind::Data,
+                    fs: Some("ext4".into()),
+                    free_bytes: None,
+                    encrypted: None,
+                    is_recovery: false,
+                    detected_os: None,
+                    loader_count: 0,
+                    boot_targets: vec![],
+                }),
+            }],
+        });
+
+        let state = MenuState::new(0, true, None);
+        let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, 800, UiScale::default());
+        let mut fb = Framebuffer::new(1280, 800);
+        let map = paint_experimental_with(
+            &mut fb,
+            LayoutMode::Bento,
+            &spec,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+        // 3 direct OS widgets + 1 hamburger overflow button = 4 total slots on drive 0.
+        assert_eq!(map.zones.len(), 3, "only 3 direct OS widgets should render");
+        assert_eq!(
+            map.overflow_buttons.len(),
+            1,
+            "4th slot must be hamburger overflow"
+        );
+        let (drive_idx, btn) = map.overflow_buttons[0];
+        assert_eq!(drive_idx, 0);
+        assert_eq!(
+            map.hit_test_experimental(btn.x + btn.w / 2, btn.y + btn.h / 2),
+            ExperimentalHit::ToggleOverflow(0)
+        );
+        // Header Compact/Detailed toggle hits cleanly.
+        let cr = map.detail_compact.unwrap();
+        let dr = map.detail_detailed.unwrap();
+        assert_eq!(
+            map.hit_test_experimental(cr.x + cr.w / 2, cr.y + cr.h / 2),
+            ExperimentalHit::SetDetail(StorageDetail::Compact)
+        );
+        assert_eq!(
+            map.hit_test_experimental(dr.x + dr.w / 2, dr.y + dr.h / 2),
+            ExperimentalHit::SetDetail(StorageDetail::Detailed)
+        );
+
+        // Opening the overflow popover exposes the remaining 2 targets + close button.
+        let mut fb_open = Framebuffer::new(1280, 800);
+        let open_map = paint_experimental_with(
+            &mut fb_open,
+            LayoutMode::Bento,
+            &spec,
+            &state,
+            ExperimentalOptions {
+                overflow_drive: Some(0),
+                ..ExperimentalOptions::default()
+            },
+            &mut renderer,
+        );
+        assert!(open_map.overflow_panel.is_some());
+        assert_eq!(
+            open_map.overflow_zones.len(),
+            2,
+            "remaining 2 OSes must appear in popover"
+        );
+        let close = open_map.overflow_close.unwrap();
+        assert_eq!(
+            open_map.hit_test_experimental(close.x + close.w / 2, close.y + close.h / 2),
+            ExperimentalHit::CloseOverflow
+        );
+        let z0 = open_map.overflow_zones[0].segments[0];
+        assert_eq!(
+            open_map.hit_test_experimental(z0.x + z0.w / 2, z0.y + z0.h / 2),
+            ExperimentalHit::Card(open_map.overflow_zones[0].card_index)
+        );
+        // Detailed mode exposes all 5 targets directly without overflow popover.
+        let det_map = layout_experimental_with(
+            LayoutMode::Bento,
+            1280,
+            800,
+            &spec,
+            &state,
+            ExperimentalOptions {
+                detail: StorageDetail::Detailed,
+                ..ExperimentalOptions::default()
+            },
+            &mut renderer,
+        );
+        assert!(det_map.overflow_buttons.is_empty());
+        assert_eq!(det_map.zones.len(), 5);
     }
 }

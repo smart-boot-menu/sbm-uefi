@@ -16,7 +16,7 @@ use std::fs;
 use std::path::Path;
 
 use sbm_gfx::Framebuffer;
-pub use sbm_gfx::hardware::LayoutMode;
+pub use sbm_gfx::hardware::{ExperimentalOptions, LayoutMode, StorageDetail};
 pub use sbm_gfx::{FontMode, UiScale};
 use sbm_menu::Key;
 

@@ -762,8 +762,9 @@ fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
         }
     }
 
-    // 2. Multi-drive scrolling: 6 drives in `multi-disk` exceed viewport height in Bento/Storage,
-    //    expose a scrollbar, respond to scroll_by & scrollbar clicks, and auto-scroll on keyboard nav.
+    // 2. Multi-drive scrolling: 6 drives in `multi-disk` Detailed view exceed viewport height
+    //    across Bento/Schematic/Storage, expose a scrollbar, respond to scroll_by & scrollbar
+    //    clicks, and auto-scroll on keyboard nav.
     for mode in [
         LayoutMode::Bento,
         LayoutMode::Schematic,
@@ -771,11 +772,21 @@ fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
     ] {
         let mut s = session("multi-disk");
         s.set_layout(mode);
+        s.set_detail(sbm_preview::StorageDetail::Detailed);
         let spec = s.system_spec(W, H);
-        let map0 = layout_experimental_scrolled(mode, W, H, &spec, &s.state, s.scroll_y);
+        let mut tr = sbm_gfx::TextRenderer::new(s.font_mode, H, s.scale);
+        let map0 = sbm_gfx::hardware::layout_experimental_with(
+            mode,
+            W,
+            H,
+            &spec,
+            &s.state,
+            s.experimental_options(),
+            &mut tr,
+        );
         assert!(
             map0.max_scroll_y > 0,
-            "{mode:?} multi-disk (6 drives) should be scrollable"
+            "{mode:?} multi-disk (6 drives in Detailed) should be scrollable"
         );
         assert!(map0.scroll_up.is_some());
         assert!(map0.scroll_down.is_some());
@@ -817,12 +828,13 @@ fn autoboot_abort_x_buttons_flashing_and_multi_drive_scroll_work() {
 
 #[test]
 fn clicking_partition_selects_safely_without_arming_unintended_autoboot() {
-    use sbm_gfx::hardware::layout_experimental_scrolled;
+    use sbm_gfx::hardware::layout_experimental_with;
     use sbm_menu::Pointer;
-    use sbm_preview::LayoutMode;
+    use sbm_preview::{LayoutMode, StorageDetail};
 
     let mut s = session("lba-stress");
     s.set_layout(LayoutMode::Bento);
+    s.set_detail(StorageDetail::Detailed);
     assert!(
         s.state.countdown_ms.is_some(),
         "policy startup countdown should be active on boot"
@@ -835,7 +847,16 @@ fn clicking_partition_selects_safely_without_arming_unintended_autoboot() {
         .position(|&idx| s.entries()[idx].item.target.display_name.contains("Fedora"))
         .expect("lba-stress should have Fedora");
     let spec = s.system_spec(W, H);
-    let map = layout_experimental_scrolled(LayoutMode::Bento, W, H, &spec, &s.state, s.scroll_y);
+    let mut tr = sbm_gfx::TextRenderer::new(s.font_mode, H, s.scale);
+    let map = layout_experimental_with(
+        LayoutMode::Bento,
+        W,
+        H,
+        &spec,
+        &s.state,
+        s.experimental_options(),
+        &mut tr,
+    );
     let fedora_seg = map
         .zones
         .iter()
@@ -998,4 +1019,179 @@ fn unified_typography_high_contrast_and_scaling_work_across_layouts() {
             assert!(fb.px.iter().any(|&p| p != fb.px[0]));
         }
     }
+}
+
+#[test]
+fn compact_default_detail_toggle_and_four_slot_hamburger_overflow_work() {
+    use sbm_gfx::hardware::{ExperimentalHit, layout_experimental_with};
+    use sbm_menu::Pointer;
+    use sbm_preview::{LayoutMode, StorageDetail};
+
+    let mut s = session("lba-stress");
+    s.set_layout(LayoutMode::Bento);
+    assert_eq!(
+        s.detail,
+        StorageDetail::Compact,
+        "experimental dashboards must default to Compact mode"
+    );
+
+    let fb_compact = render(&s, W, H);
+    let mut tr = sbm_gfx::TextRenderer::new(s.font_mode, H, s.scale);
+    let spec = s.system_spec(W, H);
+    let map = layout_experimental_with(
+        LayoutMode::Bento,
+        W,
+        H,
+        &spec,
+        &s.state,
+        s.experimental_options(),
+        &mut tr,
+    );
+    // lba-stress NVME0 has 5 boot targets -> Compact shows 3 direct OS cards + 1 hamburger overflow slot.
+    assert_eq!(
+        map.zones.len(),
+        3,
+        "Compact mode caps direct OS widgets to 3 + hamburger"
+    );
+    assert_eq!(map.overflow_buttons.len(), 1);
+    let (drive_idx, hbtn) = map.overflow_buttons[0];
+    assert_eq!(drive_idx, 0);
+    let hx = hbtn.x + hbtn.w / 2;
+    let hy = hbtn.y + hbtn.h / 2;
+    assert_eq!(
+        map.hit_test_experimental(hx, hy),
+        ExperimentalHit::ToggleOverflow(0)
+    );
+
+    // 1. Clicking the 4th hamburger tile cancels countdown and opens the overflow popover.
+    let eff = s.pointer(
+        Pointer {
+            x: hx,
+            y: hy,
+            moved: true,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(eff, Effect::Redraw);
+    assert_eq!(s.overflow_drive, Some(0));
+    assert_eq!(s.state.countdown_ms, None);
+
+    let fb_overflow = render(&s, W, H);
+    assert_ne!(
+        fb_compact.px, fb_overflow.px,
+        "overflow popover must render visibly"
+    );
+    let open_map = layout_experimental_with(
+        LayoutMode::Bento,
+        W,
+        H,
+        &spec,
+        &s.state,
+        s.experimental_options(),
+        &mut tr,
+    );
+    assert!(open_map.overflow_panel.is_some());
+    assert_eq!(
+        open_map.overflow_zones.len(),
+        2,
+        "remaining 2 OSes (Fedora + SBM Core) must appear in the overflow popover"
+    );
+
+    // 2. First click on Fedora inside the overflow popover selects safely without booting or arming countdown.
+    let fedora_card = s
+        .visible()
+        .iter()
+        .position(|&idx| s.entries()[idx].item.target.display_name.contains("Fedora"))
+        .expect("Fedora card");
+    let f_seg = open_map
+        .overflow_zones
+        .iter()
+        .find(|z| z.card_index == fedora_card)
+        .expect("Fedora in overflow popover")
+        .segments[0];
+    let fx = f_seg.x + f_seg.w / 2;
+    let fy = f_seg.y + f_seg.h / 2;
+    let _ = s.pointer(
+        Pointer {
+            x: fx,
+            y: fy,
+            moved: true,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(s.screen_name(), "menu");
+    assert_eq!(s.state.selected, fedora_card);
+    assert_eq!(s.state.countdown_ms, None);
+    run_script(&mut s, &parse_script("wait:15000").unwrap(), W, H);
+    assert_eq!(s.screen_name(), "menu");
+
+    // 3. Pressing Escape dismisses the overflow popover cleanly without booting.
+    let _ = s.key(Key::Escape, W, H);
+    assert_eq!(s.overflow_drive, None);
+    assert_eq!(s.screen_name(), "menu");
+
+    // 4. Re-open overflow popover and click already-selected Fedora -> boots immediately.
+    let _ = s.pointer(
+        Pointer {
+            x: hx,
+            y: hy,
+            moved: false,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(s.overflow_drive, Some(0));
+    let _ = s.pointer(
+        Pointer {
+            x: fx,
+            y: fy,
+            moved: false,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    match &s.sim {
+        Some(SimScreen::Booted { name, .. }) => assert!(name.contains("Fedora")),
+        other => panic!("second click on selected overflow OS should boot Fedora, got {other:?}"),
+    }
+
+    // 5. Clicking header Detailed / Compact toggle and pressing `V` switch views cleanly.
+    let mut s2 = session("lba-stress");
+    s2.set_layout(LayoutMode::Bento);
+    let spec2 = s2.system_spec(W, H);
+    let m2 = layout_experimental_with(
+        LayoutMode::Bento,
+        W,
+        H,
+        &spec2,
+        &s2.state,
+        s2.experimental_options(),
+        &mut tr,
+    );
+    let dr = m2.detail_detailed.expect("header Detailed toggle");
+    let _ = s2.pointer(
+        Pointer {
+            x: dr.x + dr.w / 2,
+            y: dr.y + dr.h / 2,
+            moved: true,
+            clicked: true,
+        },
+        W,
+        H,
+    );
+    assert_eq!(s2.detail, StorageDetail::Detailed);
+    assert_eq!(s2.state.countdown_ms, None);
+    let fb_detailed = render(&s2, W, H);
+    assert_ne!(fb_compact.px, fb_detailed.px);
+
+    let _ = s2.key(Key::Char('v'), W, H);
+    assert_eq!(s2.detail, StorageDetail::Compact);
+    let _ = s2.key(Key::Char('v'), W, H);
+    assert_eq!(s2.detail, StorageDetail::Detailed);
 }

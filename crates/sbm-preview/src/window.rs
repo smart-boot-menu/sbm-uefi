@@ -13,7 +13,8 @@ use sbm_menu::{Key, Pointer};
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::session::CoreExit;
 use sbm_preview::{
-    DISPLAY_PRESETS, Effect, FontMode, LayoutMode, Machine, Session, UiScale, core, write_image,
+    DISPLAY_PRESETS, Effect, FontMode, LayoutMode, Machine, Session, StorageDetail, UiScale, core,
+    write_image,
 };
 
 use crate::Options;
@@ -91,6 +92,11 @@ pub fn run(opts: &Options) -> Result<(), String> {
     let scenarios = scenario::list(&scenario::scenario_dir())?;
     let mut current = scenario::resolve(&opts.scenario)?;
     let initial_layout = opts.layouts.first().copied().unwrap_or(LayoutMode::Classic);
+    let initial_detail = opts
+        .details
+        .first()
+        .copied()
+        .unwrap_or(StorageDetail::Compact);
     let initial_font = opts
         .fonts
         .first()
@@ -102,6 +108,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
         initial_layout,
         opts.discovery,
     );
+    session.set_detail(initial_detail);
     session.set_font_mode(initial_font);
     session.set_high_contrast(opts.high_contrast);
     session.set_scale(opts.scale);
@@ -149,6 +156,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     current = scenarios[next].clone();
                     let dark = session.state.dark;
                     let layout = session.layout;
+                    let detail = session.detail;
                     let discovery = session.discovery;
                     let font = session.font_mode;
                     let hc = session.high_contrast;
@@ -159,6 +167,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                         layout,
                         discovery,
                     );
+                    session.set_detail(detail);
                     session.set_font_mode(font);
                     session.set_high_contrast(hc);
                     session.set_scale(scale);
@@ -200,6 +209,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                 MKey::F5 => {
                     let dark = session.state.dark;
                     let layout = session.layout;
+                    let detail = session.detail;
                     let discovery = session.discovery;
                     let font = session.font_mode;
                     let hc = session.high_contrast;
@@ -210,6 +220,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                         layout,
                         discovery,
                     );
+                    session.set_detail(detail);
                     session.set_font_mode(font);
                     session.set_high_contrast(hc);
                     session.set_scale(scale);
@@ -238,6 +249,14 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     session.set_high_contrast(!session.high_contrast);
                     set_title(&mut view, &session);
                     dirty = true;
+                }
+                MKey::F9 => {
+                    if session.layout != LayoutMode::Classic {
+                        session.state.countdown_ms = None;
+                        session.toggle_detail();
+                        set_title(&mut view, &session);
+                        dirty = true;
+                    }
                 }
                 MKey::Equal | MKey::NumPadPlus => {
                     session.set_scale(session.scale.step_up());
@@ -274,7 +293,11 @@ pub fn run(opts: &Options) -> Result<(), String> {
                             session.help = false;
                             dirty = true;
                         }
+                        let prev_detail = session.detail;
                         effects.push(session.key(key, w, h));
+                        if session.detail != prev_detail {
+                            set_title(&mut view, &session);
+                        }
                     }
                 }
             }
@@ -310,6 +333,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                 effects.push(session.scroll_drag(pos.1, w, h));
             } else if moved || clicked {
                 mouse_last = Some(pos);
+                let prev_detail = session.detail;
                 effects.push(session.pointer(
                     Pointer {
                         x: pos.0,
@@ -320,6 +344,9 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     w,
                     h,
                 ));
+                if session.detail != prev_detail {
+                    set_title(&mut view, &session);
+                }
             }
         }
 
@@ -429,8 +456,13 @@ fn set_title(view: &mut View, session: &Session) {
         None => "follows window".into(),
     };
     let hc = if session.high_contrast { " HC" } else { "" };
+    let detail = if session.layout == LayoutMode::Classic {
+        String::new()
+    } else {
+        format!(" [{}]", session.detail.label())
+    };
     view.window.set_title(&format!(
-        "Smart Boot Menu - SIMULATED - {} - {} - {} - {} {}%{hc} - {size} - F1 help",
+        "Smart Boot Menu - SIMULATED - {} - {}{detail} - {} - {} {}%{hc} - {size} - F1 help",
         session.machine.scenario.id,
         session.layout.label(),
         session.discovery.mode.id(),
@@ -441,10 +473,15 @@ fn set_title(view: &mut View, session: &Session) {
 
 fn screenshot_path(session: &Session, fb: &Framebuffer, n: u32) -> PathBuf {
     let hc = if session.high_contrast { "-hc" } else { "" };
+    let detail = if session.layout == LayoutMode::Classic {
+        String::new()
+    } else {
+        format!("-{}", session.detail.id())
+    };
     sbm_preview::workspace_root()
         .join("build/sim/screenshots")
         .join(format!(
-            "{}-{}-{}-{}{hc}-{}pct-{}x{}-{n:03}.png",
+            "{}-{}{detail}-{}-{}{hc}-{}pct-{}x{}-{n:03}.png",
             session.machine.scenario.id,
             session.layout.id(),
             session.font_mode.id(),

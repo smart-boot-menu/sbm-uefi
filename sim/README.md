@@ -37,6 +37,7 @@ The production keys work as on firmware: arrows, Enter, Tab, Esc, `T` theme,
 | Key | Action |
 | --- | --- |
 | 1–4 / F4 | Switch layout (Classic, Bento, Schematic, Storage) |
+| V / F9 | Toggle Compact (OS cards, max 4/drive) vs Detailed (LBA partition map) |
 | F1 | Help overlay |
 | F2 / Shift+F2 | Next / previous scenario |
 | F3 | Cycle virtual resolutions (800x600 … 2560x1600, then follow window) |

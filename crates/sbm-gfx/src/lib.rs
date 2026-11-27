@@ -31,6 +31,6 @@ pub use typography::{
 };
 pub use vector::{
     PathOp, VectorPath, draw_vector_chevron, draw_vector_close_x, draw_vector_emblem,
-    draw_vector_lock, fill_circle, fill_ortho_polygon, fill_path, fill_rounded_panel,
-    fill_rounded_rect, ortho_outer_vertices, stroke_ortho_polygon,
+    draw_vector_hamburger, draw_vector_lock, fill_circle, fill_ortho_polygon, fill_path,
+    fill_rounded_panel, fill_rounded_rect, ortho_outer_vertices, stroke_ortho_polygon,
 };

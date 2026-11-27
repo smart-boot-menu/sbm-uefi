@@ -172,6 +172,7 @@ pub const HELP: &[&str] = &[
     "  F1 help          F2 next scenario      Shift+F2 previous",
     "  F3 display size (window / fixed presets)",
     "  F4 next layout   Shift+F4 previous     1-4 jump (Classic/A/B/C)",
+    "  V / F9 or header pill: toggle Compact (OS cards) / Detailed (LBA map)",
     "  F5 reset computer                      F6 discovery mode",
     "  F7 font mode     Shift+F7 previous     F8 high-contrast theme",
     "  + / - adjust UI scale (75%-200%)       0 reset scale to 100%",

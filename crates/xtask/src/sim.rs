@@ -15,6 +15,7 @@ Native SBM development (SIMULATED; never touches host disks or NVRAM)
   cargo xtask sim [OPTIONS]        interactive UEFI menu window; Manage Computer opens native Core
       --scenario NAME              dual-boot (default), see `cargo xtask sim --list`
       --layout NAME                classic (default), bento, schematic, storage
+      --detail MODE                compact (default: OS cards, max 4/drive), detailed (LBA map)
       --font MODE                  next-mono (default), next, bitmap
       --contrast MODE              normal (default), high
       --scale PCT                  UI scale 75..=200 (default 100)
@@ -26,6 +27,7 @@ Native SBM development (SIMULATED; never touches host disks or NVRAM)
   cargo xtask preview [OPTIONS]    headless PNG screenshots into build/preview
       --scenario NAME | --all-scenarios   --screen menu|splash|diagnostics|error|all
       --layout NAME                classic, bento, schematic, storage, experiments, all
+      --detail MODE                compact (default), detailed, both
       --font MODE                  next-mono, next, bitmap, all
       --contrast MODE              normal, high, both   --scale 75..=200
       --discovery MODE             instant, progressive, slow, sparse   --delay-ms N  --at-ms N

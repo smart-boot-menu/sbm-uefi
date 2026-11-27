@@ -6,7 +6,8 @@
 use std::cell::RefCell;
 
 use sbm_gfx::hardware::{
-    ExperimentalHit, LayoutMode, layout_experimental_with, paint_experimental_with,
+    ExperimentalHit, ExperimentalOptions, LayoutMode, StorageDetail, layout_experimental_with,
+    paint_experimental_with,
 };
 use sbm_gfx::{
     CacheStats, FontMode, Framebuffer, Input, MenuState, Outcome, Screen, TextRenderer, UiScale,
@@ -76,6 +77,8 @@ pub struct Session {
     pub sim: Option<SimScreen>,
     pub help: bool,
     pub layout: LayoutMode,
+    pub detail: StorageDetail,
+    pub overflow_drive: Option<usize>,
     pub discovery: DiscoverySchedule,
     pub font_mode: FontMode,
     pub high_contrast: bool,
@@ -118,6 +121,8 @@ impl Session {
             sim: None,
             help: false,
             layout,
+            detail: StorageDetail::default(),
+            overflow_drive: None,
             discovery,
             font_mode,
             high_contrast: false,
@@ -138,6 +143,38 @@ impl Session {
     pub fn set_layout(&mut self, layout: LayoutMode) {
         self.layout = layout;
         self.scroll_y = 0;
+        self.overflow_drive = None;
+    }
+
+    pub fn set_detail(&mut self, detail: StorageDetail) {
+        self.detail = detail;
+        self.scroll_y = 0;
+        self.overflow_drive = None;
+    }
+
+    pub fn toggle_detail(&mut self) {
+        self.set_detail(self.detail.toggle());
+    }
+
+    pub fn set_overflow_drive(&mut self, drive: Option<usize>) {
+        self.overflow_drive = if self.detail == StorageDetail::Compact {
+            drive
+        } else {
+            None
+        };
+    }
+
+    pub fn experimental_options(&self) -> ExperimentalOptions {
+        ExperimentalOptions {
+            scroll_y: self.scroll_y,
+            high_contrast: self.high_contrast,
+            detail: self.detail,
+            overflow_drive: if self.detail == StorageDetail::Compact {
+                self.overflow_drive
+            } else {
+                None
+            },
+        }
     }
 
     pub fn set_discovery(&mut self, discovery: DiscoverySchedule) {
@@ -158,6 +195,7 @@ impl Session {
         self.scale = scale;
         self.renderer.borrow_mut().set_scale(scale);
         self.scroll_y = 0;
+        self.overflow_drive = None;
     }
 
     pub fn renderer_stats(&self) -> CacheStats {
@@ -189,6 +227,7 @@ impl Session {
 
     fn experimental_hit_map(&self, width: u32, height: u32) -> sbm_gfx::hardware::LayoutHitMap {
         let spec = self.system_spec(width, height);
+        let opts = self.experimental_options();
         let mut renderer = self.renderer.borrow_mut();
         layout_experimental_with(
             self.layout,
@@ -196,8 +235,7 @@ impl Session {
             height,
             &spec,
             &self.state,
-            self.scroll_y,
-            self.high_contrast,
+            opts,
             &mut renderer,
         )
     }
@@ -286,6 +324,7 @@ impl Session {
         self.sim = None;
         self.elapsed_ms = 0;
         self.scroll_y = 0;
+        self.overflow_drive = None;
         self.core_plan = None;
         self.machine.reset();
         self.picker = Picker::start(&mut self.machine, &mut || false);
@@ -325,6 +364,17 @@ impl Session {
         if let Some(screen) = self.sim.clone() {
             return self.sim_key(screen, key);
         }
+        if self.state.screen == Screen::Menu && self.layout != LayoutMode::Classic {
+            if self.overflow_drive.is_some() && key == Key::Escape {
+                self.overflow_drive = None;
+                return Effect::Redraw;
+            }
+            if matches!(key, Key::Char('v' | 'V')) {
+                self.state.countdown_ms = None;
+                self.toggle_detail();
+                return Effect::Redraw;
+            }
+        }
         let input = menu_input(
             Some(key),
             &Pointer::default(),
@@ -358,6 +408,24 @@ impl Session {
                     ExperimentalHit::AbortAutoboot if pointer.clicked => {
                         return self.abort_autoboot();
                     }
+                    ExperimentalHit::SetDetail(detail) if pointer.clicked => {
+                        self.state.countdown_ms = None;
+                        self.set_detail(detail);
+                        return Effect::Redraw;
+                    }
+                    ExperimentalHit::ToggleOverflow(drive) if pointer.clicked => {
+                        self.state.countdown_ms = None;
+                        self.overflow_drive = if self.overflow_drive == Some(drive) {
+                            None
+                        } else {
+                            Some(drive)
+                        };
+                        return Effect::Redraw;
+                    }
+                    ExperimentalHit::CloseOverflow if pointer.clicked => {
+                        self.overflow_drive = None;
+                        return Effect::Redraw;
+                    }
                     ExperimentalHit::ScrollDelta(delta) if pointer.clicked => {
                         return self.scroll_by(delta, width, height);
                     }
@@ -370,13 +438,14 @@ impl Session {
                         None
                     }
                     ExperimentalHit::Card(index) if pointer.clicked => {
-                        // Safe two-step click on dense partition maps:
-                        // - Clicking an unselected partition selects it & cancels any policy
+                        // Safe two-step click on dense partition maps & Compact cards:
+                        // - Clicking an unselected target selects it & cancels any policy
                         //   countdown (never boots on first click and never arms a new timer).
-                        // - Clicking the already-selected partition boots it immediately.
+                        // - Clicking the already-selected target boots it immediately.
                         let already_selected = self.state.focus == sbm_gfx::Focus::Cards
                             && self.state.selected == index;
                         if already_selected {
+                            self.overflow_drive = None;
                             Some(Input::ClickCard(index))
                         } else {
                             return self.select_card(index, width, height);
@@ -388,6 +457,7 @@ impl Session {
                         None
                     }
                     ExperimentalHit::Action(index) if pointer.clicked => {
+                        self.overflow_drive = None;
                         Some(Input::ClickAction(index))
                     }
                     _ => None,
@@ -689,13 +759,13 @@ impl Session {
             ),
             None if self.state.screen == Screen::Menu && self.layout != LayoutMode::Classic => {
                 let spec = self.system_spec(fb.width, fb.height);
+                let opts = self.experimental_options();
                 let _ = paint_experimental_with(
                     fb,
                     self.layout,
                     &spec,
                     &self.state,
-                    self.scroll_y,
-                    self.high_contrast,
+                    opts,
                     &mut renderer,
                 );
             }

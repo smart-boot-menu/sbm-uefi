@@ -232,9 +232,10 @@ fn main() {
 #[cfg(feature = "experimental-layouts")]
 fn bench_experimental_layouts() {
     use sbm_gfx::hardware::{
-        BoardSpec, BootTargetView, CpuSpec, DiskRegion, DisplaySpec, FirmwareSpec, LayoutMode,
-        MemorySpec, NicSpec, PartitionKind, PartitionView, ProbeState, RegionKind,
-        SecureBootSummary, SecuritySpec, StorageDevice, SystemSpec, paint_experimental_with,
+        BoardSpec, BootTargetView, CpuSpec, DiskRegion, DisplaySpec, ExperimentalOptions,
+        FirmwareSpec, LayoutMode, MemorySpec, NicSpec, PartitionKind, PartitionView, ProbeState,
+        RegionKind, SecureBootSummary, SecuritySpec, StorageDetail, StorageDevice, SystemSpec,
+        paint_experimental_with,
     };
 
     let make_spec = |w: u32, h: u32| SystemSpec {
@@ -425,38 +426,46 @@ fn bench_experimental_layouts() {
         "Layout", "Res", "Cold (us)", "Warm (us)", "CacheEnt", "CacheBytes"
     );
     let state = MenuState::new(0, true, Some(8_000));
-    for mode in LayoutMode::EXPERIMENTS {
-        for &(w, h) in &[(1280u32, 800u32), (1920, 1080)] {
-            let spec = make_spec(w, h);
-            let mut fb = Framebuffer::new(w, h);
-            let mut cold_samples = Vec::with_capacity(9);
-            for _ in 0..9 {
+    for detail in StorageDetail::ALL {
+        println!("\n--- Storage detail: {} ---", detail.id());
+        let opts = ExperimentalOptions {
+            detail,
+            ..ExperimentalOptions::default()
+        };
+        for mode in LayoutMode::EXPERIMENTS {
+            for &(w, h) in &[(1280u32, 800u32), (1920, 1080)] {
+                let spec = make_spec(w, h);
+                let mut fb = Framebuffer::new(w, h);
+                let mut cold_samples = Vec::with_capacity(9);
+                for _ in 0..9 {
+                    let mut tr =
+                        TextRenderer::new(FontMode::AtkinsonNextMono, h, UiScale::default());
+                    let t0 = Instant::now();
+                    let _ = paint_experimental_with(&mut fb, mode, &spec, &state, opts, &mut tr);
+                    cold_samples.push(t0.elapsed().as_secs_f64() * 1e6);
+                    black_box(fb.px[0]);
+                }
                 let mut tr = TextRenderer::new(FontMode::AtkinsonNextMono, h, UiScale::default());
+                let _ = paint_experimental_with(&mut fb, mode, &spec, &state, opts, &mut tr);
                 let t0 = Instant::now();
-                let _ = paint_experimental_with(&mut fb, mode, &spec, &state, 0, false, &mut tr);
-                cold_samples.push(t0.elapsed().as_secs_f64() * 1e6);
-                black_box(fb.px[0]);
+                for i in 0..30 {
+                    let mut st = state.clone();
+                    st.selected = i % 5;
+                    let _ = paint_experimental_with(&mut fb, mode, &spec, &st, opts, &mut tr);
+                    black_box(fb.px[0]);
+                }
+                let warm_us = (t0.elapsed().as_secs_f64() * 1e6) / 30.0;
+                let st = tr.cache_stats();
+                println!(
+                    "{:<10} {:<10} {:>12.1} {:>12.1} {:>10} {:>10}",
+                    mode.id(),
+                    format!("{w}x{h}"),
+                    median_us(cold_samples),
+                    warm_us,
+                    st.entries,
+                    st.bytes
+                );
             }
-            let mut tr = TextRenderer::new(FontMode::AtkinsonNextMono, h, UiScale::default());
-            let _ = paint_experimental_with(&mut fb, mode, &spec, &state, 0, false, &mut tr);
-            let t0 = Instant::now();
-            for i in 0..30 {
-                let mut st = state.clone();
-                st.selected = i % 5;
-                let _ = paint_experimental_with(&mut fb, mode, &spec, &st, 0, false, &mut tr);
-                black_box(fb.px[0]);
-            }
-            let warm_us = (t0.elapsed().as_secs_f64() * 1e6) / 30.0;
-            let st = tr.cache_stats();
-            println!(
-                "{:<10} {:<10} {:>12.1} {:>12.1} {:>10} {:>10}",
-                mode.id(),
-                format!("{w}x{h}"),
-                median_us(cold_samples),
-                warm_us,
-                st.entries,
-                st.bytes
-            );
         }
     }
 }
