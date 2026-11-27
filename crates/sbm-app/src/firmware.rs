@@ -2,10 +2,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use sbm_menu::flow::HandoffVar;
 use sbm_types::{CpuArch, FirmwarePlatform, PlatformCapabilities, SecureBootState};
 use uefi::boot::{OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol};
 use uefi::proto::ProtocolPointer;
 use uefi::proto::console::serial::Serial;
+use uefi::proto::rng::Rng;
 use uefi::runtime::{ResetType, VariableAttributes, VariableVendor};
 use uefi::{CStr16, CString16, Handle, Status, boot, cstr16, guid, runtime, system};
 
@@ -177,16 +179,70 @@ pub fn nvram_accepts_volatile_write() -> bool {
     wrote
 }
 
-pub fn publish_selection(id: &str) {
-    let Ok(name) = CString16::try_from("LoaderEntrySelected") else {
-        return;
-    };
-    let Some(bytes) = ucs2_bytes(id) else {
-        return;
+/// Sets a Spec 03 §8 variable: boot-service + runtime access, volatile,
+/// NUL-terminated UTF-16.
+pub fn set_handoff_var(var: HandoffVar, value: &str) -> bool {
+    let (Ok(name), Some(bytes)) = (CString16::try_from(var.name()), ucs2_bytes(value)) else {
+        return false;
     };
     let attributes = VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS;
-    let _ = runtime::set_variable(&name, &sbm_vendor(), attributes, &bytes);
-    let _ = runtime::set_variable(&name, &systemd_vendor(), attributes, &bytes);
+    runtime::set_variable(&name, &handoff_vendor(var), attributes, &bytes).is_ok()
+}
+
+pub fn delete_handoff_var(var: HandoffVar) {
+    if let Ok(name) = CString16::try_from(var.name()) {
+        let _ = runtime::delete_variable(&name, &handoff_vendor(var));
+    }
+}
+
+fn handoff_vendor(var: HandoffVar) -> VariableVendor {
+    if var.systemd_vendor() {
+        systemd_vendor()
+    } else {
+        sbm_vendor()
+    }
+}
+
+/// 16 bytes from `EFI_RNG_PROTOCOL` (default algorithm), if firmware has it.
+pub fn rng_bytes() -> Option<[u8; 16]> {
+    let handle = boot::get_handle_for_protocol::<Rng>().ok()?;
+    let mut rng = open_shared::<Rng>(handle).ok()?;
+    let mut bytes = [0u8; 16];
+    rng.get_rng(None, &mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Inputs for the derived attempt ID when there is no RNG (Spec 02 §7):
+/// firmware monotonic count, RTC time and the CPU cycle counter.
+pub fn entropy() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(&monotonic_count().unwrap_or(0).to_le_bytes());
+    if let Ok(time) = runtime::get_time() {
+        bytes.extend_from_slice(&time.year().to_le_bytes());
+        bytes.extend_from_slice(&[
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second(),
+        ]);
+        bytes.extend_from_slice(&time.nanosecond().to_le_bytes());
+    }
+    bytes.extend_from_slice(&ticks().to_le_bytes());
+    bytes
+}
+
+fn monotonic_count() -> Option<u64> {
+    let st = uefi::table::system_table_raw()?;
+    // SAFETY: the system table is valid while boot services run.
+    let bs = unsafe { st.as_ref().boot_services };
+    if bs.is_null() {
+        return None;
+    }
+    let mut count = 0u64;
+    // SAFETY: `count` is a valid out-pointer for the call.
+    let status = unsafe { ((*bs).get_next_monotonic_count)(&mut count) };
+    (status == Status::SUCCESS).then_some(count)
 }
 
 pub fn firmware_ui_supported() -> bool {

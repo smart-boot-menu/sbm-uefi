@@ -42,12 +42,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "cc"
 version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02f0e023adb368345ce0ca6cdfc0f24a06554468d0e8503e14a0841de79bfa69"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -141,6 +149,17 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
+name = "fatfs"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05669f8e7e2d7badc545c513710f0eba09c2fbef683eb859fd79c46c355048e0"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "log",
+]
 
 [[package]]
 name = "fdeflate"
@@ -284,6 +303,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +323,16 @@ name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom",
+ "libc",
+]
 
 [[package]]
 name = "js-sys"
@@ -553,8 +588,8 @@ dependencies = [
  "sbm-boot",
  "sbm-gfx",
  "sbm-menu",
- "sbm-protocol",
- "sbm-types",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
  "uefi",
 ]
 
@@ -562,8 +597,8 @@ dependencies = [
 name = "sbm-boot"
 version = "0.1.0"
 dependencies = [
- "sbm-protocol",
- "sbm-types",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
  "serde",
  "serde_json",
  "sha2",
@@ -573,6 +608,9 @@ dependencies = [
 name = "sbm-fixture"
 version = "0.1.0"
 dependencies = [
+ "sbm-boot",
+ "sbm-menu",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
  "uefi",
 ]
 
@@ -581,12 +619,31 @@ name = "sbm-gfx"
 version = "0.1.0"
 
 [[package]]
+name = "sbm-media"
+version = "0.0.1"
+source = "git+https://github.com/smart-boot-menu/install?rev=b11c427147ee26f1630506efe61c10a88e93b7ce#b11c427147ee26f1630506efe61c10a88e93b7ce"
+dependencies = [
+ "crc32fast",
+ "fatfs",
+ "hex",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=57e9b3d4858ed89247cffd6cfe79039d9c1526ef)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=57e9b3d4858ed89247cffd6cfe79039d9c1526ef)",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "toml 0.8.23",
+ "zstd",
+]
+
+[[package]]
 name = "sbm-menu"
 version = "0.1.0"
 dependencies = [
  "sbm-boot",
  "sbm-gfx",
- "sbm-types",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
 ]
 
 [[package]]
@@ -598,26 +655,43 @@ dependencies = [
  "sbm-boot",
  "sbm-gfx",
  "sbm-menu",
- "sbm-protocol",
- "sbm-types",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
  "serde",
  "serde_json",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
 name = "sbm-protocol"
 version = "0.1.0"
-source = "git+https://github.com/smart-boot-menu/sbm-common?rev=28d38450954f0b93815e12f31da92370b13a7462#28d38450954f0b93815e12f31da92370b13a7462"
+source = "git+https://github.com/smart-boot-menu/sbm-common?rev=57e9b3d4858ed89247cffd6cfe79039d9c1526ef#57e9b3d4858ed89247cffd6cfe79039d9c1526ef"
 dependencies = [
- "sbm-types",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=57e9b3d4858ed89247cffd6cfe79039d9c1526ef)",
+ "serde",
+]
+
+[[package]]
+name = "sbm-protocol"
+version = "0.1.0"
+source = "git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9#abe3029c831f05d77d10cfb214a0c236903d00d9"
+dependencies = [
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
  "serde",
 ]
 
 [[package]]
 name = "sbm-types"
 version = "0.1.0"
-source = "git+https://github.com/smart-boot-menu/sbm-common?rev=28d38450954f0b93815e12f31da92370b13a7462#28d38450954f0b93815e12f31da92370b13a7462"
+source = "git+https://github.com/smart-boot-menu/sbm-common?rev=57e9b3d4858ed89247cffd6cfe79039d9c1526ef#57e9b3d4858ed89247cffd6cfe79039d9c1526ef"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "sbm-types"
+version = "0.1.0"
+source = "git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9#abe3029c831f05d77d10cfb214a0c236903d00d9"
 dependencies = [
  "serde",
 ]
@@ -696,6 +770,15 @@ dependencies = [
 
 [[package]]
 name = "serde_spanned"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "serde_spanned"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
@@ -763,6 +846,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -773,17 +876,38 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
+dependencies = [
+ "serde",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
+ "toml_edit",
+]
+
+[[package]]
+name = "toml"
 version = "0.9.12+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
 dependencies = [
  "indexmap",
  "serde_core",
- "serde_spanned",
- "toml_datetime",
+ "serde_spanned 1.1.3",
+ "toml_datetime 0.7.5+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.6.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -796,6 +920,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.22.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned 0.6.9",
+ "toml_datetime 0.6.11",
+ "toml_write",
+ "winnow 0.7.15",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.7+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -803,6 +941,12 @@ checksum = "0bb28d6e049a9766c3bd91a8326e6179f5b132dec87906bb97018ef7a2f3431a"
 dependencies = [
  "winnow 1.0.5",
 ]
+
+[[package]]
+name = "toml_write"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
@@ -1077,6 +1221,9 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"
@@ -1105,10 +1252,12 @@ checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "fatfs",
  "libc",
  "sbm-boot",
- "sbm-protocol",
- "sbm-types",
+ "sbm-media",
+ "sbm-protocol 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
+ "sbm-types 0.1.0 (git+https://github.com/smart-boot-menu/sbm-common?rev=abe3029c831f05d77d10cfb214a0c236903d00d9)",
 ]
 
 [[package]]
@@ -1122,3 +1271,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "465cb081cac3a28a84ef547702dba1fe0f4a9f22e4e57a0b675ceee028c2af80"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b09bddd92c53b91833f4df03e0ea07e02d8367cfcd15a3b9acda94fc273f793"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.2.0+zstd.1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f4089cda6dda4dc43c43dd9f8964140064fd2f752f3da46c3a483c3c175160"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

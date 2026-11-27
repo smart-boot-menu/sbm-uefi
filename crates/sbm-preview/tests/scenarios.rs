@@ -10,10 +10,10 @@ const H: u32 = 800;
 
 fn cards(session: &Session) -> Vec<String> {
     session
-        .visible
+        .visible()
         .iter()
         .map(|&index| {
-            let item = &session.entries[index].item;
+            let item = &session.entries()[index].item;
             let mark = if sbm_boot::selectable(item) { "" } else { "!" };
             format!("{}{mark}", item.target.display_name)
         })
@@ -42,16 +42,10 @@ fn every_scenario_parses_and_shows_a_menu() {
 #[test]
 fn scenarios_discover_the_expected_targets() {
     let expect: &[(&str, &[&str])] = &[
-        ("empty-uefi", &["SBM Core Removable"]),
-        ("windows-only", &["Windows", "SBM Core Removable"]),
-        (
-            "linux-only",
-            &["Fedora Linux 45", "SBM Core Slot A", "SBM Core Slot B"],
-        ),
-        (
-            "dual-boot",
-            &["Windows", "Ubuntu", "SBM Core Slot A", "SBM Core Slot B"],
-        ),
+        ("empty-uefi", &["SBM Core Slot A"]),
+        ("windows-only", &["Windows", "SBM Core Slot A"]),
+        ("linux-only", &["Fedora Linux 45", "SBM Core Slot A"]),
+        ("dual-boot", &["Windows", "Ubuntu", "SBM Core Slot A"]),
         (
             "multi-disk",
             &[
@@ -60,34 +54,17 @@ fn scenarios_discover_the_expected_targets() {
                 "systemd-boot",
                 "Debian",
                 "External drive",
-                "SBM Core Removable",
+                "SBM Core Slot A",
             ],
         ),
-        ("low-disk-space", &["Windows", "SBM Core Removable"]),
-        ("bitlocker", &["Windows", "SBM Core Removable"]),
-        (
-            "corrupt-boot",
-            &[
-                "Windows",
-                "Ubuntu",
-                "SBM Core Slot A (unverified)!",
-                "SBM Core Slot B",
-            ],
-        ),
+        ("low-disk-space", &["Windows", "SBM Core Slot A"]),
+        ("bitlocker", &["Windows", "SBM Core Slot A"]),
+        ("corrupt-boot", &["Windows", "Ubuntu", "SBM Core Slot A"]),
         (
             "secure-boot-reject",
-            &[
-                "Windows",
-                "Arch Linux",
-                "systemd-boot",
-                "SBM Core Slot A",
-                "SBM Core Slot B",
-            ],
+            &["Windows", "Arch Linux", "systemd-boot", "SBM Core Slot A"],
         ),
-        (
-            "existing-sbm",
-            &["Debian", "Fedora", "SBM Core Slot A", "SBM Core Slot B"],
-        ),
+        ("existing-sbm", &["Debian", "Fedora", "SBM Core Slot A"]),
     ];
     for (name, want) in expect {
         assert_eq!(cards(&session(name)), *want, "{name}");
@@ -144,6 +121,14 @@ fn corrupt_loader_and_slot_are_reported() {
         H,
     );
     assert_eq!(session.screen_name(), "error");
+    assert!(session.state.message.contains("SHA-256"));
+    assert!(session.machine.vars.is_empty());
+    assert!(
+        session
+            .machine
+            .read_boot(sbm_preview::machine::HANDOFF_PATH)
+            .is_none()
+    );
 }
 
 #[test]
@@ -182,14 +167,15 @@ fn core_round_trip_boots_the_requested_target_once() {
     let Effect::LaunchCore(request) = session.key(Key::Char('c'), W, H) else {
         panic!("recovery key did not launch Core");
     };
-    let dir = std::env::temp_dir().join(format!("sbm-preview-core-{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sbm-preview-core-{}", std::process::id()));
     core::materialize(&dir, &session.machine, Some(&request)).unwrap();
     assert!(dir.join("SIMULATED").is_file());
     assert!(dir.join("esp/EFI/sbm/handoff/current.json").is_file());
 
     // What sbm-sim writes when the user picks Ubuntu in Core and reboots.
     let ubuntu = session
-        .entries
+        .entries()
         .iter()
         .find(|entry| entry.item.target.display_name == "Ubuntu")
         .unwrap()
@@ -197,14 +183,34 @@ fn core_round_trip_boots_the_requested_target_once() {
         .target
         .id
         .clone();
-    let command = sbm_protocol::BootCommand::BootTarget {
-        target_id: ubuntu,
-        one_shot: true,
-        extra_cmdline_preset: None,
+    let payload: sbm_protocol::EfiHandoffPayload =
+        serde_json::from_slice(&request.handoff).unwrap();
+    let attempt_id = payload.attempt_id;
+    let success = sbm_protocol::BootSuccessReport {
+        schema_version: "1.0".into(),
+        attempt_id: attempt_id.clone(),
+        target_id: sbm_types::BootTargetId(sbm_boot::RECOVERY_TARGET_ID.into()),
+        confirmed_by: sbm_types::ComponentKind::SbmCoreUki,
+        confirmed_at_unix: 0,
     };
+    let command = sbm_protocol::LocalBootRequest {
+        schema_version: "1.0".into(),
+        request_id: sbm_protocol::format_uuid_v4([27; 16]),
+        attempt_id,
+        requested_by: sbm_types::ComponentKind::SbmCoreUki,
+        requested_at_unix: 0,
+        command: sbm_protocol::BootCommand::BootTarget {
+            target_id: ubuntu,
+            one_shot: true,
+            extra_cmdline_preset: None,
+        },
+    };
+    let path = dir.join("esp/EFI/sbm/state/boot-success.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_vec(&success).unwrap()).unwrap();
     let path = dir.join("esp/EFI/sbm/handoff/requested-command.json");
-    std::fs::write(&path, serde_json::to_vec(&command).unwrap()).unwrap();
-    core::import(&dir, &session.machine);
+    std::fs::write(path, serde_json::to_vec(&command).unwrap()).unwrap();
+    core::import(&dir, &session.machine).unwrap();
 
     let effect = session.after_core(CoreExit::Reboot);
     assert_eq!(effect, Effect::Redraw);
@@ -245,7 +251,8 @@ fn png_dimensions(path: &std::path::Path) -> (u32, u32) {
 #[test]
 fn headless_captures_theme_pairs_and_multiple_resolutions() {
     let bin = env!("CARGO_BIN_EXE_sbm-preview");
-    let dir = std::env::temp_dir().join(format!("sbm-preview-matrix-{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sbm-preview-matrix-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     let output = std::process::Command::new(bin)
@@ -322,7 +329,8 @@ fn headless_captures_theme_pairs_and_multiple_resolutions() {
 #[test]
 fn headless_sizes_all_renders_every_display_preset() {
     let bin = env!("CARGO_BIN_EXE_sbm-preview");
-    let dir = std::env::temp_dir().join(format!("sbm-preview-presets-{}", std::process::id()));
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sbm-preview-presets-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     let output = std::process::Command::new(bin)
@@ -351,4 +359,186 @@ fn headless_sizes_all_renders_every_display_preset() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn prepare_core(session: &mut Session) -> Box<sbm_preview::session::CoreRequest> {
+    let Effect::LaunchCore(request) = session.key(Key::Char('c'), W, H) else {
+        panic!("Manage Computer did not start the recovery UKI");
+    };
+    request
+}
+
+fn assert_interactive_error(session: &mut Session, message: &str) {
+    assert_eq!(session.screen_name(), "error");
+    assert!(
+        session.state.message.contains(message),
+        "{}",
+        session.state.message
+    );
+    assert_eq!(session.state.countdown_ms, None);
+    assert!(session.sim.is_none());
+    session.key(Key::Escape, W, H);
+    session.tick(30_000, W, H);
+    assert_eq!(session.screen_name(), "menu");
+    assert!(session.sim.is_none());
+}
+
+#[test]
+fn unknown_and_legacy_requests_suppress_an_immediate_default() {
+    use sbm_preview::machine::{POLICY_PATH, REQUEST_PATH};
+    use sbm_types::BootTargetId;
+
+    for legacy in [false, true] {
+        let mut session = session("dual-boot");
+        let request = prepare_core(&mut session);
+        let policy =
+            sbm_boot::decode_policy(&session.machine.read_boot(POLICY_PATH).unwrap()).unwrap();
+        let immediate = sbm_protocol::BootPolicy {
+            timeout_seconds: 0,
+            ..policy
+        };
+        assert!(
+            session
+                .machine
+                .write_boot(POLICY_PATH, &sbm_boot::encode_policy(&immediate).unwrap())
+        );
+        let target = BootTargetId("os:11111111-1111-1111-1111-111111111111".into());
+        core::simulated_core_reports(&session.machine, &request, Some(&target)).unwrap();
+        if legacy {
+            let bare = sbm_protocol::BootCommand::BootTarget {
+                target_id: target,
+                one_shot: true,
+                extra_cmdline_preset: None,
+            };
+            assert!(
+                session
+                    .machine
+                    .write_boot(REQUEST_PATH, &serde_json::to_vec(&bare).unwrap())
+            );
+        }
+        session.after_core(CoreExit::Reboot);
+        assert_interactive_error(&mut session, if legacy { "format" } else { "present" });
+        assert!(session.machine.read_boot(REQUEST_PATH).is_none());
+    }
+}
+
+#[test]
+fn stale_success_and_request_cannot_use_a_later_attempt() {
+    use sbm_preview::machine::{ATTEMPT_PATH, REQUEST_PATH, SUCCESS_PATH};
+
+    let mut session = session("dual-boot");
+    let first = prepare_core(&mut session);
+    let target = session.machine.target_for_preset("ubuntu").unwrap();
+    core::simulated_core_reports(&session.machine, &first, Some(&target)).unwrap();
+    let saved = [REQUEST_PATH, SUCCESS_PATH].map(|path| session.machine.read_boot(path).unwrap());
+    session.after_core(CoreExit::Reboot);
+    session.key(Key::Char('x'), W, H);
+
+    let second = prepare_core(&mut session);
+    assert_ne!(
+        first.var("SbmBootAttemptId"),
+        second.var("SbmBootAttemptId")
+    );
+    for (path, bytes) in [REQUEST_PATH, SUCCESS_PATH].into_iter().zip(saved) {
+        assert!(session.machine.write_boot(path, &bytes));
+    }
+    session.after_core(CoreExit::Reboot);
+    assert_interactive_error(&mut session, "current SBM Core session");
+    let attempt =
+        sbm_boot::decode_attempt(&session.machine.read_boot(ATTEMPT_PATH).unwrap()).unwrap();
+    assert_eq!(attempt.status, sbm_protocol::BootAttemptStatus::Started);
+    assert_eq!(
+        Some(attempt.attempt_id.as_str()),
+        second.var("SbmBootAttemptId")
+    );
+    assert!(session.machine.read_boot(SUCCESS_PATH).is_none());
+}
+
+#[test]
+fn multiple_loaders_stay_distinct_and_missing_disk_is_reported() {
+    let mut session = session("multi-disk");
+    let request = prepare_core(&mut session);
+    let payload = sbm_boot::decode_handoff(&request.handoff).unwrap();
+    let arch = payload
+        .discovered_targets
+        .iter()
+        .find(|target| target.display_name == "Arch Linux")
+        .unwrap();
+    let systemd = payload
+        .discovered_targets
+        .iter()
+        .find(|target| target.display_name == "systemd-boot")
+        .unwrap();
+    assert_ne!(arch.id, systemd.id);
+    assert_eq!(arch.partition_guid, systemd.partition_guid);
+    core::simulated_core_reports(&session.machine, &request, Some(&arch.id)).unwrap();
+    // Unplug the disk containing both loaders between selecting in Core and rebooting.
+    session.machine.esps.retain(|esp| {
+        sbm_boot::Volume::partition_guid(&esp.volume) != arch.partition_guid.as_deref().unwrap()
+    });
+    session.after_core(CoreExit::Reboot);
+    assert_interactive_error(&mut session, "present");
+}
+
+#[test]
+fn read_only_esp_blocks_the_recovery_handoff_and_unconsumed_requests() {
+    use sbm_preview::machine::{HANDOFF_PATH, REQUEST_PATH};
+
+    let mut session = session("dual-boot");
+    session
+        .machine
+        .boot_esp()
+        .unwrap()
+        .volume
+        .set_read_only(true);
+    assert_eq!(session.key(Key::Char('c'), W, H), Effect::Redraw);
+    assert_interactive_error(&mut session, "could not be saved");
+    assert!(session.machine.vars.is_empty());
+    assert!(session.machine.read_boot(HANDOFF_PATH).is_none());
+
+    session
+        .machine
+        .boot_esp()
+        .unwrap()
+        .volume
+        .set_read_only(false);
+    let request = prepare_core(&mut session);
+    let target = session.machine.target_for_preset("ubuntu").unwrap();
+    core::simulated_core_reports(&session.machine, &request, Some(&target)).unwrap();
+    session
+        .machine
+        .boot_esp()
+        .unwrap()
+        .volume
+        .set_read_only(true);
+    session.after_core(CoreExit::Reboot);
+    assert_interactive_error(&mut session, "removed");
+    assert!(session.machine.read_boot(REQUEST_PATH).is_some());
+}
+
+#[test]
+fn unknown_policy_one_shot_suppresses_the_default() {
+    let mut scenario = Scenario::load(&scenario::resolve("dual-boot").unwrap()).unwrap();
+    scenario.policy.timeout_seconds = Some(0);
+    scenario.policy.one_shot_id = Some("efi:missing:000000000000".into());
+    let mut session = Session::power_on(sbm_preview::machine::Machine::new(scenario), true);
+    assert_interactive_error(&mut session, "present");
+}
+
+#[test]
+fn local_key_overrides_a_valid_core_request() {
+    let mut session = session("dual-boot");
+    let request = prepare_core(&mut session);
+    let target = session.machine.target_for_preset("ubuntu").unwrap();
+    core::simulated_core_reports(&session.machine, &request, Some(&target)).unwrap();
+    session.machine.reset();
+    let picker = sbm_menu::flow::Picker::start(&mut session.machine, &mut || true);
+    assert_eq!(picker.resolved.reason, "local-override");
+    assert!(picker.initial_state(true).countdown_ms.is_none());
+    assert!(
+        session
+            .machine
+            .read_boot(sbm_preview::machine::REQUEST_PATH)
+            .is_none()
+    );
 }

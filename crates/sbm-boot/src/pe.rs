@@ -20,6 +20,38 @@ pub fn pe_machine(bytes: &[u8]) -> Option<u16> {
     ))
 }
 
+/// Check the bounded COFF, optional and section headers of an EFI application.
+pub fn efi_application_machine(bytes: &[u8], file_size: u64) -> Option<u16> {
+    let machine = pe_machine(bytes)?;
+    let pe = u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    let coff = bytes.get(pe.checked_add(4)?..pe.checked_add(24)?)?;
+    let sections = u16::from_le_bytes(coff[2..4].try_into().ok()?) as usize;
+    let optional_size = u16::from_le_bytes(coff[16..18].try_into().ok()?) as usize;
+    let characteristics = u16::from_le_bytes(coff[18..20].try_into().ok()?);
+    if !(1..=96).contains(&sections) || optional_size < 70 || characteristics & 2 == 0 {
+        return None;
+    }
+    let optional_start = pe.checked_add(24)?;
+    let section_start = optional_start.checked_add(optional_size)?;
+    let optional = bytes.get(optional_start..section_start)?;
+    if optional[0..2] != [0x0b, 0x02] || optional[68..70] != [10, 0] {
+        return None;
+    }
+    let section_end = section_start.checked_add(sections * 40)?;
+    let size_of_headers = u32::from_le_bytes(optional[60..64].try_into().ok()?) as u64;
+    if section_end as u64 > size_of_headers || size_of_headers > file_size {
+        return None;
+    }
+    for section in bytes.get(section_start..section_end)?.as_chunks::<40>().0 {
+        let size = u32::from_le_bytes(section[16..20].try_into().ok()?) as u64;
+        let offset = u32::from_le_bytes(section[20..24].try_into().ok()?) as u64;
+        if size != 0 && (offset < size_of_headers || offset + size > file_size) {
+            return None;
+        }
+    }
+    Some(machine)
+}
+
 /// File offset and raw size of a PE section, from the headers in `bytes`.
 pub fn pe_section_span(bytes: &[u8], name: &str) -> Option<(u64, u64)> {
     if bytes.len() < 0x40 || bytes[0] != b'M' || bytes[1] != b'Z' || name.len() > 8 {
@@ -79,7 +111,7 @@ pub fn machine_matches(machine: u16, arch: CpuArch) -> bool {
 
 #[cfg(test)]
 pub fn fake_pe(machine: u16) -> alloc::vec::Vec<u8> {
-    let mut bytes = alloc::vec![0u8; 0x80];
+    let mut bytes = alloc::vec![0u8; 0x200];
     bytes[0] = b'M';
     bytes[1] = b'Z';
     bytes[0x3c] = 0x40;
@@ -87,6 +119,12 @@ pub fn fake_pe(machine: u16) -> alloc::vec::Vec<u8> {
     bytes[0x41] = b'E';
     bytes[0x44] = machine as u8;
     bytes[0x45] = (machine >> 8) as u8;
+    bytes[0x46] = 1;
+    bytes[0x54] = 0xf0;
+    bytes[0x56] = 2;
+    bytes[0x58..0x5a].copy_from_slice(&[0x0b, 0x02]);
+    bytes[0x94..0x98].copy_from_slice(&0x200u32.to_le_bytes());
+    bytes[0x9c] = 10;
     bytes
 }
 

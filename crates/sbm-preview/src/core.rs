@@ -2,17 +2,20 @@
 //!
 //! The simulated computer is written to a session directory in the formats
 //! `sbm-cored` reads on Linux (`lsblk --json`, `ip -j addr`, `/proc/meminfo`,
-//! and the EFI handoff file on the ESP). `sbm-sim` serves those to the real
-//! `sbm-ui` and records any power request it receives.
+//! the EFI handoff file on the ESP, and the volatile handoff variables in
+//! efivarfs layout). `sbm-sim` serves those to the real `sbm-ui` and records
+//! any power request it receives.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sbm_protocol::{BootCommand, BootSuccessReport, LocalBootRequest, format_uuid_v4};
+use sbm_types::{BootTargetId, ComponentKind, SCHEMA_VERSION_V1};
 use serde_json::{Value, json};
 
 use crate::machine::{
-    COMMAND_PATH, HANDOFF_PATH, Machine, SUCCESS_PATH, disk_guid, part_guid, partition_device,
+    HANDOFF_PATH, Machine, REQUEST_PATH, SUCCESS_PATH, disk_guid, part_guid, partition_device,
 };
 use crate::scenario::{PartKind, Partition, Scenario};
 use crate::session::{CoreExit, CoreRequest};
@@ -76,8 +79,9 @@ pub fn materialize(
         .unwrap_or_default(),
     )?;
     if let Some(request) = request {
-        write("cmdline", request.cmdline.as_bytes())?;
-        write("loader-entry-selected", request.selected_target.as_bytes())?;
+        for (name, vendor, value) in &request.vars {
+            write(&format!("efivars/{name}-{vendor}"), &efivar(value))?;
+        }
         if let Some(device) = &request.backing_device {
             write("root-source", device.as_bytes())?;
         }
@@ -88,13 +92,84 @@ pub fn materialize(
     Ok(())
 }
 
+/// A volatile `BS|RT` variable as Linux efivarfs presents it: a 4-byte
+/// little-endian attribute word, then the UTF-16LE value with its NUL.
+pub fn efivar(value: &str) -> Vec<u8> {
+    const BOOTSERVICE_RUNTIME: u32 = 0x2 | 0x4;
+    let mut bytes = BOOTSERVICE_RUNTIME.to_le_bytes().to_vec();
+    for unit in value.encode_utf16().chain([0]) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
 /// Copy files Core wrote to its view of the ESP back onto the boot volume.
-pub fn import(dir: &Path, machine: &Machine) {
-    for path in [COMMAND_PATH, SUCCESS_PATH] {
-        if let Ok(bytes) = fs::read(dir.join(esp_rel(path))) {
-            machine.write_boot(path, &bytes);
+pub fn import(dir: &Path, machine: &Machine) -> Result<(), String> {
+    for path in [SUCCESS_PATH, REQUEST_PATH] {
+        let source = dir.join(esp_rel(path));
+        match fs::read(&source) {
+            Ok(bytes) => {
+                if !machine.write_boot(path, &bytes) {
+                    return Err(format!("could not save {path} on the simulated boot ESP"));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("read {}: {err}", source.display())),
         }
     }
+    Ok(())
+}
+
+/// SIMULATED stand-in for SBM Core, for headless scripts and tests that do
+/// not run `sbm-sim`: the success report Core writes once its UI is ready
+/// and, when `boot` is given, the one-shot request the user made in Core.
+/// Both are bound to the attempt ID the picker published.
+pub fn simulated_core_reports(
+    machine: &Machine,
+    request: &CoreRequest,
+    boot: Option<&BootTargetId>,
+) -> Result<(), String> {
+    let attempt_id = request
+        .var("SbmBootAttemptId")
+        .ok_or("the picker published no SbmBootAttemptId")?
+        .to_string();
+    let now =
+        sbm_menu::flow::Platform::now_unix(machine).ok_or("the simulated clock is unavailable")?;
+    let success = BootSuccessReport {
+        schema_version: SCHEMA_VERSION_V1.into(),
+        attempt_id: attempt_id.clone(),
+        target_id: BootTargetId(sbm_boot::RECOVERY_TARGET_ID.into()),
+        confirmed_by: ComponentKind::SbmCoreUki,
+        confirmed_at_unix: now,
+    };
+    let bytes = sbm_boot::encode_success(&success).map_err(|err| format!("{err:?}"))?;
+    if !machine.write_boot(SUCCESS_PATH, &bytes) {
+        return Err("the boot ESP is not writable".into());
+    }
+    if let Some(target) = boot {
+        let mut seed = [0u8; 16];
+        for (slot, byte) in seed.iter_mut().zip(attempt_id.bytes().rev()) {
+            *slot = byte ^ 0x5a;
+        }
+        let boot_request = LocalBootRequest {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            request_id: format_uuid_v4(seed),
+            attempt_id,
+            requested_by: ComponentKind::SbmCoreUki,
+            requested_at_unix: now,
+            command: BootCommand::BootTarget {
+                target_id: target.clone(),
+                one_shot: true,
+                extra_cmdline_preset: None,
+            },
+        };
+        let bytes =
+            sbm_boot::encode_boot_request(&boot_request).map_err(|err| format!("{err:?}"))?;
+        if !machine.write_boot(REQUEST_PATH, &bytes) {
+            return Err("the boot ESP is not writable".into());
+        }
+    }
+    Ok(())
 }
 
 fn esp_rel(path: &str) -> String {

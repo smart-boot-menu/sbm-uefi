@@ -10,4 +10,5 @@ repository.workspace = true
 [dependencies]
 sbm-boot = { path = "../sbm-boot" }
 sbm-gfx = { path = "../sbm-gfx" }
+sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }

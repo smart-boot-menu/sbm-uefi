@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+pub mod flow;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -62,6 +64,8 @@ pub struct DiagFacts<'a> {
     pub first_frame_us: u64,
     pub discovery_us: u64,
     pub menu_us: Option<u64>,
+    /// What was checked about the recovery image, once known.
+    pub integrity: Option<&'a str>,
 }
 
 pub fn sort_entries(entries: &mut [MenuEntry]) {
@@ -132,10 +136,11 @@ pub fn cards(entries: &[MenuEntry], visible_index: &[usize]) -> Vec<CardView> {
                 title: target.display_name.clone(),
                 subtitle: alloc::format!(
                     "{}  {file}",
-                    if target.removable_media {
-                        "Removable"
-                    } else {
-                        family_name(target.os_family)
+                    match entry.item.integrity {
+                        sbm_boot::Integrity::Eligible => "Integrity pending",
+                        sbm_boot::Integrity::Failed => "Unavailable",
+                        _ if target.removable_media => "Removable",
+                        _ => family_name(target.os_family),
                     }
                 ),
                 hint: target
@@ -245,6 +250,9 @@ pub fn diag_lines(entries: &[MenuEntry], facts: &DiagFacts<'_>) -> Vec<String> {
     if let Some(menu_us) = facts.menu_us {
         lines.push(alloc::format!("menu {menu_us} us"));
     }
+    if let Some(integrity) = facts.integrity {
+        lines.push(String::from(integrity));
+    }
     lines.push(String::from("network policy is local-only in this build"));
     lines
 }
@@ -259,8 +267,11 @@ pub fn boot_failure(name: &str, path: &str, failure: StartFailure, status: &str)
     alloc::format!("{name} ({path}) did not start. {hint} Status {status}.")
 }
 
-pub fn unhealthy_message(name: &str) -> String {
-    alloc::format!("{name} did not pass the local health checks")
+pub fn unhealthy_message(name: &str, problem: Option<&str>) -> String {
+    match problem {
+        Some(problem) => alloc::format!("{name} cannot be started: {problem}."),
+        None => alloc::format!("{name} did not pass the local health checks"),
+    }
 }
 
 pub const NO_RECOVERY_MESSAGE: &str = "No healthy recovery system was found";
@@ -322,6 +333,9 @@ mod tests {
                 healthy: true,
                 preferred: false,
                 rank: 1,
+                integrity: sbm_boot::Integrity::Discovered,
+                expected_sha256: None,
+                problem: None,
             },
         }
     }

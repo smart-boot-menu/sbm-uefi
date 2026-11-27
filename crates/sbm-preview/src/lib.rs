@@ -74,12 +74,17 @@ pub fn parse_script(text: &str) -> Result<Vec<ScriptStep>, String> {
         .collect()
 }
 
-/// Run a script headlessly. Requests to start SBM Core are answered as if
-/// Core asked to reboot, so scripts stay deterministic without a GUI.
+/// Run a script headlessly. Requests to start SBM Core are answered by a
+/// SIMULATED Core that reports success and asks to reboot, so scripts stay
+/// deterministic without a GUI.
 pub fn run_script(session: &mut Session, steps: &[ScriptStep], width: u32, height: u32) {
     let handle = |session: &mut Session, effect: Effect| {
         let mut effect = effect;
-        while let Effect::LaunchCore(_) = effect {
+        while let Effect::LaunchCore(request) = effect {
+            if let Err(message) = core::simulated_core_reports(&session.machine, &request, None) {
+                session.core_unavailable(&message);
+                return;
+            }
             effect = session.after_core(session::CoreExit::Reboot);
         }
     };

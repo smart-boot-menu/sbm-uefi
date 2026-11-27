@@ -3,6 +3,12 @@
 
 extern crate alloc;
 
+use alloc::string::String;
+use alloc::vec;
+use sbm_boot::{decode_attempt, decode_handoff, hex_encode, sha256};
+use sbm_menu::flow::{ATTEMPT_PATH, HANDOFF_PATH, HANDOFF_VERSION, HandoffVar};
+use sbm_protocol::{BootAttemptStatus, is_uuid_v4};
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
@@ -12,12 +18,13 @@ use uefi::proto::console::serial::Serial;
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::file::{File, FileAttribute, FileMode, FileType};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::{Handle, Status, boot, entry, helpers, system};
+use uefi::runtime::{self, VariableAttributes, VariableVendor};
+use uefi::{Handle, Status, boot, entry, guid, helpers, system};
 
 static SERIAL_SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Unsigned `.cmdline` section, the same name systemd-stub reads.
-/// The menu repeats it and appends handoff tokens. This fixture does not.
+/// Recovery uses the embedded value and receives no external options.
 #[used]
 #[unsafe(link_section = ".cmdline")]
 static EMBEDDED_CMDLINE: [u8; 13] = *b"console=tty0\0";
@@ -27,7 +34,9 @@ fn main() -> Status {
     let _ = helpers::init();
     let _ = boot::set_watchdog_timer(0, 0, None);
     emit(b"SBM_MARK fixture_started\n");
-    let _ = record_chainload();
+    if let Err(error) = record_chainload() {
+        return error.status();
+    }
     boot::stall(Duration::from_millis(200));
     Status::SUCCESS
 }
@@ -37,6 +46,11 @@ fn record_chainload() -> uefi::Result<()> {
     let device = image.device().ok_or(Status::UNSUPPORTED)?;
     let mut fs = open::<SimpleFileSystem>(device)?;
     let mut root = fs.open_volume()?;
+    if handoff_var(HandoffVar::LoaderEntrySelected)
+        .is_some_and(|id| id == sbm_boot::RECOVERY_TARGET_ID)
+    {
+        validate_recovery(&image, &mut root).ok_or(Status::COMPROMISED_DATA)?;
+    }
     let sbm = cstr16(r"\EFI\sbm")?;
     let test = cstr16(r"\EFI\sbm\test")?;
     ensure_dir(&mut root, &sbm)?;
@@ -54,6 +68,74 @@ fn record_chainload() -> uefi::Result<()> {
     file.write(b"chainload-ok\n")
         .map_err(|_| Status::DEVICE_ERROR)?;
     Ok(())
+}
+
+fn validate_recovery(
+    image: &LoadedImage,
+    root: &mut uefi::proto::media::file::Directory,
+) -> Option<()> {
+    if image
+        .load_options_as_bytes()
+        .is_some_and(|options| !options.is_empty())
+    {
+        return None;
+    }
+    let partuuid = handoff_var(HandoffVar::LoaderDevicePartUuid)?;
+    let attempt_id = handoff_var(HandoffVar::SbmBootAttemptId)?;
+    let digest = handoff_var(HandoffVar::SbmHandoffSha256)?;
+    let version = handoff_var(HandoffVar::SbmHandoffVersion)?;
+    let handoff_bytes = read_record(root, HANDOFF_PATH)?;
+    let attempt = decode_attempt(&read_record(root, ATTEMPT_PATH)?).ok()?;
+    let handoff = decode_handoff(&handoff_bytes).ok()?;
+    if version != HANDOFF_VERSION
+        || !is_uuid_v4(&attempt_id)
+        || attempt_id != handoff.attempt_id
+        || attempt_id != attempt.attempt_id
+        || attempt.target_id.as_str() != sbm_boot::RECOVERY_TARGET_ID
+        || attempt.status != BootAttemptStatus::Started
+        || digest != hex_encode(&sha256(&handoff_bytes))
+    {
+        return None;
+    }
+    emit(alloc::format!("SBM_MARK fixture_recovery_valid esp={partuuid}\n").as_bytes());
+    Some(())
+}
+
+fn handoff_var(var: HandoffVar) -> Option<String> {
+    let name = CString16::try_from(var.name()).ok()?;
+    let vendor = if var.systemd_vendor() {
+        VariableVendor(guid!("4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"))
+    } else {
+        VariableVendor(guid!("d8f4a21c-7b6e-4c91-9e32-8a5c1f0e3b40"))
+    };
+    let (bytes, attrs) = runtime::get_variable_boxed(&name, &vendor).ok()?;
+    if attrs != VariableAttributes::BOOTSERVICE_ACCESS | VariableAttributes::RUNTIME_ACCESS {
+        return None;
+    }
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    let (end, text) = pairs.split_last()?;
+    if !remainder.is_empty() || *end != [0, 0] {
+        return None;
+    }
+    let units: alloc::vec::Vec<_> = text.iter().copied().map(u16::from_le_bytes).collect();
+    String::from_utf16(&units).ok()
+}
+
+fn read_record(
+    root: &mut uefi::proto::media::file::Directory,
+    path: &str,
+) -> Option<alloc::vec::Vec<u8>> {
+    let path = CString16::try_from(path).ok()?;
+    let handle = root
+        .open(&path, FileMode::Read, FileAttribute::empty())
+        .ok()?;
+    let FileType::Regular(mut file) = handle.into_type().ok()? else {
+        return None;
+    };
+    let mut bytes = vec![0; 65536];
+    let count = file.read(&mut bytes).ok()?;
+    bytes.truncate(count);
+    Some(bytes)
 }
 
 fn ensure_dir(

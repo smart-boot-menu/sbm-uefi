@@ -373,6 +373,18 @@ fn run_attempt(
     if count_prefix(log, "chainload_returned") < 2 {
         return Err(format!("expected two chainload returns\n{log}"));
     }
+    let fixture_valid = format!(
+        "fixture_recovery_valid esp={}",
+        crate::esp::fixture_partuuid()
+    );
+    if count_exact(log, &fixture_valid) != 1
+        || count_exact(log, "chainload method=device-path") != 2
+        || !log.contains("verify_done")
+    {
+        return Err(format!(
+            "fixture did not verify the exact GPT ESP handoff and launch options\n{log}"
+        ));
+    }
     let handoff = crate::esp::read_fat_file(&image, "EFI/sbm/handoff/current.json");
     let attempt_file = crate::esp::read_fat_file(&image, "EFI/sbm/state/last_attempt.json");
     let marker = crate::esp::read_fat_file(&image, "EFI/sbm/test/chainload-ok.txt");
@@ -396,7 +408,7 @@ fn run_attempt(
         &format!("screenshots/{}-menu-light.png", guest.name),
     )?;
     let summary = format!(
-        "arch={}\nattempt={}\nefi_bytes={}\nfirst_frame_us={}\ndiscovery_us={}\nmenu_ready_us={}\nbackbuffer={}\nfixture_started={}\nchainload_returned={}\nhandoff={}\nattempt_file={}\nchainload_ok={}\n",
+        "arch={}\nattempt={}\nefi_bytes={}\nfirst_frame_us={}\ndiscovery_us={}\nmenu_ready_us={}\nverify_us={}\nbackbuffer={}\nfixture_started={}\nchainload_returned={}\nhandoff={}\nattempt_file={}\nchainload_ok={}\n",
         guest.name,
         attempt.label,
         fs::metadata(
@@ -409,6 +421,7 @@ fn run_attempt(
         metric(log, "first_frame").ok_or_else(|| format!("missing first_frame\n{log}"))?,
         metric(log, "discovery_done").ok_or_else(|| format!("missing discovery_done\n{log}"))?,
         metric(log, "menu_ready").ok_or_else(|| format!("missing menu_ready\n{log}"))?,
+        metric(log, "verify_done").ok_or_else(|| format!("missing verify_done\n{log}"))?,
         backbuffer(log),
         count_exact(log, "fixture_started"),
         count_prefix(log, "chainload_returned"),

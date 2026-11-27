@@ -2,7 +2,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use sbm_boot::{DirEntry, FileMeta, VolError, Volume, normalize};
+use sbm_boot::{DirEntry, FileMeta, Streamed, VolError, Volume, normalize};
+use uefi::data_types::Align;
 use uefi::proto::device_path::build::{self, DevicePathBuilder};
 use uefi::proto::device_path::media::{self, PartitionSignature};
 use uefi::proto::device_path::{DevicePath, DeviceSubType, DeviceType};
@@ -10,7 +11,7 @@ use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::block::BlockIO;
 use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode, FileType};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::{CString16, Handle, boot};
+use uefi::{CString16, Handle, Status, boot};
 
 use crate::firmware::{self, c16_to_string, open_shared};
 
@@ -27,6 +28,8 @@ pub struct HostImage {
 
 pub struct UefiVolume {
     fs: RefCell<uefi::boot::ScopedProtocol<SimpleFileSystem>>,
+    /// Root directory handle opened once and reused for every operation.
+    root: RefCell<Option<Directory>>,
     guid: String,
     removable: bool,
     label: String,
@@ -36,6 +39,12 @@ pub struct UefiVolume {
 impl UefiVolume {
     pub fn device_path(&self) -> &[u8] {
         &self.device_path
+    }
+
+    /// Drop the cached root handle, e.g. after a started image returned and
+    /// may have changed the volume.
+    pub fn forget_root(&self) {
+        self.root.borrow_mut().take();
     }
 
     fn open(handle: Handle) -> Result<Self, ()> {
@@ -50,6 +59,7 @@ impl UefiVolume {
         let label = if inspected.removable { "USB" } else { "ESP" };
         Ok(Self {
             fs: RefCell::new(fs),
+            root: RefCell::new(None),
             guid: inspected.guid,
             removable: inspected.removable,
             label: String::from(label),
@@ -61,9 +71,15 @@ impl UefiVolume {
         &self,
         body: impl FnOnce(&mut Directory) -> Result<T, VolError>,
     ) -> Result<T, VolError> {
-        let mut proto = self.fs.borrow_mut();
-        let mut root = proto.open_volume().map_err(|_| VolError::Io)?;
-        body(&mut root)
+        let mut root = self.root.borrow_mut();
+        if root.is_none() {
+            let mut proto = self.fs.borrow_mut();
+            *root = Some(proto.open_volume().map_err(|_| VolError::Io)?);
+        }
+        match root.as_mut() {
+            Some(dir) => body(dir),
+            None => Err(VolError::Io),
+        }
     }
 }
 
@@ -108,7 +124,13 @@ impl Volume for UefiVolume {
             let name = cstr(&path)?;
             let handle = root
                 .open(&name, FileMode::Read, FileAttribute::empty())
-                .map_err(|_| VolError::NotFound)?;
+                .map_err(|err| {
+                    if err.status() == Status::NOT_FOUND {
+                        VolError::NotFound
+                    } else {
+                        VolError::Io
+                    }
+                })?;
             match handle.into_type().map_err(|_| VolError::Io)? {
                 FileType::Regular(mut file) => info_of(&mut file),
                 FileType::Dir(mut dir) => {
@@ -124,14 +146,81 @@ impl Volume for UefiVolume {
         self.with_root(|root| list_dir(root, path))
     }
 
+    fn stream(
+        &self,
+        path: &str,
+        buf: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Result<Streamed, VolError> {
+        if buf.is_empty() {
+            return Err(VolError::Io);
+        }
+        self.with_root(|root| {
+            let mut file = open_regular(root, path, FileMode::Read)?;
+            let info = file
+                .get_boxed_info::<FileInfo>()
+                .map_err(|_| VolError::Io)?;
+            let mut done = Streamed {
+                file_size: info.file_size(),
+                ..Streamed::default()
+            };
+            while done.bytes_read < done.file_size {
+                let left = done.file_size - done.bytes_read;
+                let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+                let read = file.read(&mut buf[..want]).map_err(|_| VolError::Io)?;
+                if read == 0 {
+                    break;
+                }
+                sink(&buf[..read]);
+                done.bytes_read += read as u64;
+                done.reads += 1;
+            }
+            Ok(done)
+        })
+    }
+
     fn write(&self, path: &str, data: &[u8]) -> Result<(), VolError> {
         self.with_root(|root| write_file(root, path, data))
     }
 
+    /// FAT rename in place through `EFI_FILE_PROTOCOL.SetInfo`, then flush.
     fn rename(&self, from: &str, to: &str) -> Result<(), VolError> {
-        let data = self.read(from)?;
-        self.write(to, &data)?;
-        self.remove(from)
+        let from = normalize(from);
+        let to = normalize(to);
+        let (from_dir, _) = from.rsplit_once('\\').ok_or(VolError::Io)?;
+        let (to_dir, to_name) = to.rsplit_once('\\').ok_or(VolError::Io)?;
+        if !from_dir.eq_ignore_ascii_case(to_dir) || to_name.is_empty() {
+            return Err(VolError::Io);
+        }
+        self.with_root(|root| {
+            let target = cstr(&to)?;
+            if root
+                .open(&target, FileMode::Read, FileAttribute::empty())
+                .is_ok()
+            {
+                return Err(VolError::Io);
+            }
+            let mut file = open_regular(root, &from, FileMode::ReadWrite)?;
+            let info = file
+                .get_boxed_info::<FileInfo>()
+                .map_err(|_| VolError::Io)?;
+            let name = cstr(to_name)?;
+            let mut storage = alloc::vec![0u8; 128 + name.num_bytes() + FileInfo::alignment()];
+            let aligned = FileInfo::align_buf(&mut storage).ok_or(VolError::Io)?;
+            let renamed = FileInfo::new(
+                aligned,
+                info.file_size(),
+                info.physical_size(),
+                *info.create_time(),
+                *info.last_access_time(),
+                *info.modification_time(),
+                info.attribute(),
+                &name,
+            )
+            .map_err(|_| VolError::Io)?;
+            file.set_info(renamed).map_err(|_| VolError::Io)?;
+            file.flush().map_err(|_| VolError::Io)
+        })
     }
 
     fn remove(&self, path: &str) -> Result<(), VolError> {
@@ -139,7 +228,13 @@ impl Volume for UefiVolume {
             let name = cstr(&normalize(path))?;
             let handle = root
                 .open(&name, FileMode::ReadWrite, FileAttribute::empty())
-                .map_err(|_| VolError::NotFound)?;
+                .map_err(|err| {
+                    if err.status() == Status::NOT_FOUND {
+                        VolError::NotFound
+                    } else {
+                        VolError::Io
+                    }
+                })?;
             match handle.into_type().map_err(|_| VolError::Io)? {
                 FileType::Regular(file) => file.delete().map_err(|_| VolError::Io),
                 FileType::Dir(_) => Err(VolError::Io),
@@ -184,41 +279,30 @@ pub fn scan_disks(host: &HostImage) -> Vec<Disk> {
         let boot = host.fs_handle == Some(handle) || host.device == Some(handle);
         disks.push(Disk { boot, volume });
     }
-    if !disks.iter().any(|disk| disk.boot)
-        && let Some(disk) = disks.first_mut()
-    {
-        disk.boot = true;
-        firmware::mark("boot_volume fallback");
+    // No guessing: without the picker's own ESP there is no recovery entry
+    // and no control file is read or written (Spec 03 §9).
+    if !disks.iter().any(|disk| disk.boot) {
+        firmware::mark("boot_volume unknown");
     }
     disks
 }
 
-pub fn load_from_device_path(volume_path: &[u8], file: &uefi::CStr16) -> uefi::Result<Handle> {
-    let volume =
-        <&DevicePath>::try_from(volume_path).map_err(|_| uefi::Status::INVALID_PARAMETER)?;
+/// The volume's device path with `file` appended as a media file-path node.
+pub fn file_device_path(volume_path: &[u8], file: &uefi::CStr16) -> Option<Vec<u8>> {
+    let volume = <&DevicePath>::try_from(volume_path).ok()?;
     let mut storage = Vec::new();
     let mut builder = DevicePathBuilder::with_vec(&mut storage);
     for node in volume.node_iter() {
         if node.device_type() == DeviceType::END || is_file_node(node) {
             continue;
         }
-        builder = builder
-            .push(&node)
-            .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
+        builder = builder.push(&node).ok()?;
     }
     builder = builder
         .push(&build::media::FilePath { path_name: file })
-        .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
-    let path = builder
-        .finalize()
-        .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
-    boot::load_image(
-        boot::image_handle(),
-        uefi::boot::LoadImageSource::FromDevicePath {
-            device_path: path,
-            boot_policy: uefi::proto::BootPolicy::ExactMatch,
-        },
-    )
+        .ok()?;
+    let path = builder.finalize().ok()?;
+    Some(path.as_bytes().to_vec())
 }
 
 fn list_dir(root: &mut Directory, path: &str) -> Result<Vec<DirEntry>, VolError> {
@@ -229,7 +313,13 @@ fn list_dir(root: &mut Directory, path: &str) -> Result<Vec<DirEntry>, VolError>
     let name = cstr(&path)?;
     let handle = root
         .open(&name, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| VolError::NotFound)?;
+        .map_err(|err| {
+            if err.status() == Status::NOT_FOUND {
+                VolError::NotFound
+            } else {
+                VolError::Io
+            }
+        })?;
     match handle.into_type().map_err(|_| VolError::Io)? {
         FileType::Dir(mut dir) => read_entries(&mut dir),
         FileType::Regular(_) => Err(VolError::Io),
@@ -261,7 +351,13 @@ fn read_file(root: &mut Directory, path: &str, max: Option<usize>) -> Result<Vec
     let name = cstr(&path)?;
     let handle = root
         .open(&name, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| VolError::NotFound)?;
+        .map_err(|err| {
+            if err.status() == Status::NOT_FOUND {
+                VolError::NotFound
+            } else {
+                VolError::Io
+            }
+        })?;
     let FileType::Regular(mut file) = handle.into_type().map_err(|_| VolError::Io)? else {
         return Err(VolError::Io);
     };
@@ -293,7 +389,13 @@ fn read_file_at(
     let name = cstr(&path)?;
     let handle = root
         .open(&name, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| VolError::NotFound)?;
+        .map_err(|err| {
+            if err.status() == Status::NOT_FOUND {
+                VolError::NotFound
+            } else {
+                VolError::Io
+            }
+        })?;
     let FileType::Regular(mut file) = handle.into_type().map_err(|_| VolError::Io)? else {
         return Err(VolError::Io);
     };
@@ -324,7 +426,29 @@ fn write_file(root: &mut Directory, path: &str, data: &[u8]) -> Result<(), VolEr
     let FileType::Regular(mut file) = handle.into_type().map_err(|_| VolError::Io)? else {
         return Err(VolError::Io);
     };
-    file.write(data).map(|_| ()).map_err(|_| VolError::Io)
+    file.write(data).map_err(|_| VolError::Io)?;
+    file.flush().map_err(|_| VolError::Io)
+}
+
+fn open_regular(
+    root: &mut Directory,
+    path: &str,
+    mode: FileMode,
+) -> Result<uefi::proto::media::file::RegularFile, VolError> {
+    let name = cstr(&normalize(path))?;
+    let handle = root
+        .open(&name, mode, FileAttribute::empty())
+        .map_err(|err| {
+            if err.status() == Status::NOT_FOUND {
+                VolError::NotFound
+            } else {
+                VolError::Io
+            }
+        })?;
+    match handle.into_type().map_err(|_| VolError::Io)? {
+        FileType::Regular(file) => Ok(file),
+        FileType::Dir(_) => Err(VolError::Io),
+    }
 }
 
 fn ensure_parents(root: &mut Directory, path: &str) -> Result<(), VolError> {

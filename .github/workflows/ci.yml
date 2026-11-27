@@ -24,3 +24,40 @@ jobs:
             cargo clippy -p sbm-app -p sbm-fixture --release --target "$target" -- -D warnings
             cargo build -p sbm-app -p sbm-fixture --release --target "$target"
           done
+      - name: Detect native KVM
+        id: kvm
+        run: |
+          if test -c /dev/kvm; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::KVM is unavailable on this runner. Native firmware smoke was skipped."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.kvm.outputs.available == 'true'
+        with:
+          repository: smart-boot-menu/sbm-lab
+          ref: 8dee38dd17b765571109b6069a838b69993f2504
+          path: sbm-lab
+      - name: Native x86-64 OVMF smoke
+        if: steps.kvm.outputs.available == 'true'
+        env:
+          SBM_LAB_ARTIFACTS: ${{ github.workspace }}/artifacts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils ovmf
+          cargo xtask build x86_64
+          cargo build --manifest-path sbm-lab/Cargo.toml --release --locked -p sbm-lab
+          mkdir -p build
+          sbm-lab/target/release/sbm-lab --root sbm-lab --json test \
+            --id sbm-uefi-menu-x86_64 > build/kvm-smoke-summary.json
+          run="$(jq -er '.[0] | select(.success) | .run' build/kvm-smoke-summary.json)"
+          cp "sbm-lab/var/runs/$run/result.json" build/kvm-smoke-result.json
+          jq -e '.accel == "kvm" and any(.markers[]; startswith("fixture_recovery_valid esp="))' \
+            build/kvm-smoke-result.json
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.kvm.outputs.available == 'true'
+        with:
+          name: x86-64-kvm-smoke
+          path: build/kvm-smoke-*.json

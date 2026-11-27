@@ -13,7 +13,9 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
 libc = "0.2"
+sbm-media = { git = "https://github.com/smart-boot-menu/install", rev = "b11c427147ee26f1630506efe61c10a88e93b7ce" }
 sbm-boot = { path = "../sbm-boot" }
 sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }

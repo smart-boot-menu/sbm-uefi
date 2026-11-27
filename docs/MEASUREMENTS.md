@@ -1,5 +1,14 @@
 # Measurements, 2026-11-26
 
+## Agent 15 real recovery media
+
+On ARM64 HVF, every measured menu-ready sample was under 27 ms across ten runs with real recovery media. The median was 16.2 ms. The selected 74,513,752-byte UKI took 393.5 ms median to stream and verify at launch. The baseline median menu-ready time under the same test configuration was 2,073.8 ms. [Raw samples and configuration](https://github.com/smart-boot-menu/research/blob/main/validation/evidence/sbm-uefi-agent15-2026-11-27.md)
+
+The ARM64 EFI is 230,912 bytes and the x86-64 EFI is 261,120 bytes. The ARM64 SHA-256 speed setting adds 5,120 bytes and reduces median launch verification from 615.5 to 393.5 ms in this configuration. Read-and-hash timings include firmware storage I/O.
+
+## Earlier measurements
+
+
 One successful `cargo run -p xtask --offline -- qemu` invocation per architecture after the recovery-contract changes. These are guest-timer samples from QEMU, not physical hardware, and not an average.
 
 The 0.1 menu, before this integration, measured `menu_ready` at 20,709 µs (aarch64) and 92,312 µs (x86_64), with EFI sizes 168,448 and 187,904. The binaries below are larger because discovery now reads PE `.cmdline` sections and hashes recovery files in 64 KiB chunks.

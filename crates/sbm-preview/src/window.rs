@@ -270,7 +270,10 @@ fn launch_core(
     }
     match core::run(core_bin, dir) {
         Ok(exit) => {
-            core::import(dir, &session.machine);
+            if let Err(err) = core::import(dir, &session.machine) {
+                session.core_unavailable(&err);
+                return Effect::Redraw;
+            }
             println!(
                 "SIMULATED: SBM Core requested {}",
                 if exit == CoreExit::Shutdown {

@@ -13,4 +13,7 @@ name = "sbm-fixture"
 path = "src/main.rs"
 
 [dependencies]
+sbm-boot = { path = "../sbm-boot" }
+sbm-menu = { path = "../sbm-menu" }
+sbm-protocol = { workspace = true }
 uefi = { workspace = true }

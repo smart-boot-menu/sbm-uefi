@@ -1,32 +1,17 @@
-//! One power-on of the simulated computer, driven by the production menu
-//! state machine (`sbm_gfx::step`) and policy (`sbm_boot::resolve`).
+//! One power-on of the simulated computer. Startup, launch checks,
+//! verification, persistence and the handoff run through the same
+//! `sbm_menu::flow::Picker` as the UEFI app; this file only adds the screens
+//! real firmware would hand to another program.
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use sbm_boot::{
-    LocalRequest, ResolveInput, begin_attempt, build_handoff, confirm_attempt, decode_attempt,
-    decode_command, decode_policy, decode_success, encode_attempt, encode_handoff, encode_policy,
-    fresh_policy, handoff_sha256_hex, linux_load_options, local_request, mark_one_shot_consumed,
-    recovery_for_slot, resolve, selectable,
-};
 use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_menu::flow::{HandoffVar, LaunchPlan, LaunchResult, Picker};
 use sbm_menu::{
-    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, VERSION, boot_failure, card_position,
-    countdown_ms, diag_lines, menu_input, paint_current, recovery_position, sort_entries,
-    unhealthy_message, visible_positions,
+    DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, StartFailure, diag_lines, menu_input,
+    paint_current, recovery_position,
 };
-use sbm_protocol::{
-    BootAttemptRecord, BootAttemptStatus, BootPolicy, BootSuccessReport, BootTimingMetrics,
-    NetworkHandoffHint, RecoveryLaunchMode,
-};
-use sbm_types::{
-    BootTargetKind, ComponentKind, FirmwarePlatform, OsFamily, PlatformCapabilities,
-    SCHEMA_VERSION_V1,
-};
+use sbm_types::{BootTargetKind, OsFamily, PlatformCapabilities};
 
-use crate::machine::{
-    ATTEMPT_PATH, COMMAND_PATH, HANDOFF_PATH, Machine, POLICY_PATH, SUCCESS_PATH,
-};
+use crate::machine::Machine;
 use crate::overlay;
 
 /// Screens that exist only in the simulator. Real firmware hands control to
@@ -43,12 +28,23 @@ pub enum SimScreen {
     PoweredOff,
 }
 
+/// What firmware hands SBM Core: the handoff file and the Spec 03 §8
+/// variables exactly as the picker published them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreRequest {
     pub handoff: Vec<u8>,
-    pub cmdline: String,
-    pub selected_target: String,
+    /// `(name, vendor GUID, value)` for each published variable.
+    pub vars: Vec<(String, String, String)>,
     pub backing_device: Option<String>,
+}
+
+impl CoreRequest {
+    pub fn var(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(var, _, _)| var == name)
+            .map(|(_, _, value)| value.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,142 +62,76 @@ pub enum CoreExit {
 
 pub struct Session {
     pub machine: Machine,
-    pub entries: Vec<MenuEntry>,
-    pub visible: Vec<usize>,
+    pub picker: Picker,
     pub state: MenuState,
     pub sim: Option<SimScreen>,
     pub help: bool,
-    policy: BootPolicy,
-    attempt: Option<BootAttemptRecord>,
-    discovery_us: u64,
     menu_us: u64,
     boots: u32,
     pub last_reason: &'static str,
     pending: Option<Effect>,
+    /// The Core launch in progress, until Core exits or cannot start.
+    core_plan: Option<LaunchPlan>,
 }
 
 impl Session {
-    pub fn power_on(machine: Machine, dark: bool) -> Self {
+    pub fn power_on(mut machine: Machine, dark: bool) -> Self {
+        machine.reset();
+        let picker = Picker::start(&mut machine, &mut || false);
         let mut session = Self {
             machine,
-            entries: Vec::new(),
-            visible: Vec::new(),
+            picker,
             state: MenuState::new(0, dark, None),
             sim: None,
             help: false,
-            policy: fresh_policy(),
-            attempt: None,
-            discovery_us: 0,
             menu_us: 0,
-            boots: 0,
+            boots: 1,
             last_reason: "menu",
             pending: None,
+            core_plan: None,
         };
-        session.boot();
+        session.show_menu();
         session
     }
 
-    /// Simulated reset: rediscover, reload persisted policy and attempt state.
+    /// Simulated reset: volatile variables are gone; discovery, policy and
+    /// the ESP state files run again.
     pub fn boot(&mut self) {
-        let started = Instant::now();
         self.boots += 1;
         self.sim = None;
-        self.entries = self
-            .machine
-            .discover()
-            .into_iter()
-            .map(|(disk, item)| MenuEntry { disk, item })
-            .collect();
-        sort_entries(&mut self.entries);
-        self.discovery_us = started.elapsed().as_micros() as u64;
-        self.policy = self
-            .machine
-            .read_boot(POLICY_PATH)
-            .and_then(|bytes| decode_policy(&bytes).ok())
-            .unwrap_or_else(fresh_policy);
-        self.attempt = self
-            .machine
-            .read_boot(ATTEMPT_PATH)
-            .and_then(|bytes| decode_attempt(&bytes).ok());
-        self.apply_success();
-        let targets = self
-            .entries
-            .iter()
-            .map(|entry| entry.item.clone())
-            .collect::<Vec<_>>();
-        let mut resolved = resolve(ResolveInput {
-            policy: &self.policy,
-            targets: &targets,
-            attempt: self.attempt.as_ref(),
-            now_unix: now_unix(),
-            user_key_held: false,
-            remote_refresh_failed: false,
-        });
-        let mut power_off = false;
-        if let Some(bytes) = self.machine.remove_any(COMMAND_PATH)
-            && let Ok(command) = decode_command(&bytes)
-        {
-            match local_request(&command) {
-                LocalRequest::Boot(id) => {
-                    resolved.highlight = Some(id);
-                    resolved.countdown_seconds = Some(0);
-                }
-                LocalRequest::Recovery(slot) => {
-                    if let Some(target) = recovery_for_slot(&targets, slot) {
-                        resolved.highlight = Some(target.target.id.clone());
-                        resolved.countdown_seconds = Some(0);
-                    }
-                }
-                LocalRequest::Firmware => self.sim = Some(SimScreen::FirmwareSetup),
-                LocalRequest::Reboot => {}
-                LocalRequest::Shutdown => power_off = true,
-            }
-        }
-        self.last_reason = resolved.reason;
-        self.visible = visible_positions(&self.entries);
-        let selected = resolved
-            .highlight
-            .as_ref()
-            .and_then(|id| card_position(&self.entries, &self.visible, id))
-            .unwrap_or(0);
-        let dark = self.state.dark;
-        self.state = MenuState::new(selected, dark, countdown_ms(resolved.countdown_seconds));
-        self.menu_us = started.elapsed().as_micros() as u64;
-        if power_off {
-            self.sim = Some(SimScreen::PoweredOff);
-            return;
-        }
+        self.core_plan = None;
+        self.machine.reset();
+        self.picker = Picker::start(&mut self.machine, &mut || false);
+        self.show_menu();
+    }
+
+    fn show_menu(&mut self) {
+        self.last_reason = self.picker.resolved.reason;
+        self.state = self.picker.initial_state(self.state.dark);
+        self.menu_us = sbm_menu::flow::Platform::elapsed_us(&self.machine);
         if self.state.countdown_ms == Some(0)
-            && let Some(index) = self.visible.get(self.state.selected).copied()
+            && let Some(index) = self.picker.entry_for_card(self.state.selected)
         {
-            self.state.countdown_ms = None;
             let effect = self.boot_at(index);
             self.pending = Some(effect);
         }
     }
 
-    /// An effect produced during `boot()` (an immediate one-shot or command).
+    pub fn entries(&self) -> &[MenuEntry] {
+        &self.picker.entries
+    }
+
+    pub fn visible(&self) -> &[usize] {
+        &self.picker.visible
+    }
+
+    /// An effect produced during `boot()` (an immediate one-shot or request).
     pub fn take_pending(&mut self) -> Effect {
         self.pending.take().unwrap_or(Effect::None)
     }
 
-    fn apply_success(&mut self) {
-        let Some(bytes) = self.machine.remove_any(SUCCESS_PATH) else {
-            return;
-        };
-        let Ok(report) = decode_success(&bytes) else {
-            return;
-        };
-        if let Some(record) = self.attempt.as_mut()
-            && confirm_attempt(record, &report)
-            && let Ok(encoded) = encode_attempt(record)
-        {
-            self.machine.write_boot(ATTEMPT_PATH, &encoded);
-        }
-    }
-
     pub fn cards(&self) -> usize {
-        self.visible.len()
+        self.picker.visible.len()
     }
 
     pub fn key(&mut self, key: Key, width: u32, height: u32) -> Effect {
@@ -277,11 +207,11 @@ impl Session {
         let had_input = input.is_some();
         let outcome = step(&mut self.state, input, cards, cols, dt_ms);
         let effect = match outcome {
-            Outcome::Boot => match self.visible.get(self.state.selected).copied() {
+            Outcome::Boot => match self.picker.entry_for_card(self.state.selected) {
                 Some(index) => self.boot_at(index),
                 None => Effect::Redraw,
             },
-            Outcome::Recovery => match recovery_position(&self.entries) {
+            Outcome::Recovery => match recovery_position(&self.picker.entries) {
                 Some(index) => self.boot_at(index),
                 None => {
                     self.state.screen = Screen::Error;
@@ -312,12 +242,8 @@ impl Session {
 
     fn sim_key(&mut self, screen: SimScreen, key: Key) -> Effect {
         match (screen, key) {
-            (SimScreen::Booted { .. }, Key::Activate) => {
-                self.confirm_running_os();
-                self.boot();
-                self.pending.take().unwrap_or(Effect::Redraw)
-            }
-            (SimScreen::Booted { .. }, Key::Char('x' | 'X')) => {
+            // Restart the computer. No OS reports success in 0.0.1.
+            (SimScreen::Booted { .. }, Key::Activate | Key::Char('x' | 'X')) => {
                 self.boot();
                 self.pending.take().unwrap_or(Effect::Redraw)
             }
@@ -337,84 +263,25 @@ impl Session {
         }
     }
 
-    /// What an OS agent (`sbm-agent`) would write after a healthy boot.
-    fn confirm_running_os(&mut self) {
-        let Some(record) = self.attempt.as_ref() else {
-            return;
-        };
-        let report = BootSuccessReport {
-            schema_version: SCHEMA_VERSION_V1.into(),
-            attempt_id: record.attempt_id.clone(),
-            target_id: record.target_id.clone(),
-            confirmed_by: ComponentKind::SbmAgent,
-            confirmed_at_unix: now_unix().unwrap_or(0),
-        };
-        if let Ok(bytes) = serde_json::to_vec(&report) {
-            self.machine.write_boot(SUCCESS_PATH, &bytes);
-        }
-    }
-
     fn boot_at(&mut self, index: usize) -> Effect {
-        match self.launch(index) {
-            Ok(effect) => {
-                self.state.screen = Screen::Menu;
-                self.state.countdown_ms = None;
-                self.state.message.clear();
-                effect
-            }
-            Err(message) => {
-                self.state.screen = Screen::Error;
-                self.state.message = message;
-                self.state.countdown_ms = None;
-                Effect::Redraw
-            }
-        }
-    }
-
-    fn launch(&mut self, index: usize) -> Result<Effect, String> {
-        let Some(found) = self.entries.get(index) else {
-            return Err("That boot entry is no longer available".into());
+        self.state.countdown_ms = None;
+        let plan = match self.picker.prepare(&mut self.machine, index, 0) {
+            Ok(plan) => plan,
+            Err(message) => return self.show_error(message),
         };
-        if !selectable(&found.item) {
-            return Err(unhealthy_message(&found.item.target.display_name));
+        if let Some(failed) = self.machine.load_image(&plan) {
+            let message = self.picker.finish(&mut self.machine, &plan, &failed);
+            return self.show_error(message.unwrap_or_default());
         }
-        let target = found.item.target.clone();
-        let name = target.display_name.clone();
-        let path = target
-            .efi_path
-            .clone()
-            .ok_or_else(|| format!("{name} has no EFI path"))?;
-        if self
-            .policy
-            .one_shot
-            .as_ref()
-            .is_some_and(|shot| shot.target_id == target.id && !shot.consumed)
-        {
-            mark_one_shot_consumed(&mut self.policy);
-            if let Ok(bytes) = encode_policy(&self.policy) {
-                self.machine.write_boot(POLICY_PATH, &bytes);
-            }
+        self.picker.loaded(&mut self.machine, &plan);
+        self.state.screen = Screen::Menu;
+        self.state.message.clear();
+        if plan.kind == BootTargetKind::SbmCore {
+            let request = self.core_request(&plan);
+            self.core_plan = Some(plan);
+            return Effect::LaunchCore(Box::new(request));
         }
-        let mut record = begin_attempt(
-            self.attempt.as_ref(),
-            &target.id,
-            now_unix(),
-            &format!("uefi-sim-{}", self.boots),
-        );
-        self.persist_attempt(&record);
-        let guid = target.partition_guid.clone().unwrap_or_default();
-        if let Some((failure, status)) = self.machine.start_result(&guid, &path) {
-            record.status = BootAttemptStatus::Failed;
-            self.persist_attempt(&record);
-            self.attempt = Some(record);
-            return Err(boot_failure(&name, &path, failure, status));
-        }
-        self.attempt = Some(record.clone());
-        if target.kind == BootTargetKind::SbmCore {
-            return Ok(Effect::LaunchCore(Box::new(
-                self.core_request(&record, &target)?,
-            )));
-        }
+        let target = &self.picker.entries[plan.entry].item.target;
         let mut notes = Vec::new();
         if target.os_family == OsFamily::Windows
             && self
@@ -429,95 +296,53 @@ impl Session {
                     .into(),
             );
         }
-        if let Some(cmdline) = target.kernel_cmdline.as_deref() {
-            notes.push(format!("Kernel command line: {cmdline}"));
+        if let Some(options) = plan.load_options.as_deref() {
+            notes.push(format!("Load options: {options}"));
         }
         self.sim = Some(SimScreen::Booted {
-            name,
-            path,
+            name: plan.name.clone(),
+            path: plan.path.clone(),
             family: target.os_family,
             notes,
         });
-        Ok(Effect::Redraw)
+        Effect::Redraw
     }
 
-    fn persist_attempt(&self, record: &BootAttemptRecord) {
-        if let Ok(bytes) = encode_attempt(record) {
-            self.machine.write_boot(ATTEMPT_PATH, &bytes);
-        }
+    fn show_error(&mut self, message: String) -> Effect {
+        self.state.screen = Screen::Error;
+        self.state.message = message;
+        self.state.countdown_ms = None;
+        Effect::Redraw
     }
 
-    fn core_request(
-        &self,
-        record: &BootAttemptRecord,
-        target: &sbm_types::BootTarget,
-    ) -> Result<CoreRequest, String> {
-        let snapshot = self
-            .entries
+    fn core_request(&self, plan: &LaunchPlan) -> CoreRequest {
+        let vars = HandoffVar::ALL
             .iter()
-            .map(|entry| entry.item.clone())
-            .collect::<Vec<_>>();
-        let payload = build_handoff(
-            &record.attempt_id,
-            VERSION,
-            self.capabilities(),
-            RecoveryLaunchMode::Interactive,
-            None,
-            &snapshot,
-            BootTimingMetrics {
-                firmware_init_us: None,
-                uefi_entry_us: 0,
-                first_frame_us: Some(0),
-                network_us: Some(0),
-                handoff_us: self.menu_us,
-            },
-            Some(NetworkHandoffHint {
-                link_up: self.machine.scenario.firmware.network,
-                dhcp_acquired: false,
-                server_reachable: None,
-            }),
-        );
-        let bytes = encode_handoff(&payload).map_err(|_| "handoff encoding failed".to_string())?;
-        self.machine.write_boot(HANDOFF_PATH, &bytes);
-        let hash = handoff_sha256_hex(&payload).ok();
-        let boot_esp = self.machine.boot_esp();
-        let esp_guid =
-            boot_esp.map(|esp| sbm_boot::Volume::partition_guid(&esp.volume).to_string());
-        let cmdline = linux_load_options(
-            target.kernel_cmdline.as_deref(),
-            hash.as_deref(),
-            esp_guid.as_deref(),
-        )
-        .unwrap_or_default();
-        Ok(CoreRequest {
-            handoff: bytes,
-            cmdline,
-            selected_target: target.id.as_str().to_string(),
-            backing_device: boot_esp.map(|esp| esp.device.clone()),
-        })
+            .filter_map(|var| {
+                self.machine.vars.get(var).map(|value| {
+                    (
+                        var.name().to_string(),
+                        var.vendor_guid().to_string(),
+                        value.clone(),
+                    )
+                })
+            })
+            .collect();
+        CoreRequest {
+            handoff: plan.handoff.clone().unwrap_or_default(),
+            vars,
+            backing_device: self.machine.device_for_esp(plan.volume).map(str::to_string),
+        }
     }
 
     pub fn capabilities(&self) -> PlatformCapabilities {
-        let scenario = &self.machine.scenario;
-        PlatformCapabilities {
-            arch: scenario.arch.cpu(),
-            firmware: FirmwarePlatform::UefiNative,
-            page_size_bytes: 4096,
-            secure_boot_state: scenario.firmware.secure_boot.state(),
-            tpm_present: scenario.firmware.tpm,
-            nvram_writable: true,
-            gop_framebuffer: true,
-            uefi_networking: scenario.firmware.network,
-            can_chainload_efi: true,
-            can_direct_chainload_macos: false,
-            external_usb_boot_supported: scenario.disks.iter().any(|disk| disk.removable),
-            ram_total_mib: Some(scenario.firmware.ram_mib),
-        }
+        self.machine.capabilities()
     }
 
     /// Return from SBM Core. Files Core wrote to the shared ESP are already
     /// on the boot volume; this resets or powers off the computer.
     pub fn after_core(&mut self, exit: CoreExit) -> Effect {
+        self.core_plan = None;
         match exit {
             CoreExit::Reboot => {
                 self.boot();
@@ -530,7 +355,17 @@ impl Session {
         }
     }
 
+    /// The native Core simulator could not run. Treat it like `StartImage`
+    /// returning an error: the attempt fails and the variables are cleared.
     pub fn core_unavailable(&mut self, message: &str) {
+        if let Some(plan) = self.core_plan.take() {
+            let result = LaunchResult::Returned {
+                success: false,
+                failure: StartFailure::Other,
+                status: "SIMULATED_UNAVAILABLE".into(),
+            };
+            let _ = self.picker.finish(&mut self.machine, &plan, &result);
+        }
         self.state.screen = Screen::Error;
         self.state.message = format!("SIMULATED: SBM Core could not start natively. {message}");
     }
@@ -543,7 +378,7 @@ impl Session {
         );
         let display = format!("{width}x{height} simulated GOP framebuffer");
         let mut lines = diag_lines(
-            &self.entries,
+            &self.picker.entries,
             &DiagFacts {
                 firmware: &firmware,
                 arch: scenario.arch.cpu(),
@@ -551,15 +386,17 @@ impl Session {
                 display: Some(&display),
                 ram_mib: Some(scenario.firmware.ram_mib),
                 first_frame_us: 0,
-                discovery_us: self.discovery_us,
+                discovery_us: self.picker.timings.discovery_us,
                 menu_us: Some(self.menu_us),
+                integrity: self.picker.integrity_note.as_deref(),
             },
         );
         lines.push(format!("scenario {} ({})", scenario.id, scenario.name));
         lines.push(format!(
             "policy decision {}  attempts {}",
             self.last_reason,
-            self.attempt
+            self.picker
+                .attempt
                 .as_ref()
                 .map(|record| record.consecutive_failures)
                 .unwrap_or(0)
@@ -572,7 +409,13 @@ impl Session {
             Some(screen) => overlay::paint_sim_screen(fb, self.state.dark, screen),
             None => {
                 let lines = self.diagnostics(fb.width, fb.height);
-                paint_current(fb, &self.entries, &self.visible, &self.state, &lines);
+                paint_current(
+                    fb,
+                    &self.picker.entries,
+                    &self.picker.visible,
+                    &self.state,
+                    &lines,
+                );
             }
         }
         if self.help {
@@ -594,11 +437,8 @@ impl Session {
             (None, Screen::Error) => "error",
         }
     }
-}
 
-fn now_unix() -> Option<i64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|elapsed| elapsed.as_secs() as i64)
+    pub fn boots(&self) -> u32 {
+        self.boots
+    }
 }

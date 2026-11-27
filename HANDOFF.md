@@ -1,5 +1,14 @@
 # Handoff
 
+## Agent 15 update
+
+The picker performs metadata-only Slot A discovery and streams the selected recovery UKI through SHA-256 before launch. It writes the Spec 03 handoff and attempt to the identified boot ESP, publishes all five volatile variables, and starts the UKI by its exact device path with empty external options. Core-issued one-shot requests bind to a confirmed attempt, and a rejected request leaves the picker interactive with an explanation.
+
+The native simulator and firmware use the same picker. The GPT smoke fixture validates the handoff from inside the launched EFI image. See the [Agent 15 measurements](docs/MEASUREMENTS.md) for evidence and remaining firmware checks.
+
+## Earlier handoff
+
+
 The 0.1 UEFI menu still builds and boots for `x86_64-unknown-uefi` and `aarch64-unknown-uefi`. This follow-up wires it to the recovery files `sbm-core` already writes, records boot success and local boot commands, and keeps the menu offline. Shared types come from `sbm-common` `28d38450954f0b93815e12f31da92370b13a7462` (`sbm-types`, `sbm-protocol`, default features off). This tree does not modify `sbm-common`, `sbm-core`, or `sbm-lab`.
 
 There is no Agent 10. The agent roster is Agents 1–9. Recovery belongs to Agent 02 (`sbm-core`). The lab belongs to Agent 03 (`sbm-lab`).

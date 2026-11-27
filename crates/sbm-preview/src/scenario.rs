@@ -72,6 +72,8 @@ pub struct Firmware {
     pub ram_mib: u64,
     pub tpm: bool,
     pub network: bool,
+    /// `EFI_RNG_PROTOCOL` is present. Without it attempt IDs are derived.
+    pub rng: bool,
 }
 
 impl Default for Firmware {
@@ -82,6 +84,7 @@ impl Default for Firmware {
             ram_mib: 16_384,
             tpm: true,
             network: false,
+            rng: true,
         }
     }
 }
@@ -114,8 +117,14 @@ pub struct Policy {
     /// Loader preset name (for example `windows`) whose target is the default.
     pub default: Option<String>,
     pub max_failed_attempts: Option<u8>,
-    /// Consecutive unconfirmed boots of the default already recorded on the ESP.
+    /// Consecutive failed boots of the default already recorded on the ESP.
     pub failed_boots: Option<u8>,
+    /// Raw target ID for the default, for targets that do not exist.
+    pub default_id: Option<String>,
+    /// Loader preset to boot once, as Core or a remote would schedule it.
+    pub one_shot: Option<String>,
+    /// Raw target ID to boot once, for targets that do not exist.
+    pub one_shot_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,9 +222,13 @@ pub struct Partition {
     /// Presets whose binaries Secure Boot refuses when it is enabled.
     #[serde(default)]
     pub rejected: Vec<String>,
-    /// Presets whose binaries exist but are damaged.
+    /// Presets whose binaries exist but are damaged. For `sbm-slot-a` the
+    /// UKI is a valid PE whose bytes differ from the manifest digest.
     #[serde(default)]
     pub corrupt: Vec<String>,
+    /// Writes to this ESP fail, as on a write-protected or failing medium.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Byte count written as `512MiB`, `2TB`, or a plain integer.

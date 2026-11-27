@@ -22,7 +22,7 @@ cargo run -p xtask -- qemu aarch64
 cargo run -p xtask -- qemu x86_64
 ```
 
-`cargo test` is the host suites. UEFI bins are release builds. QEMU is local; CI does not boot a guest.
+`cargo test` is the host suites. UEFI bins are release builds. The local smoke uses native QEMU on ARM64. Linux CI also boots the x86-64 fixture when KVM is available.
 
 ### Native development (SIMULATED)
 
