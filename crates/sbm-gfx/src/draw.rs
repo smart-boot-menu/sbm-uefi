@@ -36,6 +36,11 @@ impl Rgba {
             ch(self.b(), other.b()),
         )
     }
+
+    /// Relative luminance approximation (0..=255) for contrast-aware blending.
+    pub const fn luma(self) -> u8 {
+        (((self.r() as u32) * 54 + (self.g() as u32) * 183 + (self.b() as u32) * 19) >> 8) as u8
+    }
 }
 
 pub struct Framebuffer {
@@ -85,6 +90,55 @@ impl Framebuffer {
         if x < self.width && y < self.height {
             self.px[(y * self.width + x) as usize] = color.0;
         }
+    }
+
+    /// Alpha-composite `color` with coverage `alpha` (`0..=255`) onto `(x, y)`.
+    #[inline]
+    pub fn blend_pixel(&mut self, x: u32, y: u32, color: Rgba, alpha: u8) {
+        if alpha == 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = (y * self.width + x) as usize;
+        if alpha == 255 {
+            self.px[idx] = color.0;
+            return;
+        }
+        let bg = Rgba(self.px[idx]);
+        let a = u32::from(alpha);
+        let inv = 255 - a;
+        let r = (u32::from(bg.r()) * inv + u32::from(color.r()) * a + 127) / 255;
+        let g = (u32::from(bg.g()) * inv + u32::from(color.g()) * a + 127) / 255;
+        let b = (u32::from(bg.b()) * inv + u32::from(color.b()) * a + 127) / 255;
+        self.px[idx] = Rgba::rgb(r as u8, g as u8, b as u8).0;
+    }
+
+    /// Linear-light (gamma ~2.0) alpha-composite for stem-weight-consistent
+    /// antialiased text and vector edges across both dark and light themes.
+    #[inline]
+    pub fn blend_pixel_linear(&mut self, x: u32, y: u32, color: Rgba, alpha: u8) {
+        if alpha == 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = (y * self.width + x) as usize;
+        if alpha == 255 {
+            self.px[idx] = color.0;
+            return;
+        }
+        let bg = Rgba(self.px[idx]);
+        let a = u32::from(alpha);
+        let inv = 255 - a;
+        let blend_ch = |b: u8, f: u8| -> u8 {
+            let bl = u32::from(b) * u32::from(b);
+            let fl = u32::from(f) * u32::from(f);
+            let mixed = (bl * inv + fl * a + 127) / 255;
+            isqrt_u32(mixed).min(255) as u8
+        };
+        self.px[idx] = Rgba::rgb(
+            blend_ch(bg.r(), color.r()),
+            blend_ch(bg.g(), color.g()),
+            blend_ch(bg.b(), color.b()),
+        )
+        .0;
     }
 
     pub fn round_rect(&mut self, x: u32, y: u32, w: u32, h: u32, radius: u32, color: Rgba) {
@@ -165,6 +219,22 @@ impl Framebuffer {
     }
 }
 
+/// Fast integer square root for `0..=65025` (8-bit squared channels).
+#[inline]
+fn isqrt_u32(v: u32) -> u32 {
+    if v <= 1 {
+        return v;
+    }
+    let mut x = 1u32 << (32 - v.leading_zeros()).div_ceil(2);
+    loop {
+        let next = (x + v / x) >> 1;
+        if next >= x {
+            return x;
+        }
+        x = next;
+    }
+}
+
 pub fn text_width(text: &str, size: u32) -> u32 {
     (text.chars().count() as u32).saturating_mul(size)
 }
@@ -183,12 +253,16 @@ pub fn fit_text(text: &str, size: u32, max_width: u32) -> String {
     out
 }
 
+/// Draw a visible missing-glyph tofu box (`.notdef`) for legacy 8x8 mode
+/// rather than misleadingly substituting `'?'`.
+const NOTDEF_8X8: [u8; 8] = [0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00];
+
 fn glyph_bits(ch: char) -> [u8; 8] {
     let index = u32::from(ch);
     if index < 128 {
         FONT8X8[index as usize]
     } else {
-        FONT8X8[b'?' as usize]
+        NOTDEF_8X8
     }
 }
 
@@ -227,5 +301,24 @@ mod tests {
         let fitted = fit_text("Fedora Linux", 8, 40);
         assert!(fitted.ends_with("..."));
         assert!(text_width(&fitted, 8) <= 40);
+    }
+
+    #[test]
+    fn unknown_glyph_uses_notdef_box_not_question_mark() {
+        assert_ne!(glyph_bits('漢'), FONT8X8[b'?' as usize]);
+        assert_eq!(glyph_bits('漢'), NOTDEF_8X8);
+    }
+
+    #[test]
+    fn blend_pixel_and_linear_blend_produce_antialiased_intermediate() {
+        let mut fb = Framebuffer::new(4, 1);
+        fb.fill(Rgba::rgb(0, 0, 0));
+        fb.blend_pixel(0, 0, Rgba::rgb(255, 255, 255), 128);
+        fb.blend_pixel_linear(1, 0, Rgba::rgb(255, 255, 255), 128);
+        let p0 = fb.pixel(0, 0).unwrap();
+        let p1 = fb.pixel(1, 0).unwrap();
+        assert!(p0.r() > 120 && p0.r() < 135);
+        // Linear-light 50% coverage maps to ~180 in sRGB (gamma 2.0)
+        assert!(p1.r() > 170 && p1.r() < 190);
     }
 }

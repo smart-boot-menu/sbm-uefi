@@ -1,17 +1,37 @@
 //! Screens and overlays that exist only in the simulator. They use the same
-//! theme tokens and bitmap font as the firmware renderer and always say
-//! SIMULATED so they cannot be mistaken for production UI.
+//! theme tokens and active typography renderer as the firmware UI and always
+//! say SIMULATED so they cannot be mistaken for production UI.
 
-use sbm_gfx::{Framebuffer, Rgba, Theme, font_px};
+use sbm_gfx::{
+    FontMode, Framebuffer, Rgba, TextRenderer, TextRole, Theme, UiScale, fill_rounded_panel,
+};
 
 use crate::session::SimScreen;
 
 pub fn paint_sim_screen(fb: &mut Framebuffer, dark: bool, screen: &SimScreen) {
-    let theme = Theme::from_dark(dark);
+    let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, fb.height, UiScale::default());
+    paint_sim_screen_with(fb, dark, false, screen, &mut renderer);
+}
+
+pub fn paint_sim_screen_with(
+    fb: &mut Framebuffer,
+    dark: bool,
+    high_contrast: bool,
+    screen: &SimScreen,
+    renderer: &mut TextRenderer<'_>,
+) {
+    renderer.set_display_height(fb.height);
+    let theme = Theme::resolve(dark, high_contrast);
     fb.fill(theme.bg);
-    let size = font_px(fb.height);
-    banner(fb, &theme, size);
-    let mut out = Writer { y: size * 4, size };
+    let pad = (fb.width / 24).max(20);
+    banner(fb, &theme, pad, renderer);
+    let banner_h = renderer.line_metrics(TextRole::Body).line_height * 2;
+    let mut out = Writer {
+        y: banner_h.saturating_add(pad),
+        pad,
+        max_w: fb.width.saturating_sub(pad * 2),
+    };
+
     match screen {
         SimScreen::Booted {
             name,
@@ -19,88 +39,136 @@ pub fn paint_sim_screen(fb: &mut Framebuffer, dark: bool, screen: &SimScreen) {
             family,
             notes,
         } => {
-            out.line(fb, &format!("{name} would start now"), theme.ok, 3);
             out.line(
                 fb,
+                renderer,
+                &format!("{name} would start now"),
+                TextRole::Display,
+                theme.ok,
+            );
+            out.line(
+                fb,
+                renderer,
                 &format!(
                     "The menu handed {path} to a simulated LoadImage/StartImage ({family:?})."
                 ),
+                TextRole::Technical,
                 theme.text,
-                2,
             );
             out.line(
                 fb,
+                renderer,
                 "No operating system runs in the native preview. The boot attempt was recorded on the simulated ESP.",
+                TextRole::Body,
                 theme.muted,
-                2,
             );
             for note in notes {
-                out.line(fb, note, theme.text, 2);
+                let role = if note.starts_with("Kernel command line:") {
+                    TextRole::Technical
+                } else {
+                    TextRole::Body
+                };
+                out.line(fb, renderer, note, role, theme.text);
             }
             out.gap();
             out.line(
                 fb,
+                renderer,
                 "Enter  restart after a healthy boot (the OS agent confirms)",
+                TextRole::Body,
                 theme.accent,
-                2,
             );
             out.line(
                 fb,
+                renderer,
                 "X      restart without confirmation (counts as a failed boot)",
+                TextRole::Body,
                 theme.accent,
-                2,
             );
-            out.line(fb, "P      power off", theme.accent, 2);
+            out.line(
+                fb,
+                renderer,
+                "P      power off",
+                TextRole::Body,
+                theme.accent,
+            );
         }
         SimScreen::FirmwareSetup => {
-            out.line(fb, "Firmware setup", theme.ok, 3);
+            out.line(fb, renderer, "Firmware setup", TextRole::Display, theme.ok);
             out.line(
                 fb,
+                renderer,
                 "Real firmware would set OsIndications and reset into its setup UI. Nothing was written to host NVRAM.",
+                TextRole::Body,
                 theme.text,
-                2,
             );
             out.gap();
-            out.line(fb, "Enter  power on again", theme.accent, 2);
+            out.line(
+                fb,
+                renderer,
+                "Enter  power on again",
+                TextRole::Body,
+                theme.accent,
+            );
         }
         SimScreen::PoweredOff => {
-            out.line(fb, "Powered off", theme.muted, 3);
-            out.line(fb, "The simulated computer is off.", theme.text, 2);
+            out.line(fb, renderer, "Powered off", TextRole::Display, theme.muted);
+            out.line(
+                fb,
+                renderer,
+                "The simulated computer is off.",
+                TextRole::Body,
+                theme.text,
+            );
             out.gap();
-            out.line(fb, "Enter  power on", theme.accent, 2);
+            out.line(
+                fb,
+                renderer,
+                "Enter  power on",
+                TextRole::Body,
+                theme.accent,
+            );
         }
     }
 }
 
 struct Writer {
     y: u32,
-    size: u32,
+    pad: u32,
+    max_w: u32,
 }
 
 impl Writer {
-    fn line(&mut self, fb: &mut Framebuffer, text: &str, color: Rgba, scale: u32) {
-        let size = self.size;
-        let glyph = size * scale / 2;
-        for chunk in wrap(text, glyph, fb.width.saturating_sub(size * 2)) {
-            fb.text(&chunk, size, self.y, glyph, color);
-            self.y = self.y.saturating_add(glyph + size / 3);
-        }
+    fn line(
+        &mut self,
+        fb: &mut Framebuffer,
+        renderer: &mut TextRenderer<'_>,
+        text: &str,
+        role: TextRole,
+        color: Rgba,
+    ) {
+        let used = renderer.draw_wrapped(fb, text, self.pad, self.y, self.max_w, 6, role, color);
+        self.y = self.y.saturating_add(used).saturating_add(self.pad / 4);
     }
 
     fn gap(&mut self) {
-        self.y = self.y.saturating_add(self.size);
+        self.y = self.y.saturating_add(self.pad / 2);
     }
 }
 
-fn banner(fb: &mut Framebuffer, theme: &Theme, size: u32) {
-    let h = size * 2;
+fn banner(fb: &mut Framebuffer, theme: &Theme, pad: u32, renderer: &mut TextRenderer<'_>) {
+    let lm = renderer.line_metrics(TextRole::Body);
+    let h = lm.line_height.saturating_mul(2);
     fb.fill_rect(0, 0, fb.width, h, theme.header);
     fb.fill_rect(0, h.saturating_sub(2), fb.width, 2, theme.danger);
-    fb.text(
+    let top_y = h.saturating_sub(lm.line_height) / 2;
+    renderer.draw_truncated(
+        fb,
         "SIMULATED  native preview, not firmware",
-        size,
-        size / 2,
-        size,
+        pad,
+        top_y,
+        fb.width.saturating_sub(pad * 2),
+        TextRole::Body,
         theme.danger,
     );
 }
@@ -112,54 +180,79 @@ pub const HELP: &[&str] = &[
     "  F firmware   R restart   S shut down   Esc back",
     "  Mouse: hover selects, click boots",
     "",
-    "Simulator keys",
+    "Simulator & typography keys",
     "  F1 help      F2 next scenario    Shift+F2 previous",
-    "  F3 display size (window / fixed presets)",
-    "  F5 reset the computer     F12 screenshot (PNG)",
+    "  F3 display size (window / fixed presets including 4K)",
+    "  F5 reset computer     F12 screenshot (PNG)",
+    "  F7 font mode (Bitmap / Atkinson Next / Next + Mono)  Shift+F7 prev",
+    "  F8 high contrast      + / - UI scale      0 reset scale",
     "  Cmd+Q / close window  quit",
 ];
 
 pub fn paint_help(fb: &mut Framebuffer, dark: bool) {
-    let theme = Theme::from_dark(dark);
-    let size = (font_px(fb.height) * 3 / 4).max(8);
-    let width = HELP
-        .iter()
-        .map(|line| line.len() as u32 * size)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(size * 2)
-        .min(fb.width);
-    let height = (HELP.len() as u32 + 2) * (size + size / 3);
-    let x = fb.width.saturating_sub(width) / 2;
-    let y = fb.height.saturating_sub(height) / 2;
-    fb.round_panel(x, y, width, height, size / 2, 2, theme.header, theme.accent);
-    let mut row = y + size;
-    for line in HELP {
-        let color = if line.starts_with(' ') {
-            theme.text
-        } else {
-            theme.accent
-        };
-        fb.text(line, x + size, row, size, color);
-        row += size + size / 3;
-    }
+    let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, fb.height, UiScale::default());
+    paint_help_with(fb, dark, false, &mut renderer);
 }
 
-fn wrap(text: &str, size: u32, max: u32) -> Vec<String> {
-    let per_line = (max / size.max(1)).max(8) as usize;
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if !current.is_empty() && current.len() + 1 + word.len() > per_line {
-            lines.push(std::mem::take(&mut current));
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
+pub fn paint_help_with(
+    fb: &mut Framebuffer,
+    dark: bool,
+    high_contrast: bool,
+    renderer: &mut TextRenderer<'_>,
+) {
+    renderer.set_display_height(fb.height);
+    let theme = Theme::resolve(dark, high_contrast);
+    let lm = renderer.line_metrics(TextRole::Caption);
+    let pad = (lm.line_height * 5 / 4).max(16);
+    let row_step = lm.line_height.saturating_add(4);
+    let max_line_w = HELP
+        .iter()
+        .map(|line| {
+            let role = if line.starts_with(' ') {
+                TextRole::Technical
+            } else {
+                TextRole::Heading
+            };
+            renderer.measure(line, role).width
+        })
+        .max()
+        .unwrap_or(0);
+    let width = max_line_w
+        .saturating_add(pad * 2)
+        .min(fb.width.saturating_sub(16));
+    let height = (HELP.len() as u32)
+        .saturating_mul(row_step)
+        .saturating_add(pad * 2)
+        .min(fb.height.saturating_sub(16));
+    let x = fb.width.saturating_sub(width) / 2;
+    let y = fb.height.saturating_sub(height) / 2;
+    let radius = (pad / 2).clamp(6, 14);
+    if renderer.mode() == FontMode::Bitmap8x8 {
+        fb.round_panel(x, y, width, height, radius, 2, theme.header, theme.accent);
+    } else {
+        fill_rounded_panel(
+            fb,
+            x,
+            y,
+            width,
+            height,
+            radius,
+            2,
+            theme.header,
+            theme.accent,
+        );
     }
-    if !current.is_empty() {
-        lines.push(current);
+    let mut row = y.saturating_add(pad);
+    let inner_w = width.saturating_sub(pad * 2);
+    for line in HELP {
+        if !line.is_empty() {
+            let (role, color) = if line.starts_with(' ') {
+                (TextRole::Technical, theme.text)
+            } else {
+                (TextRole::Heading, theme.accent)
+            };
+            renderer.draw_truncated(fb, line, x + pad, row, inner_w, role, color);
+        }
+        row = row.saturating_add(row_step);
     }
-    lines
 }

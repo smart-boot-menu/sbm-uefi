@@ -1,6 +1,7 @@
 //! One power-on of the simulated computer, driven by the production menu
 //! state machine (`sbm_gfx::step`) and policy (`sbm_boot::resolve`).
 
+use std::cell::RefCell;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sbm_boot::{
@@ -9,10 +10,13 @@ use sbm_boot::{
     fresh_policy, handoff_sha256_hex, linux_load_options, local_request, mark_one_shot_consumed,
     recovery_for_slot, resolve, selectable,
 };
-use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_gfx::{
+    CacheStats, FontMode, Framebuffer, Input, MenuState, Outcome, Screen, TextRenderer, UiScale,
+    layout_menu, paint_splash_with, step,
+};
 use sbm_menu::{
     DiagFacts, Key, MenuEntry, NO_RECOVERY_MESSAGE, Pointer, VERSION, boot_failure, card_position,
-    countdown_ms, diag_lines, menu_input, paint_current, recovery_position, sort_entries,
+    countdown_ms, diag_lines, menu_input, paint_current_with, recovery_position, sort_entries,
     unhealthy_message, visible_positions,
 };
 use sbm_protocol::{
@@ -71,6 +75,10 @@ pub struct Session {
     pub state: MenuState,
     pub sim: Option<SimScreen>,
     pub help: bool,
+    pub font_mode: FontMode,
+    pub scale: UiScale,
+    pub high_contrast: bool,
+    renderer: RefCell<TextRenderer<'static>>,
     policy: BootPolicy,
     attempt: Option<BootAttemptRecord>,
     discovery_us: u64,
@@ -82,6 +90,8 @@ pub struct Session {
 
 impl Session {
     pub fn power_on(machine: Machine, dark: bool) -> Self {
+        let font_mode = FontMode::default();
+        let scale = UiScale::default();
         let mut session = Self {
             machine,
             entries: Vec::new(),
@@ -89,6 +99,10 @@ impl Session {
             state: MenuState::new(0, dark, None),
             sim: None,
             help: false,
+            font_mode,
+            scale,
+            high_contrast: false,
+            renderer: RefCell::new(TextRenderer::new(font_mode, 800, scale)),
             policy: fresh_policy(),
             attempt: None,
             discovery_us: 0,
@@ -99,6 +113,45 @@ impl Session {
         };
         session.boot();
         session
+    }
+
+    pub fn set_font_mode(&mut self, mode: FontMode) {
+        self.font_mode = mode;
+        self.renderer.borrow_mut().set_mode(mode);
+    }
+
+    pub fn cycle_font_mode(&mut self, reverse: bool) {
+        let next = if reverse {
+            self.font_mode.prev()
+        } else {
+            self.font_mode.next()
+        };
+        self.set_font_mode(next);
+    }
+
+    pub fn set_scale(&mut self, scale: UiScale) {
+        self.scale = scale;
+        self.renderer.borrow_mut().set_scale(scale);
+    }
+
+    pub fn scale_up(&mut self) {
+        self.set_scale(self.scale.step_up());
+    }
+
+    pub fn scale_down(&mut self) {
+        self.set_scale(self.scale.step_down());
+    }
+
+    pub fn reset_scale(&mut self) {
+        self.set_scale(UiScale::default());
+    }
+
+    pub fn toggle_high_contrast(&mut self) {
+        self.high_contrast = !self.high_contrast;
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        self.renderer.borrow().cache_stats()
     }
 
     /// Simulated reset: rediscover, reload persisted policy and attempt state.
@@ -556,6 +609,15 @@ impl Session {
             },
         );
         lines.push(format!("scenario {} ({})", scenario.id, scenario.name));
+        let stats = self.renderer.borrow().cache_stats();
+        lines.push(format!(
+            "typography {}  scale {}%  contrast {}  cache {}/{} B",
+            self.font_mode.label(),
+            self.scale.percent(),
+            if self.high_contrast { "high" } else { "normal" },
+            stats.entries,
+            stats.bytes
+        ));
         lines.push(format!(
             "policy decision {}  attempts {}",
             self.last_reason,
@@ -568,20 +630,45 @@ impl Session {
     }
 
     pub fn render(&self, fb: &mut Framebuffer) {
+        let mut renderer = self.renderer.borrow_mut();
+        renderer.set_display_height(fb.height);
+        renderer.set_mode(self.font_mode);
+        renderer.set_scale(self.scale);
         match &self.sim {
-            Some(screen) => overlay::paint_sim_screen(fb, self.state.dark, screen),
+            Some(screen) => overlay::paint_sim_screen_with(
+                fb,
+                self.state.dark,
+                self.high_contrast,
+                screen,
+                &mut renderer,
+            ),
             None => {
+                drop(renderer);
                 let lines = self.diagnostics(fb.width, fb.height);
-                paint_current(fb, &self.entries, &self.visible, &self.state, &lines);
+                let mut renderer = self.renderer.borrow_mut();
+                paint_current_with(
+                    fb,
+                    &self.entries,
+                    &self.visible,
+                    &self.state,
+                    &lines,
+                    self.high_contrast,
+                    &mut renderer,
+                );
             }
         }
         if self.help {
-            overlay::paint_help(fb, self.state.dark);
+            let mut renderer = self.renderer.borrow_mut();
+            overlay::paint_help_with(fb, self.state.dark, self.high_contrast, &mut renderer);
         }
     }
 
     pub fn render_splash(&self, fb: &mut Framebuffer) {
-        paint_splash(fb, self.state.dark);
+        let mut renderer = self.renderer.borrow_mut();
+        renderer.set_display_height(fb.height);
+        renderer.set_mode(self.font_mode);
+        renderer.set_scale(self.scale);
+        paint_splash_with(fb, self.state.dark, self.high_contrast, &mut renderer);
     }
 
     pub fn screen_name(&self) -> &'static str {

@@ -85,10 +85,29 @@ impl View {
     }
 }
 
+fn new_session(
+    path: &Path,
+    dark: bool,
+    prev: Option<&Session>,
+    opts: &Options,
+) -> Result<Session, String> {
+    let mut session = Session::power_on(Machine::new(Scenario::load(path)?), dark);
+    if let Some(old) = prev {
+        session.set_font_mode(old.font_mode);
+        session.set_scale(old.scale);
+        session.high_contrast = old.high_contrast;
+    } else {
+        session.set_font_mode(opts.font_mode);
+        session.set_scale(opts.scale);
+        session.high_contrast = opts.high_contrast;
+    }
+    Ok(session)
+}
+
 pub fn run(opts: &Options) -> Result<(), String> {
     let scenarios = scenario::list(&scenario::scenario_dir())?;
     let mut current = scenario::resolve(&opts.scenario)?;
-    let mut session = Session::power_on(Machine::new(Scenario::load(&current)?), opts.dark);
+    let mut session = new_session(&current, opts.dark, None, opts)?;
     let mut view = View::open(opts.size, opts.fixed)?;
     let mut preset = None::<usize>;
     let mut shots = 0u32;
@@ -131,7 +150,7 @@ pub fn run(opts: &Options) -> Result<(), String> {
                     };
                     current = scenarios[next].clone();
                     let dark = session.state.dark;
-                    session = Session::power_on(Machine::new(Scenario::load(&current)?), dark);
+                    session = new_session(&current, dark, Some(&session), opts)?;
                     effects.push(session.take_pending());
                     set_title(&mut view, &session);
                     dirty = true;
@@ -143,12 +162,38 @@ pub fn run(opts: &Options) -> Result<(), String> {
                         Some(_) => None,
                     };
                     view.fixed = preset.map(|index| DISPLAY_PRESETS[index]);
+                    set_title(&mut view, &session);
                     dirty = true;
                 }
                 MKey::F5 => {
                     let dark = session.state.dark;
-                    session = Session::power_on(Machine::new(Scenario::load(&current)?), dark);
+                    session = new_session(&current, dark, Some(&session), opts)?;
                     effects.push(session.take_pending());
+                    dirty = true;
+                }
+                MKey::F7 => {
+                    session.cycle_font_mode(shift);
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::F8 => {
+                    session.toggle_high_contrast();
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Equal | MKey::NumPadPlus => {
+                    session.scale_up();
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Minus | MKey::NumPadMinus => {
+                    session.scale_down();
+                    set_title(&mut view, &session);
+                    dirty = true;
+                }
+                MKey::Key0 | MKey::NumPad0 => {
+                    session.reset_scale();
+                    set_title(&mut view, &session);
                     dirty = true;
                 }
                 MKey::F12 => {
@@ -226,10 +271,12 @@ pub fn run(opts: &Options) -> Result<(), String> {
             if first_frame {
                 first_frame = false;
                 println!(
-                    "first frame {:.1} ms after process start ({}x{})",
+                    "first frame {:.1} ms after process start ({}x{}, {}, {}%)",
                     opts.started.elapsed().as_secs_f64() * 1000.0,
                     view.fb.width,
-                    view.fb.height
+                    view.fb.height,
+                    session.font_mode.label(),
+                    session.scale.percent()
                 );
             }
         } else {
@@ -294,19 +341,24 @@ fn set_title(view: &mut View, session: &Session) {
         Some((w, h)) => format!("{w}x{h} fixed"),
         None => "follows window".into(),
     };
+    let hc = if session.high_contrast { " HC" } else { "" };
     view.window.set_title(&format!(
-        "Smart Boot Menu - SIMULATED UEFI - {} - {size} - F1 help",
-        session.machine.scenario.id
+        "Smart Boot Menu - SIMULATED UEFI - {} - {} ({}%{hc}) - {size} - F1 help",
+        session.machine.scenario.id,
+        session.font_mode.label(),
+        session.scale.percent(),
     ));
 }
 
 fn screenshot_path(session: &Session, fb: &Framebuffer, n: u32) -> PathBuf {
+    let hc = if session.high_contrast { "-hc" } else { "" };
     sbm_preview::workspace_root()
         .join("build/sim/screenshots")
         .join(format!(
-            "{}-{}-{}x{}-{n:03}.png",
+            "{}-{}-{}{hc}-{}x{}-{n:03}.png",
             session.machine.scenario.id,
             session.screen_name(),
+            session.font_mode.id(),
             fb.width,
             fb.height
         ))

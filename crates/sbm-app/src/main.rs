@@ -20,10 +20,13 @@ use sbm_boot::{
     local_request, mark_one_shot_consumed, merge_load_options, normalize, parse_load_option,
     recovery_for_slot, resolve, selectable,
 };
-use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_gfx::{
+    FontMode, Framebuffer, Input, MenuState, Outcome, Screen, TextRenderer, UiScale, layout_menu,
+    paint_splash_with, step,
+};
 use sbm_menu::{
     DiagFacts, MenuEntry as Found, NO_RECOVERY_MESSAGE, Pointer, StartFailure, VERSION, arch_name,
-    card_position, countdown_ms, menu_input, paint_current, recovery_position, sort_entries,
+    card_position, countdown_ms, menu_input, paint_current_with, recovery_position, sort_entries,
     unhealthy_message, visible_positions,
 };
 use sbm_protocol::{
@@ -53,6 +56,29 @@ static SBAT: [u8; 148] = *b"\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n\
 sbm,1,Smart Boot Menu,sbm,1,https://github.com/smart-boot-menu/sbm-uefi\n";
 
+#[derive(Clone, PartialEq, Eq)]
+struct FrameKey {
+    selected: usize,
+    screen: Screen,
+    dark: bool,
+    countdown_sec: Option<u32>,
+    cursor: Option<(u32, u32)>,
+    message: String,
+}
+
+impl FrameKey {
+    fn from_state(state: &MenuState) -> Self {
+        Self {
+            selected: state.selected,
+            screen: state.screen,
+            dark: state.dark,
+            countdown_sec: state.countdown_ms.map(|ms| ms.div_ceil(1000)),
+            cursor: state.cursor,
+            message: state.message.clone(),
+        }
+    }
+}
+
 #[entry]
 fn main() -> Status {
     let _ = helpers::init();
@@ -76,8 +102,10 @@ fn run() -> ! {
         .map(|screen| (screen.width(), screen.height()))
         .unwrap_or((1024, 768));
     let mut fb = Framebuffer::new(width, height);
+    let mut text_renderer =
+        TextRenderer::new(FontMode::AtkinsonNextMono, height, UiScale::default());
     if let Some(screen) = gop.as_mut() {
-        paint_splash(&mut fb, true);
+        paint_splash_with(&mut fb, true, false, &mut text_renderer);
         screen.present(&fb);
         mark(&alloc::format!("gop {}", screen.describe()));
         mark(&alloc::format!(
@@ -170,17 +198,27 @@ fn run() -> ! {
         .unwrap_or(0);
     let mut state = MenuState::new(selected, true, countdown_ms(resolved.countdown_seconds));
     let mut mouse = Mouse::open(width, height);
-    paint_current(
+    paint_current_with(
         &mut fb,
         &entries,
         &visible_index,
         &state,
         &diag_lines(&entries, &gop, first_frame_us, discovery_us, None),
+        false,
+        &mut text_renderer,
     );
     if let Some(screen) = gop.as_mut() {
         screen.present(&fb);
     }
     let menu_ready_us = clock.elapsed_us();
+    let cache_stats = text_renderer.cache_stats();
+    mark(&alloc::format!(
+        "glyph_cache entries={} bytes={} hits={} misses={}",
+        cache_stats.entries,
+        cache_stats.bytes,
+        cache_stats.hits,
+        cache_stats.misses
+    ));
     mark(&alloc::format!("menu_ready us={menu_ready_us}"));
     firmware::lab_marker(
         "menu-ready",
@@ -216,6 +254,7 @@ fn run() -> ! {
         );
     }
 
+    let mut last_frame = FrameKey::from_state(&state);
     let mut last_us = clock.elapsed_us();
     loop {
         let now = clock.elapsed_us();
@@ -293,16 +332,22 @@ fn run() -> ! {
             Outcome::Action(_) => {}
             Outcome::None => {}
         }
-        let ready = Some(menu_ready_us);
-        paint_current(
-            &mut fb,
-            &entries,
-            &visible_index,
-            &state,
-            &diag_lines(&entries, &gop, first_frame_us, discovery_us, ready),
-        );
-        if let Some(screen) = gop.as_mut() {
-            screen.present(&fb);
+        let next_frame = FrameKey::from_state(&state);
+        if next_frame != last_frame {
+            last_frame = next_frame;
+            let ready = Some(menu_ready_us);
+            paint_current_with(
+                &mut fb,
+                &entries,
+                &visible_index,
+                &state,
+                &diag_lines(&entries, &gop, first_frame_us, discovery_us, ready),
+                false,
+                &mut text_renderer,
+            );
+            if let Some(screen) = gop.as_mut() {
+                screen.present(&fb);
+            }
         }
         boot::stall(Duration::from_millis(16));
     }

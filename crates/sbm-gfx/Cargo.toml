@@ -1,6 +1,6 @@
 [package]
 name = "sbm-gfx"
-description = "no_std framebuffer renderer and boot-menu layout for Smart Boot Menu"
+description = "no_std framebuffer renderer, unified vector graphics, accessible typography, and boot-menu layout for Smart Boot Menu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ab_glyph_rasterizer.workspace = true
+libm.workspace = true
+ttf-parser.workspace = true

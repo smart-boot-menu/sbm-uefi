@@ -9,9 +9,23 @@ mod layout;
 mod paint;
 mod state;
 mod theme;
+pub mod typography;
+pub mod vector;
 
 pub use draw::{Framebuffer, Rgba};
 pub use layout::{Hit, Layout, Rect, font_px, hit_test, layout_menu};
-pub use paint::{CardView, paint_diagnostics, paint_error, paint_menu, paint_splash};
+pub use paint::{
+    CardView, paint_diagnostics, paint_diagnostics_with, paint_error, paint_error_with, paint_menu,
+    paint_menu_with, paint_splash, paint_splash_with,
+};
 pub use state::{Focus, Input, MenuState, Outcome, Screen, step};
 pub use theme::Theme;
+pub use typography::{
+    ATKINSON_MONO_REGULAR, ATKINSON_NEXT_REGULAR, ATKINSON_NEXT_SEMIBOLD, BUNDLED_FONT_BYTES,
+    CacheStats, FaceSlot, FontLoadError, FontMode, LineMetrics, TextMetrics, TextRenderer,
+    TextRole, UiScale, role_pixel_size,
+};
+pub use vector::{
+    PathOp, VectorPath, draw_vector_emblem, draw_vector_lock, fill_ortho_polygon, fill_path,
+    fill_rounded_panel, fill_rounded_rect, ortho_outer_vertices, stroke_ortho_polygon,
+};

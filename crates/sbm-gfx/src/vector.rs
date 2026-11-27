@@ -1,0 +1,856 @@
+//! Unified `no_std` CPU vector rendering backend powered by `ab_glyph_rasterizer`.
+//!
+//! Serves typography outlines, rounded UI surfaces, irregular wrapped partition
+//! polygons (`ortho_polygon`), and resolution-independent vector emblems through
+//! a single analytical coverage rasterizer without extra full-screen pixmap
+//! allocations.
+
+use alloc::vec::Vec;
+
+use ab_glyph_rasterizer::{Point, Rasterizer};
+
+use crate::draw::{Framebuffer, Rgba};
+use crate::layout::Rect;
+
+/// Cubic Bézier handle ratio for a 90-degree circular arc: `4 * (sqrt(2) - 1) / 3`.
+const KAPPA: f32 = 0.552_284_8;
+
+/// Compact mathematical vector path command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathOp {
+    MoveTo(f32, f32),
+    LineTo(f32, f32),
+    QuadTo(f32, f32, f32, f32),
+    CubicTo(f32, f32, f32, f32, f32, f32),
+    Close,
+}
+
+/// Resolution-independent vector path composed of lines, quadratic Béziers,
+/// and cubic Béziers.
+#[derive(Clone, Debug, Default)]
+pub struct VectorPath {
+    ops: Vec<PathOp>,
+}
+
+impl VectorPath {
+    pub fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            ops: Vec::with_capacity(cap),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub fn ops(&self) -> &[PathOp] {
+        &self.ops
+    }
+
+    pub fn move_to(&mut self, x: f32, y: f32) -> &mut Self {
+        self.ops.push(PathOp::MoveTo(x, y));
+        self
+    }
+
+    pub fn line_to(&mut self, x: f32, y: f32) -> &mut Self {
+        self.ops.push(PathOp::LineTo(x, y));
+        self
+    }
+
+    pub fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) -> &mut Self {
+        self.ops.push(PathOp::QuadTo(cx, cy, x, y));
+        self
+    }
+
+    pub fn cubic_to(
+        &mut self,
+        c1x: f32,
+        c1y: f32,
+        c2x: f32,
+        c2y: f32,
+        x: f32,
+        y: f32,
+    ) -> &mut Self {
+        self.ops.push(PathOp::CubicTo(c1x, c1y, c2x, c2y, x, y));
+        self
+    }
+
+    pub fn close(&mut self) -> &mut Self {
+        self.ops.push(PathOp::Close);
+        self
+    }
+
+    /// Append a clockwise axis-aligned rectangle.
+    pub fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32) -> &mut Self {
+        if w <= 0.0 || h <= 0.0 {
+            return self;
+        }
+        self.move_to(x, y)
+            .line_to(x + w, y)
+            .line_to(x + w, y + h)
+            .line_to(x, y + h)
+            .close()
+    }
+
+    /// Append a clockwise rounded rectangle using smooth cubic corner arcs.
+    pub fn push_rounded_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) -> &mut Self {
+        if w <= 0.0 || h <= 0.0 {
+            return self;
+        }
+        let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+        if r <= 0.01 {
+            return self.push_rect(x, y, w, h);
+        }
+        let k = r * KAPPA;
+        let x1 = x + w;
+        let y1 = y + h;
+        self.move_to(x + r, y)
+            .line_to(x1 - r, y)
+            .cubic_to(x1 - r + k, y, x1, y + r - k, x1, y + r)
+            .line_to(x1, y1 - r)
+            .cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1)
+            .line_to(x + r, y1)
+            .cubic_to(x + r - k, y1, x, y1 - r + k, x, y1 - r)
+            .line_to(x, y + r)
+            .cubic_to(x, y + r - k, x + r - k, y, x + r, y)
+            .close()
+    }
+
+    /// Append a counter-clockwise rounded rectangle (subtractive winding hole).
+    pub fn push_rounded_rect_ccw(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+    ) -> &mut Self {
+        if w <= 0.0 || h <= 0.0 {
+            return self;
+        }
+        let r = radius.max(0.0).min(w * 0.5).min(h * 0.5);
+        let x1 = x + w;
+        let y1 = y + h;
+        if r <= 0.01 {
+            return self
+                .move_to(x, y)
+                .line_to(x, y1)
+                .line_to(x1, y1)
+                .line_to(x1, y)
+                .close();
+        }
+        let k = r * KAPPA;
+        self.move_to(x + r, y)
+            .cubic_to(x + r - k, y, x, y + r - k, x, y + r)
+            .line_to(x, y1 - r)
+            .cubic_to(x, y1 - r + k, x + r - k, y1, x + r, y1)
+            .line_to(x1 - r, y1)
+            .cubic_to(x1 - r + k, y1, x1, y1 - r + k, x1, y1 - r)
+            .line_to(x1, y + r)
+            .cubic_to(x1, y + r - k, x1 - r + k, y, x1 - r, y)
+            .close()
+    }
+
+    /// Append a clockwise circle using 4 cubic Bézier arcs.
+    pub fn push_circle(&mut self, cx: f32, cy: f32, r: f32) -> &mut Self {
+        if r <= 0.0 {
+            return self;
+        }
+        let k = r * KAPPA;
+        self.move_to(cx, cy - r)
+            .cubic_to(cx + k, cy - r, cx + r, cy - k, cx + r, cy)
+            .cubic_to(cx + r, cy + k, cx + k, cy + r, cx, cy + r)
+            .cubic_to(cx - k, cy + r, cx - r, cy + k, cx - r, cy)
+            .cubic_to(cx - r, cy - k, cx - k, cy - r, cx, cy - r)
+            .close()
+    }
+
+    /// Append a counter-clockwise circle (subtractive winding hole for rings).
+    pub fn push_circle_ccw(&mut self, cx: f32, cy: f32, r: f32) -> &mut Self {
+        if r <= 0.0 {
+            return self;
+        }
+        let k = r * KAPPA;
+        self.move_to(cx, cy - r)
+            .cubic_to(cx - k, cy - r, cx - r, cy - k, cx - r, cy)
+            .cubic_to(cx - r, cy + k, cx - k, cy + r, cx, cy + r)
+            .cubic_to(cx + k, cy + r, cx + r, cy + k, cx + r, cy)
+            .cubic_to(cx + r, cy - k, cx + k, cy - r, cx, cy - r)
+            .close()
+    }
+
+    /// Append an antialiased ring (outer CW circle + inner CCW hole).
+    pub fn push_ring(&mut self, cx: f32, cy: f32, outer_r: f32, thickness: f32) -> &mut Self {
+        if outer_r <= 0.0 || thickness <= 0.0 {
+            return self;
+        }
+        self.push_circle(cx, cy, outer_r);
+        let inner_r = outer_r - thickness;
+        if inner_r > 0.05 {
+            self.push_circle_ccw(cx, cy, inner_r);
+        }
+        self
+    }
+
+    /// Append an arbitrary closed polygon with optional quadratic corner rounding.
+    pub fn push_polygon(&mut self, verts: &[(f32, f32)], corner_radius: f32) -> &mut Self {
+        let n = verts.len();
+        if n < 3 {
+            return self;
+        }
+        if corner_radius <= 0.01 {
+            self.move_to(verts[0].0, verts[0].1);
+            for &(x, y) in &verts[1..] {
+                self.line_to(x, y);
+            }
+            return self.close();
+        }
+        for i in 0..n {
+            let prev = verts[(i + n - 1) % n];
+            let curr = verts[i];
+            let next = verts[(i + 1) % n];
+            let (d1x, d1y) = (prev.0 - curr.0, prev.1 - curr.1);
+            let (d2x, d2y) = (next.0 - curr.0, next.1 - curr.1);
+            let len1 = libm::hypotf(d1x, d1y);
+            let len2 = libm::hypotf(d2x, d2y);
+            let r = corner_radius.min(len1 * 0.45).min(len2 * 0.45);
+            if r <= 0.01 || len1 <= 0.01 || len2 <= 0.01 {
+                if i == 0 {
+                    self.move_to(curr.0, curr.1);
+                } else {
+                    self.line_to(curr.0, curr.1);
+                }
+            } else {
+                let p_in = (curr.0 + d1x * (r / len1), curr.1 + d1y * (r / len1));
+                let p_out = (curr.0 + d2x * (r / len2), curr.1 + d2y * (r / len2));
+                if i == 0 {
+                    self.move_to(p_in.0, p_in.1);
+                } else {
+                    self.line_to(p_in.0, p_in.1);
+                }
+                self.quad_to(curr.0, curr.1, p_out.0, p_out.1);
+            }
+        }
+        self.close()
+    }
+
+    /// Build a closed vector path for a rounded rectangle.
+    pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Self {
+        let mut path = Self::with_capacity(12);
+        path.push_rounded_rect(x, y, w, h, radius);
+        path
+    }
+
+    /// Build a closed vector path for an antialiased rounded border frame.
+    pub fn rounded_frame(x: f32, y: f32, w: f32, h: f32, radius: f32, thickness: f32) -> Self {
+        let mut path = Self::with_capacity(24);
+        path.push_rounded_rect(x, y, w, h, radius);
+        let t = thickness.max(0.0);
+        if w > t * 2.0 && h > t * 2.0 {
+            path.push_rounded_rect_ccw(
+                x + t,
+                y + t,
+                w - t * 2.0,
+                h - t * 2.0,
+                (radius - t).max(0.0),
+            );
+        }
+        path
+    }
+
+    /// Build a connected outer-perimeter vector path from top-to-bottom
+    /// rectilinear row segments (such as wrapped LBA partition polygons).
+    ///
+    /// Internal shared seams between adjacent segments are merged away.
+    pub fn ortho_polygon(segments: &[Rect], corner_radius: f32) -> Self {
+        let verts = ortho_outer_vertices(segments);
+        let mut path = Self::with_capacity(verts.len() * 2 + 2);
+        path.push_polygon(&verts, corner_radius);
+        path
+    }
+
+    /// Build an antialiased outer-perimeter border frame for a connected
+    /// rectilinear polygon (`segments`), omitting internal seams.
+    pub fn ortho_polygon_frame(segments: &[Rect], thickness: f32, corner_radius: f32) -> Self {
+        let outer = ortho_outer_vertices(segments);
+        if outer.len() < 4 || thickness <= 0.0 {
+            return Self::new();
+        }
+        let inner = inset_ortho_polygon(&outer, thickness);
+        let mut path = Self::with_capacity(outer.len() * 4 + 4);
+        path.push_polygon(&outer, corner_radius);
+        if let Some(mut inner_verts) = inner {
+            inner_verts.reverse();
+            path.push_polygon(&inner_verts, (corner_radius - thickness).max(0.0));
+        }
+        path
+    }
+
+    /// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` of control points.
+    pub fn control_bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        let mut push = |x: f32, y: f32| {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        };
+        for &op in &self.ops {
+            match op {
+                PathOp::MoveTo(x, y) | PathOp::LineTo(x, y) => push(x, y),
+                PathOp::QuadTo(cx, cy, x, y) => {
+                    push(cx, cy);
+                    push(x, y);
+                }
+                PathOp::CubicTo(c1x, c1y, c2x, c2y, x, y) => {
+                    push(c1x, c1y);
+                    push(c2x, c2y);
+                    push(x, y);
+                }
+                PathOp::Close => {}
+            }
+        }
+        if min_x.is_finite() && max_x >= min_x && max_y >= min_y {
+            Some((min_x, min_y, max_x, max_y))
+        } else {
+            None
+        }
+    }
+}
+
+/// Trace the exact clockwise outer perimeter of horizontally overlapping
+/// top-to-bottom rectilinear row segments, merging collinear edges.
+pub fn ortho_outer_vertices(segments: &[Rect]) -> Vec<(f32, f32)> {
+    let valid: Vec<Rect> = segments
+        .iter()
+        .copied()
+        .filter(|s| s.w > 0 && s.h > 0)
+        .collect();
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    let mut raw = Vec::with_capacity(valid.len() * 4);
+    // Right boundary top-to-bottom.
+    for s in &valid {
+        let x1 = s.x.saturating_add(s.w) as f32;
+        let y0 = s.y as f32;
+        let y1 = s.y.saturating_add(s.h) as f32;
+        raw.push((x1, y0));
+        raw.push((x1, y1));
+    }
+    // Left boundary bottom-to-top.
+    for s in valid.iter().rev() {
+        let x0 = s.x as f32;
+        let y0 = s.y as f32;
+        let y1 = s.y.saturating_add(s.h) as f32;
+        raw.push((x0, y1));
+        raw.push((x0, y0));
+    }
+    simplify_ortho_ring(raw)
+}
+
+fn simplify_ortho_ring(raw: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    let mut dedup: Vec<(f32, f32)> = Vec::with_capacity(raw.len());
+    for pt in raw {
+        if dedup
+            .last()
+            .is_none_or(|prev| (prev.0 - pt.0).abs() > 0.01 || (prev.1 - pt.1).abs() > 0.01)
+        {
+            dedup.push(pt);
+        }
+    }
+    if dedup.len() > 1 {
+        let first = dedup[0];
+        if let Some(&last) = dedup.last()
+            && (first.0 - last.0).abs() <= 0.01
+            && (first.1 - last.1).abs() <= 0.01
+        {
+            dedup.pop();
+        }
+    }
+    let mut changed = true;
+    while changed && dedup.len() >= 3 {
+        changed = false;
+        let n = dedup.len();
+        let mut next = Vec::with_capacity(n);
+        for i in 0..n {
+            let prev = dedup[(i + n - 1) % n];
+            let curr = dedup[i];
+            let after = dedup[(i + 1) % n];
+            let same_x = (prev.0 - curr.0).abs() <= 0.01 && (curr.0 - after.0).abs() <= 0.01;
+            let same_y = (prev.1 - curr.1).abs() <= 0.01 && (curr.1 - after.1).abs() <= 0.01;
+            if same_x || same_y {
+                changed = true;
+            } else {
+                next.push(curr);
+            }
+        }
+        dedup = next;
+    }
+    dedup
+}
+
+/// Compute exact inward offset of a clockwise orthogonal polygon by `t` pixels.
+fn inset_ortho_polygon(verts: &[(f32, f32)], t: f32) -> Option<Vec<(f32, f32)>> {
+    let n = verts.len();
+    if n < 4 {
+        return None;
+    }
+    // Reject inset if any edge is too short to sustain a non-self-intersecting inset.
+    for i in 0..n {
+        let a = verts[i];
+        let b = verts[(i + 1) % n];
+        if libm::hypotf(b.0 - a.0, b.1 - a.1) <= t * 2.0 + 0.5 {
+            return None;
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = verts[(i + n - 1) % n];
+        let curr = verts[i];
+        let next = verts[(i + 1) % n];
+        let (n1x, n1y) = ortho_inward_normal(prev, curr);
+        let (n2x, n2y) = ortho_inward_normal(curr, next);
+        out.push((curr.0 + (n1x + n2x) * t, curr.1 + (n1y + n2y) * t));
+    }
+    Some(out)
+}
+
+/// Inward unit normal for a clockwise axis-aligned edge in screen space (+y down).
+fn ortho_inward_normal(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    if dx.abs() >= dy.abs() {
+        if dx >= 0.0 { (0.0, 1.0) } else { (0.0, -1.0) }
+    } else if dy >= 0.0 {
+        (-1.0, 0.0)
+    } else {
+        (1.0, 0.0)
+    }
+}
+
+/// Rasterize and composite `path` directly onto `fb` using `ab_glyph_rasterizer`.
+///
+/// Allocates only the clipped local bounding box of `path`, never a full-screen buffer.
+pub fn fill_path(fb: &mut Framebuffer, path: &VectorPath, color: Rgba) {
+    let Some((min_x, min_y, max_x, max_y)) = path.control_bounds() else {
+        return;
+    };
+    let x0 = (libm::floorf(min_x) as i32).max(0);
+    let y0 = (libm::floorf(min_y) as i32).max(0);
+    let x1 = (libm::ceilf(max_x) as i32).min(fb.width as i32);
+    let y1 = (libm::ceilf(max_y) as i32).min(fb.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let w = (x1 - x0) as usize;
+    let h = (y1 - y0) as usize;
+    let ox = x0 as f32;
+    let oy = y0 as f32;
+
+    let mut raster = Rasterizer::new(w, h);
+    let mut start = Point { x: 0.0, y: 0.0 };
+    let mut cur = Point { x: 0.0, y: 0.0 };
+    let mut has_point = false;
+
+    for &op in &path.ops {
+        match op {
+            PathOp::MoveTo(x, y) => {
+                let p = Point {
+                    x: x - ox,
+                    y: y - oy,
+                };
+                start = p;
+                cur = p;
+                has_point = true;
+            }
+            PathOp::LineTo(x, y) => {
+                let p = Point {
+                    x: x - ox,
+                    y: y - oy,
+                };
+                if has_point {
+                    raster.draw_line(cur, p);
+                } else {
+                    start = p;
+                    has_point = true;
+                }
+                cur = p;
+            }
+            PathOp::QuadTo(cx, cy, x, y) => {
+                let c = Point {
+                    x: cx - ox,
+                    y: cy - oy,
+                };
+                let p = Point {
+                    x: x - ox,
+                    y: y - oy,
+                };
+                if has_point {
+                    raster.draw_quad(cur, c, p);
+                }
+                cur = p;
+            }
+            PathOp::CubicTo(c1x, c1y, c2x, c2y, x, y) => {
+                let c1 = Point {
+                    x: c1x - ox,
+                    y: c1y - oy,
+                };
+                let c2 = Point {
+                    x: c2x - ox,
+                    y: c2y - oy,
+                };
+                let p = Point {
+                    x: x - ox,
+                    y: y - oy,
+                };
+                if has_point {
+                    raster.draw_cubic(cur, c1, c2, p);
+                }
+                cur = p;
+            }
+            PathOp::Close => {
+                if has_point && (cur.x != start.x || cur.y != start.y) {
+                    raster.draw_line(cur, start);
+                }
+                cur = start;
+            }
+        }
+    }
+
+    let base_x = x0 as u32;
+    let base_y = y0 as u32;
+    raster.for_each_pixel_2d(|dx, dy, cov| {
+        let alpha = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        if alpha > 0 {
+            fb.blend_pixel(base_x + dx, base_y + dy, color, alpha);
+        }
+    });
+}
+
+/// Draw an antialiased filled rounded rectangle via the unified vector backend.
+pub fn fill_rounded_rect(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    color: Rgba,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let path = VectorPath::rounded_rect(x as f32, y as f32, w as f32, h as f32, radius as f32);
+    fill_path(fb, &path, color);
+}
+
+/// Draw an antialiased rounded panel with crisp border and interior fill.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_rounded_panel(
+    fb: &mut Framebuffer,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    thickness: u32,
+    fill: Rgba,
+    border: Rgba,
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let fill_path_geom =
+        VectorPath::rounded_rect(x as f32, y as f32, w as f32, h as f32, radius as f32);
+    fill_path(fb, &fill_path_geom, fill);
+    if thickness > 0 {
+        let frame = VectorPath::rounded_frame(
+            x as f32,
+            y as f32,
+            w as f32,
+            h as f32,
+            radius as f32,
+            thickness as f32,
+        );
+        fill_path(fb, &frame, border);
+    }
+}
+
+/// Fill a connected rectilinear partition polygon with smooth antialiased corners.
+pub fn fill_ortho_polygon(
+    fb: &mut Framebuffer,
+    segments: &[Rect],
+    corner_radius: f32,
+    color: Rgba,
+) {
+    let path = VectorPath::ortho_polygon(segments, corner_radius);
+    fill_path(fb, &path, color);
+}
+
+/// Stroke the merged outer perimeter of a connected rectilinear partition polygon.
+pub fn stroke_ortho_polygon(
+    fb: &mut Framebuffer,
+    segments: &[Rect],
+    thickness: f32,
+    corner_radius: f32,
+    color: Rgba,
+) {
+    let frame = VectorPath::ortho_polygon_frame(segments, thickness, corner_radius);
+    fill_path(fb, &frame, color);
+}
+
+/// Draw a resolution-independent antialiased vector OS / boot-target emblem.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_vector_emblem(
+    fb: &mut Framebuffer,
+    hint: &str,
+    title: &str,
+    x: u32,
+    y: u32,
+    size: u32,
+    badge_bg: Rgba,
+    fg: Rgba,
+) {
+    if size < 10 {
+        return;
+    }
+    let xf = x as f32;
+    let yf = y as f32;
+    let s = size as f32;
+    let r = (s * 0.24).max(3.0);
+    let bg = VectorPath::rounded_rect(xf, yf, s, s, r);
+    fill_path(fb, &bg, badge_bg);
+
+    let lower = title.to_ascii_lowercase();
+    let cx = xf + s * 0.5;
+    let cy = yf + s * 0.5;
+    let inset = s * 0.22;
+    let inner = s - inset * 2.0;
+
+    let mut glyph = VectorPath::new();
+    if hint == "windows" || lower.contains("windows") {
+        let gap = (inner * 0.14).max(1.5);
+        let pane = (inner - gap) * 0.5;
+        let pr = (pane * 0.12).max(0.8);
+        glyph
+            .push_rounded_rect(xf + inset, yf + inset, pane, pane, pr)
+            .push_rounded_rect(xf + inset + pane + gap, yf + inset, pane, pane, pr)
+            .push_rounded_rect(xf + inset, yf + inset + pane + gap, pane, pane, pr)
+            .push_rounded_rect(
+                xf + inset + pane + gap,
+                yf + inset + pane + gap,
+                pane,
+                pane,
+                pr,
+            );
+    } else if hint == "recovery" || lower.contains("sbm") || lower.contains("recovery") {
+        let arm = (inner * 0.30).max(2.0);
+        let cr = (arm * 0.25).max(1.0);
+        glyph
+            .push_rounded_rect(cx - arm * 0.5, yf + inset, arm, inner, cr)
+            .push_rounded_rect(xf + inset, cy - arm * 0.5, inner, arm, cr);
+    } else if lower.contains("ubuntu") {
+        let ring_r = inner * 0.36;
+        let stroke = (s * 0.10).max(1.8);
+        let dot_r = (s * 0.095).max(1.5);
+        glyph
+            .push_ring(cx, cy, ring_r, stroke)
+            .push_circle(cx - ring_r, cy, dot_r)
+            .push_circle(cx + ring_r * 0.5, cy - ring_r * 0.866, dot_r)
+            .push_circle(cx + ring_r * 0.5, cy + ring_r * 0.866, dot_r);
+    } else if lower.contains("arch") {
+        let top_y = yf + inset;
+        let bot_y = yf + s - inset;
+        let half_w = inner * 0.46;
+        let notch_w = inner * 0.16;
+        let notch_y = top_y + inner * 0.64;
+        glyph
+            .move_to(cx, top_y)
+            .line_to(cx + half_w, bot_y)
+            .line_to(cx + notch_w, bot_y)
+            .line_to(cx, notch_y)
+            .line_to(cx - notch_w, bot_y)
+            .line_to(cx - half_w, bot_y)
+            .close();
+    } else if lower.contains("fedora") {
+        let ring_r = inner * 0.44;
+        let stroke = (s * 0.10).max(1.8);
+        let bar = (s * 0.11).max(1.8);
+        glyph
+            .push_ring(cx, cy, ring_r, stroke)
+            .push_rounded_rect(
+                cx - bar * 0.5,
+                yf + inset + bar * 0.6,
+                bar,
+                inner - bar * 1.2,
+                bar * 0.3,
+            )
+            .push_rounded_rect(cx - bar * 1.2, cy - bar * 0.5, bar * 2.6, bar, bar * 0.3);
+    } else if lower.contains("debian") {
+        let r1 = inner * 0.46;
+        let r2 = inner * 0.25;
+        let stroke = (s * 0.095).max(1.6);
+        glyph.push_ring(cx, cy, r1, stroke).push_ring(
+            cx + s * 0.03,
+            cy - s * 0.03,
+            r2,
+            stroke * 0.85,
+        );
+    } else if hint == "usb" {
+        let bw = inner * 0.60;
+        let bh = inner * 0.54;
+        let bx = cx - bw * 0.5;
+        let by = yf + s - inset - bh;
+        let pw = bw * 0.64;
+        let ph = inner - bh;
+        let px = cx - pw * 0.5;
+        glyph
+            .push_rounded_rect(bx, by, bw, bh, (s * 0.07).max(1.0))
+            .push_rect(px, yf + inset, pw, ph);
+        fill_path(fb, &glyph, fg);
+        // Subtractive pin holes in badge background color.
+        let mut pins = VectorPath::new();
+        let pin_w = (pw * 0.22).max(1.5);
+        let pin_h = (ph * 0.50).max(1.5);
+        pins.push_rect(px + pw * 0.16, yf + inset + ph * 0.25, pin_w, pin_h)
+            .push_rect(px + pw * 0.62, yf + inset + ph * 0.25, pin_w, pin_h);
+        fill_path(fb, &pins, badge_bg);
+        return;
+    } else {
+        // Generic Linux / systemd / GRUB terminal prompt `>_`.
+        let stroke = (s * 0.10).max(1.8);
+        let left = xf + inset;
+        let mid_x = cx - s * 0.02;
+        let top = cy - inner * 0.30;
+        let bot = cy + inner * 0.30;
+        glyph
+            .move_to(left, top)
+            .line_to(mid_x, cy)
+            .line_to(left, bot)
+            .line_to(left, bot - stroke)
+            .line_to(mid_x - stroke, cy)
+            .line_to(left, top + stroke)
+            .close()
+            .push_rounded_rect(
+                mid_x + stroke * 0.5,
+                bot - stroke,
+                inner * 0.44,
+                stroke,
+                stroke * 0.35,
+            );
+    }
+    fill_path(fb, &glyph, fg);
+}
+
+/// Draw a resolution-independent padlock icon (BitLocker / LUKS).
+pub fn draw_vector_lock(fb: &mut Framebuffer, x: u32, y: u32, size: u32, color: Rgba) {
+    let s = (size.max(10)) as f32;
+    let xf = x as f32;
+    let yf = y as f32;
+    let body_w = s * 0.74;
+    let body_h = s * 0.52;
+    let bx = xf + (s - body_w) * 0.5;
+    let by = yf + s - body_h;
+    let mut path = VectorPath::new();
+    path.push_rounded_rect(bx, by, body_w, body_h, (s * 0.12).max(1.5));
+    let shackle_r = body_w * 0.34;
+    let stroke = (s * 0.14).max(1.5);
+    path.push_ring(xf + s * 0.5, by + stroke * 0.2, shackle_r, stroke);
+    fill_path(fb, &path, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rounded_panel_has_antialiased_edge_pixels() {
+        let mut fb = Framebuffer::new(80, 50);
+        let bg = Rgba::rgb(0x10, 0x14, 0x1A);
+        let fill = Rgba::rgb(0x1C, 0x23, 0x30);
+        let border = Rgba::rgb(0x4C, 0x8D, 0xFF);
+        fb.fill(bg);
+        fill_rounded_panel(&mut fb, 8, 8, 64, 34, 10, 2, fill, border);
+        assert_eq!(fb.pixel(40, 25), Some(fill));
+        // Antialiased pixels exist that are neither pure bg, pure fill, nor pure border.
+        let blended = fb
+            .px
+            .iter()
+            .filter(|&&p| p != bg.0 && p != fill.0 && p != border.0)
+            .count();
+        assert!(
+            blended > 10,
+            "expected antialiased edge pixels, got {blended}"
+        );
+    }
+
+    #[test]
+    fn ortho_polygon_traces_l_shape_and_cancels_internal_seam() {
+        let segs = [
+            Rect {
+                x: 10,
+                y: 10,
+                w: 80,
+                h: 30,
+            },
+            Rect {
+                x: 10,
+                y: 40,
+                w: 50,
+                h: 30,
+            },
+        ];
+        let verts = ortho_outer_vertices(&segs);
+        // L-shape has exactly 6 vertices.
+        assert_eq!(verts.len(), 6, "verts={verts:?}");
+
+        let mut fb = Framebuffer::new(110, 90);
+        let bg = Rgba::rgb(0x10, 0x14, 0x1A);
+        let fill = Rgba::rgb(0x20, 0x30, 0x40);
+        let border = Rgba::rgb(0xFF, 0xCC, 0x00);
+        fb.fill(bg);
+        fill_ortho_polygon(&mut fb, &segs, 4.0, fill);
+        stroke_ortho_polygon(&mut fb, &segs, 2.0, 4.0, border);
+
+        // Interior across the merged horizontal seam at (30, 39..=40) must stay `fill`.
+        assert_eq!(fb.pixel(30, 39), Some(fill));
+        assert_eq!(fb.pixel(30, 40), Some(fill));
+        // Exposed overhang bottom edge at (75, 39) must be `border`.
+        assert_eq!(fb.pixel(75, 39), Some(border));
+        // Cutout region at (80, 55) must stay `bg`.
+        assert_eq!(fb.pixel(80, 55), Some(bg));
+    }
+
+    #[test]
+    fn vector_emblems_render_distinct_ink() {
+        for (hint, title) in [
+            ("windows", "Windows"),
+            ("linux", "Fedora Linux"),
+            ("linux", "Ubuntu"),
+            ("linux", "Arch Linux"),
+            ("linux", "Debian"),
+            ("recovery", "SBM Core"),
+            ("usb", "USB Drive"),
+            ("grub", "GRUB"),
+        ] {
+            let mut fb = Framebuffer::new(48, 48);
+            let bg = Rgba::rgb(0x10, 0x14, 0x1A);
+            let accent = Rgba::rgb(0x4C, 0x8D, 0xFF);
+            let fg = Rgba::rgb(0xFF, 0xFF, 0xFF);
+            fb.fill(bg);
+            draw_vector_emblem(&mut fb, hint, title, 4, 4, 40, accent, fg);
+            assert!(
+                fb.px.contains(&fg.0),
+                "emblem {hint}/{title} had no foreground ink"
+            );
+        }
+    }
+}

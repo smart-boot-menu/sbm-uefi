@@ -352,3 +352,50 @@ fn headless_sizes_all_renders_every_display_preset() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn headless_typography_modes_contrast_and_scale_render_distinct_outputs() {
+    let bin = env!("CARGO_BIN_EXE_sbm-preview");
+    let dir = std::env::temp_dir().join(format!("sbm-preview-typo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let output = std::process::Command::new(bin)
+        .args([
+            "--headless",
+            "--scenario",
+            "multi-disk",
+            "--screen",
+            "menu",
+            "--theme",
+            "dark",
+            "--font",
+            "all",
+            "--contrast",
+            "both",
+            "--scale",
+            "125",
+            "--size",
+            "1280x800",
+            "--out",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bitmap = std::fs::read(dir.join("uefi-multi-disk-menu-dark-bitmap-s125.png")).unwrap();
+    let next = std::fs::read(dir.join("uefi-multi-disk-menu-dark-next-s125.png")).unwrap();
+    let next_mono =
+        std::fs::read(dir.join("uefi-multi-disk-menu-dark-next-mono-s125.png")).unwrap();
+    let hc = std::fs::read(dir.join("uefi-multi-disk-menu-dark-hc-next-mono-s125.png")).unwrap();
+
+    assert_ne!(bitmap, next);
+    assert_ne!(next, next_mono);
+    assert_ne!(next_mono, hc);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
