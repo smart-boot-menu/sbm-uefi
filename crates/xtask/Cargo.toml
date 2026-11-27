@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Build, patch, and QEMU-test Smart Boot Menu"
+description = "Build, patch, preview, and QEMU-test Smart Boot Menu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,5 +15,6 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 sbm-boot = { path = "../sbm-boot" }
+sbm-gfx = { path = "../sbm-gfx" }
 sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }

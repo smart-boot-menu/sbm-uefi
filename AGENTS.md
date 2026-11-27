@@ -23,7 +23,7 @@ Do NOT implement Linux disk/OS installation logic (`sbm-core`), Apple `m1n1` boo
 
 0.1 is the graphical menu, discovery, chainload, and the fail-closed remote decision function. It does not open SNP. Read [HANDOFF.md](HANDOFF.md) before changing the recovery JSON or the QEMU disk. Guest times from the 2026-11-26 run are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
-Host checks: `cargo fmt --all`, `cargo clippy -p sbm-boot -p sbm-gfx -p xtask --all-targets -- -D warnings`, `cargo test`. UEFI checks are `cargo clippy` and `cargo build` for `sbm-app` and `sbm-fixture` with `--release` on both UEFI targets. Do not set `profile.dev` `panic = "abort"`.
+Host checks (Level 0, < 1 s): `cargo fmt --all`, `cargo clippy -p sbm-boot -p sbm-gfx -p xtask --all-targets -- -D warnings`, `cargo test`, and `cargo run -p xtask -- preview` for rapid native `sbm-gfx` software-renderer previews (mock only, not firmware qualification). Local EFI smoke checks (Level 1) default to native architecture: `cargo run -p xtask -- build native` and `cargo run -p xtask -- qemu native` (use `all` for both architectures). Release UEFI checks are `cargo clippy` and `cargo build` for `sbm-app` and `sbm-fixture` with `--release` on both UEFI targets. Do not set `profile.dev` `panic = "abort"`.
 
 ## Engineering & Performance Targets
 

@@ -1,6 +1,7 @@
 mod esp;
 mod parse;
 mod pe;
+mod preview;
 mod qemu;
 
 use std::env;
@@ -10,6 +11,7 @@ use std::process::Command;
 
 use crate::esp::assemble;
 use crate::pe::set_nx_compat;
+use crate::preview::{parse_preview_args, run_preview};
 use crate::qemu::{AARCH64, Guest, X86_64};
 
 fn main() {
@@ -20,46 +22,83 @@ fn main() {
     }
 }
 
+fn native_guest() -> &'static Guest {
+    if cfg!(target_arch = "aarch64") {
+        &AARCH64
+    } else {
+        &X86_64
+    }
+}
+
+fn resolve_guests(spec: Option<&str>) -> Result<Vec<&'static Guest>, String> {
+    match spec {
+        None | Some("native") => Ok(vec![native_guest()]),
+        Some("all") | Some("both") => Ok(vec![&AARCH64, &X86_64]),
+        Some("aarch64") | Some("arm64") => Ok(vec![&AARCH64]),
+        Some("x86_64") | Some("x86-64") | Some("amd64") => Ok(vec![&X86_64]),
+        Some(other) => Err(format!(
+            "unknown architecture {other} (expected native|aarch64|x86_64|all)"
+        )),
+    }
+}
+
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        None | Some("all") => {
-            build()?;
-            qemu_one(&AARCH64)?;
-            qemu_one(&X86_64)?;
+        None => {
+            // Fast default: build and smoke-test native architecture only.
+            let guest = native_guest();
+            build_guests(&[guest])?;
+            qemu_one(guest, false)?;
         }
-        Some("build") => build()?,
-        Some("qemu") => match args.next().as_deref() {
-            None => {
-                qemu_one(&AARCH64)?;
-                qemu_one(&X86_64)?;
+        Some("all") => {
+            let guests = vec![&AARCH64, &X86_64];
+            build_guests(&guests)?;
+            for guest in guests {
+                qemu_one(guest, false)?;
             }
-            Some("aarch64") => qemu_one(&AARCH64)?,
-            Some("x86_64") => qemu_one(&X86_64)?,
-            Some(other) => return Err(format!("unknown architecture {other}")),
-        },
-        Some(other) => return Err(format!("unknown command {other}")),
+        }
+        Some("build") => {
+            let spec = args.next();
+            let guests = resolve_guests(spec.as_deref())?;
+            build_guests(&guests)?;
+        }
+        Some("qemu") => {
+            let spec = args.next();
+            let guests = resolve_guests(spec.as_deref())?;
+            build_guests(&guests)?;
+            for guest in guests {
+                qemu_one(guest, false)?;
+            }
+        }
+        Some("preview") => {
+            let opts = parse_preview_args(args)?;
+            run_preview(&workspace(), &opts)?;
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown command {other} (expected build|qemu|preview|all)"
+            ));
+        }
     }
     Ok(())
 }
 
-fn build() -> Result<(), String> {
+fn build_guests(guests: &[&Guest]) -> Result<(), String> {
     let root = workspace();
-    for guest in [&AARCH64, &X86_64] {
-        let status = Command::new(cargo())
-            .current_dir(&root)
-            .args([
-                "build",
-                "--release",
-                "--target",
-                guest.triple,
-                "-p",
-                "sbm-app",
-                "-p",
-                "sbm-fixture",
-            ])
-            .status()
-            .map_err(|err| format!("cargo: {err}"))?;
+    for guest in guests {
+        let mut cmd = Command::new(cargo());
+        cmd.current_dir(&root).args([
+            "build",
+            "--release",
+            "--target",
+            guest.triple,
+            "-p",
+            "sbm-app",
+            "-p",
+            "sbm-fixture",
+        ]);
+        let status = cmd.status().map_err(|err| format!("cargo: {err}"))?;
         if !status.success() {
             return Err(format!("release build failed for {}", guest.triple));
         }
@@ -95,9 +134,11 @@ fn build() -> Result<(), String> {
     Ok(())
 }
 
-fn qemu_one(guest: &Guest) -> Result<(), String> {
+fn qemu_one(guest: &Guest, rebuild: bool) -> Result<(), String> {
     let root = workspace();
-    build()?;
+    if rebuild {
+        build_guests(&[guest])?;
+    }
     let menu = fs::read(
         root.join("artifacts")
             .join(format!("sbm-{}.efi", guest.name)),
