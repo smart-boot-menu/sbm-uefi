@@ -56,8 +56,44 @@ jobs:
           cp "sbm-lab/var/runs/$run/result.json" build/kvm-smoke-result.json
           jq -e '.accel == "kvm" and any(.markers[]; startswith("fixture_recovery_valid esp="))' \
             build/kvm-smoke-result.json
+      - name: Reject an untrusted recovery image under Secure Boot
+        if: steps.kvm.outputs.available == 'true'
+        env:
+          SBM_LAB_ARTIFACTS: ${{ github.workspace }}/build/signed-menu
+        run: |
+          sudo apt-get install -y osslsigncode python3-pip python3-venv libcrypt-dev
+          lab="$GITHUB_WORKSPACE/sbm-lab"
+          cargo build --manifest-path "$lab/fixtures/efi-probe/Cargo.toml" --release \
+            --target x86_64-unknown-uefi
+          "$lab/target/release/sbm-lab" --root "$lab" setup --secure-boot
+          mkdir -p "$SBM_LAB_ARTIFACTS"
+          cp artifacts/sbm-fixture-x86_64.efi "$SBM_LAB_ARTIFACTS/"
+          osslsigncode sign -certs "$lab/var/secure-boot/DB.pem" -key "$lab/var/secure-boot/DB.key" \
+            -h sha256 -in artifacts/sbm-x86_64.efi -out "$SBM_LAB_ARTIFACTS/sbm-x86_64.efi"
+          sed 's/^id = .*/id = "secure-recovery-picker"/' "$lab/profiles/x86_64-secure-enrolled.toml" \
+            > "$lab/profiles/secure-recovery-picker.toml"
+          echo 'boot = "sbm-menu"' >> "$lab/profiles/secure-recovery-picker.toml"
+          cat > "$lab/scenarios/secure-recovery-picker.toml" <<'EOF'
+          [[scenario]]
+          id = "secure-recovery-picker"
+          tier = "secure"
+          profile = "secure-recovery-picker"
+          send_key = "c"
+          send_key_after = "menu_ready"
+          stop_on_expect = true
+          expect = ["menu_ready", "verify_done", "load_failed"]
+          forbid_markers = ["fixture_started", "chainload method=", "chainload_returned"]
+          EOF
+          "$lab/target/release/sbm-lab" --root "$lab" --json test \
+            --id secure-recovery-picker > build/kvm-secure-summary.json
+          run="$(jq -er '.[0] | select(.success) | .run' build/kvm-secure-summary.json)"
+          cp "$lab/var/runs/$run/result.json" build/kvm-secure-result.json
+          jq -e '.accel == "kvm"
+            and any(.markers[]; startswith("verify_done ") and endswith("result=ok"))
+            and any(.markers[]; test("^load_failed status=(SECURITY_VIOLATION|ACCESS_DENIED)$"))' \
+            build/kvm-secure-result.json
       - uses: actions/upload-artifact@v4
         if: always() && steps.kvm.outputs.available == 'true'
         with:
           name: x86-64-kvm-smoke
-          path: build/kvm-smoke-*.json
+          path: build/kvm-*.json
