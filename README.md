@@ -29,6 +29,7 @@ cargo run -p xtask -- qemu x86_64
 ```
 cargo xtask sim --scenario dual-boot      # real menu code in a desktop window; Manage Computer opens real sbm-ui
 cargo xtask preview --all-scenarios       # headless screenshots
+cargo xtask preview --scenario dual-boot --theme both --sizes 800x600,1280x800,1920x1080
 ```
 
 The simulator runs the production `sbm-boot`, `sbm-gfx` and `sbm-menu` code against scenario files in `sim/scenarios/`. It never touches host disks, NVRAM or boot settings, and it is not part of `sbm-app`. See [sim/README.md](sim/README.md).

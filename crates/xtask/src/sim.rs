@@ -20,8 +20,8 @@ Native SBM development (SIMULATED; never touches host disks or NVRAM)
       --release                    optimized build
   cargo xtask preview [OPTIONS]    headless PNG screenshots into build/preview
       --scenario NAME | --all-scenarios   --screen menu|splash|diagnostics|error|all
-      --theme dark|light  --width N --height N  --keys Right,Enter,wait:500  --selected N
-      --out FILE|DIR  --open
+      --theme dark|light|both  --size WxH | --sizes 800x600,1280x800,1920x1080|all
+      --width N --height N  --keys Right,Enter,wait:500  --selected N  --out FILE|DIR  --open
   cargo xtask core [OPTIONS]       native Core (real sbm-ui) for a scenario, without the menu
       --scenario NAME
   cargo xtask core build           build sbm-sim and sbm-ui --features native-sim

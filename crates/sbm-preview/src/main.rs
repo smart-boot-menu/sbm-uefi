@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use sbm_preview::scenario::{self, Scenario};
 use sbm_preview::{
-    Session, core, load_session, parse_resolution, parse_script, render, run_script, write_image,
+    DISPLAY_PRESETS, Session, core, load_session, parse_resolution, parse_script, render,
+    run_script, write_image,
 };
 
 #[cfg(feature = "window")]
@@ -15,15 +16,18 @@ sbm-preview: native Smart Boot Menu UEFI preview against a simulated computer
 
   sbm-preview [--scenario NAME|PATH] [--theme dark|light] [--display window|WxH]
   sbm-preview --headless [--scenario NAME] [--screen menu|splash|diagnostics|error|all]
-              [--keys Right,Enter,wait:1000] [--size 1280x800] [--out FILE.png|DIR]
+              [--theme dark|light|both] [--keys Right,Enter,wait:1000]
+              [--size 1280x800 | --sizes 800x600,1280x800,1920x1080|all] [--out FILE.png|DIR]
   sbm-preview --list
   sbm-preview --materialize DIR [--scenario NAME]
 
 Options
   --scenario      scenario name from sim/scenarios or a TOML path (default dual-boot)
   --all-scenarios headless: render every scenario
+  --theme         dark, light, or both (headless comparison)
   --display       window follows the window size; WxH renders a fixed virtual display
   --size          window or headless size (default 1280x800)
+  --sizes         headless: comma-separated WxH list or `all` (display presets)
   --core-bin DIR  directory holding sbm-sim and sbm-ui (default ../sbm-core/target/debug)
   --exit-after-ms quit the window after N ms (measurements)
 
@@ -34,8 +38,10 @@ pub struct Options {
     pub scenario: String,
     pub all_scenarios: bool,
     pub dark: bool,
+    pub both_themes: bool,
     pub fixed: Option<(u32, u32)>,
     pub size: (u32, u32),
+    pub sizes: Vec<(u32, u32)>,
     pub headless: bool,
     pub screen: String,
     pub keys: String,
@@ -51,8 +57,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         scenario: "dual-boot".into(),
         all_scenarios: false,
         dark: true,
+        both_themes: false,
         fixed: None,
         size: (1280, 800),
+        sizes: Vec::new(),
         headless: false,
         screen: "menu".into(),
         keys: String::new(),
@@ -68,13 +76,18 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
         match arg.as_str() {
             "--scenario" => opts.scenario = value()?,
             "--all-scenarios" => opts.all_scenarios = true,
-            "--theme" => {
-                opts.dark = match value()?.as_str() {
-                    "dark" => true,
-                    "light" => false,
-                    other => return Err(format!("unknown theme {other:?} (dark|light)")),
+            "--theme" => match value()?.as_str() {
+                "dark" => {
+                    opts.dark = true;
+                    opts.both_themes = false;
                 }
-            }
+                "light" => {
+                    opts.dark = false;
+                    opts.both_themes = false;
+                }
+                "both" => opts.both_themes = true,
+                other => return Err(format!("unknown theme {other:?} (dark|light|both)")),
+            },
             "--display" => {
                 let v = value()?;
                 opts.fixed = if v == "window" {
@@ -84,6 +97,22 @@ fn parse(args: Vec<String>) -> Result<Option<Options>, String> {
                 };
             }
             "--size" | "--resolution" => opts.size = parse_resolution(&value()?)?,
+            "--sizes" => {
+                let v = value()?;
+                if v == "all" {
+                    opts.sizes = DISPLAY_PRESETS.to_vec();
+                } else {
+                    opts.sizes = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(parse_resolution)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if opts.sizes.is_empty() {
+                        return Err("--sizes requires at least one WxH resolution".into());
+                    }
+                }
+            }
             "--width" => opts.size.0 = value()?.parse().map_err(|_| "invalid --width")?,
             "--height" => opts.size.1 = value()?.parse().map_err(|_| "invalid --height")?,
             "--headless" => opts.headless = true,
@@ -156,48 +185,60 @@ fn headless(opts: &Options) -> Result<(), String> {
     } else {
         vec![opts.screen.as_str()]
     };
-    let themes: Vec<bool> = if opts.screen == "all" {
+    let themes: Vec<bool> = if opts.both_themes || opts.screen == "all" {
         vec![true, false]
     } else {
         vec![opts.dark]
     };
-    let single = names.len() == 1 && screens.len() == 1 && themes.len() == 1;
-    let (width, height) = opts.size;
-    for name in &names {
-        for screen in &screens {
-            for dark in &themes {
-                let started = Instant::now();
-                let Some(session) = scripted(name, *dark, screen, &opts.keys, width, height)?
-                else {
-                    println!("skip {name} {screen}: this scenario has no such state");
-                    continue;
-                };
-                let mut fb = sbm_gfx::Framebuffer::new(width, height);
-                if *screen == "splash" {
-                    session.render_splash(&mut fb);
-                } else {
-                    fb = render(&session, width, height);
-                }
-                let theme = if *dark { "dark" } else { "light" };
-                let path = match (&opts.out, single) {
-                    (Some(path), true) if path.extension().is_some() => path.clone(),
-                    (Some(dir), _) => dir.join(format!("uefi-{name}-{screen}-{theme}.png")),
-                    (None, _) => out_dir().join(format!("uefi-{name}-{screen}-{theme}.png")),
-                };
-                let bytes = write_image(&path, &fb)?;
-                println!(
-                    "SIMULATED preview {} ({}x{}, {} bytes, {} screen, {:.1} ms)",
-                    path.display(),
-                    width,
-                    height,
-                    bytes,
+    let sizes: Vec<(u32, u32)> = if opts.sizes.is_empty() {
+        vec![opts.size]
+    } else {
+        opts.sizes.clone()
+    };
+    let multi_size = sizes.len() > 1;
+    let single = names.len() == 1 && screens.len() == 1 && themes.len() == 1 && !multi_size;
+    for &(width, height) in &sizes {
+        for name in &names {
+            for screen in &screens {
+                for dark in &themes {
+                    let started = Instant::now();
+                    let Some(session) = scripted(name, *dark, screen, &opts.keys, width, height)?
+                    else {
+                        println!("skip {name} {screen}: this scenario has no such state");
+                        continue;
+                    };
+                    let mut fb = sbm_gfx::Framebuffer::new(width, height);
                     if *screen == "splash" {
-                        "splash"
+                        session.render_splash(&mut fb);
                     } else {
-                        session.screen_name()
-                    },
-                    started.elapsed().as_secs_f64() * 1000.0
-                );
+                        fb = render(&session, width, height);
+                    }
+                    let theme = if *dark { "dark" } else { "light" };
+                    let filename = if multi_size {
+                        format!("uefi-{name}-{screen}-{theme}-{width}x{height}.png")
+                    } else {
+                        format!("uefi-{name}-{screen}-{theme}.png")
+                    };
+                    let path = match (&opts.out, single) {
+                        (Some(path), true) if path.extension().is_some() => path.clone(),
+                        (Some(dir), _) => dir.join(&filename),
+                        (None, _) => out_dir().join(&filename),
+                    };
+                    let bytes = write_image(&path, &fb)?;
+                    println!(
+                        "SIMULATED preview {} ({}x{}, {} bytes, {} screen, {:.1} ms)",
+                        path.display(),
+                        width,
+                        height,
+                        bytes,
+                        if *screen == "splash" {
+                            "splash"
+                        } else {
+                            session.screen_name()
+                        },
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
         }
     }

@@ -233,3 +233,122 @@ fn materialized_lsblk_matches_scenario_layout() {
         assert_eq!(disk["rm"].as_bool().unwrap(), want.removable);
     }
 }
+
+fn png_dimensions(path: &std::path::Path) -> (u32, u32) {
+    let file = std::fs::File::open(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let reader = decoder.read_info().unwrap();
+    let info = reader.info();
+    (info.width, info.height)
+}
+
+#[test]
+fn headless_captures_theme_pairs_and_multiple_resolutions() {
+    let bin = env!("CARGO_BIN_EXE_sbm-preview");
+    let dir = std::env::temp_dir().join(format!("sbm-preview-matrix-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let output = std::process::Command::new(bin)
+        .args([
+            "--headless",
+            "--scenario",
+            "dual-boot",
+            "--screen",
+            "menu",
+            "--theme",
+            "both",
+            "--sizes",
+            "800x600,1280x800",
+            "--out",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (w, h) in [(800, 600), (1280, 800)] {
+        let dark = dir.join(format!("uefi-dual-boot-menu-dark-{w}x{h}.png"));
+        let light = dir.join(format!("uefi-dual-boot-menu-light-{w}x{h}.png"));
+        assert_eq!(png_dimensions(&dark), (w, h));
+        assert_eq!(png_dimensions(&light), (w, h));
+        assert_ne!(
+            std::fs::read(&dark).unwrap(),
+            std::fs::read(&light).unwrap()
+        );
+    }
+
+    // Single-size theme-pair keeps the unsuffixed filename format.
+    let pair_dir = dir.join("single-size");
+    let output = std::process::Command::new(bin)
+        .args([
+            "--headless",
+            "--scenario",
+            "windows-only",
+            "--theme",
+            "both",
+            "--size",
+            "1024x768",
+            "--out",
+        ])
+        .arg(&pair_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        png_dimensions(&pair_dir.join("uefi-windows-only-menu-dark.png")),
+        (1024, 768)
+    );
+    assert_eq!(
+        png_dimensions(&pair_dir.join("uefi-windows-only-menu-light.png")),
+        (1024, 768)
+    );
+
+    // Invalid --sizes and --theme are rejected.
+    for bad in [
+        &["--headless", "--sizes", "not-a-size"][..],
+        &["--headless", "--theme", "sepia"][..],
+    ] {
+        let status = std::process::Command::new(bin).args(bad).status().unwrap();
+        assert!(!status.success(), "expected failure for {bad:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn headless_sizes_all_renders_every_display_preset() {
+    let bin = env!("CARGO_BIN_EXE_sbm-preview");
+    let dir = std::env::temp_dir().join(format!("sbm-preview-presets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let output = std::process::Command::new(bin)
+        .args([
+            "--headless",
+            "--scenario",
+            "empty-uefi",
+            "--theme",
+            "dark",
+            "--sizes",
+            "all",
+            "--out",
+        ])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for &(w, h) in sbm_preview::DISPLAY_PRESETS {
+        let path = dir.join(format!("uefi-empty-uefi-menu-dark-{w}x{h}.png"));
+        assert_eq!(png_dimensions(&path), (w, h));
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

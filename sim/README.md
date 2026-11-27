@@ -20,6 +20,8 @@ cargo xtask sim --list                           # scenarios
 cargo xtask sim --watch                          # relaunch on save (needs watchexec)
 cargo xtask core --scenario bitlocker            # SBM Core only (real sbm-ui)
 cargo xtask preview --all-scenarios --screen all # headless PNGs in build/preview/
+cargo xtask preview --scenario dual-boot --theme both --sizes 800x600,1280x800,1920x1080
+cargo xtask preview --scenario multi-disk --theme both --sizes all   # all display presets
 cargo xtask preview --scenario corrupt-boot --keys Right,Enter --out shot.png
 ```
 
