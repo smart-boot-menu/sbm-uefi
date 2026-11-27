@@ -1,0 +1,64 @@
+name = "BitLocker-protected Windows"
+summary = "Windows 11 with BitLocker device encryption and Secure Boot; Core must treat the volume as protected"
+arch = "x86_64"
+
+[firmware]
+vendor = "Microsoft Surface (UEFI)"
+secure_boot = "enabled"
+ram_mib = 16384
+tpm = true
+
+[hardware]
+hostname = "sim-bitlocker"
+vendor = "Microsoft Corporation"
+product = "Surface Laptop 7 (Intel)"
+cpu = "Intel(R) Core(TM) Ultra 5 236V"
+cores = 8
+gpus = ["Intel Arc 130V (xe)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.1.90/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "Samsung MZ9L4512HBLU 512GB"
+size = "512GB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "260MiB"
+  free = "170MiB"
+  loaders = ["windows"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  bitlocker = true
+  size = "470GiB"
+
+  [[disk.partition]]
+  name = "Windows recovery"
+  kind = "windows_recovery"
+  size = "1GiB"
+
+[[disk]]
+name = "sda"
+model = "SanDisk Ultra Flair"
+size = "32GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "SBM"
+  kind = "esp"
+  size = "2GiB"
+  loaders = ["sbm-media"]

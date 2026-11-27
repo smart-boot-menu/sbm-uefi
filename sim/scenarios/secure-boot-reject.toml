@@ -1,0 +1,51 @@
+name = "Secure Boot rejection"
+summary = "Secure Boot is enabled and the firmware refuses Arch Linux's unsigned kernel; Windows is signed"
+arch = "x86_64"
+
+[firmware]
+vendor = "Gigabyte (EDK II)"
+secure_boot = "enabled"
+ram_mib = 32768
+tpm = true
+
+[hardware]
+hostname = "sim-secure-boot"
+vendor = "Gigabyte Technology Co., Ltd."
+product = "B760 AORUS ELITE AX (desktop)"
+cpu = "Intel(R) Core(TM) i7-14700K"
+cores = 20
+gpus = ["Intel UHD Graphics 770 (i915)"]
+
+[[nic]]
+name = "enp4s0"
+addresses = ["10.1.1.8/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "Samsung SSD 990 EVO Plus 2TB"
+size = "2TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "1GiB"
+  free = "520MiB"
+  loaders = ["windows", "arch", "sbm"]
+  rejected = ["arch"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  size = "1000GiB"
+
+  [[disk.partition]]
+  name = "arch-root"
+  kind = "linux"
+  fs = "btrfs"
+  size = "800GiB"

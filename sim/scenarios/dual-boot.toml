@@ -1,0 +1,67 @@
+name = "Windows and Linux dual boot"
+summary = "Windows 11 and Ubuntu share one NVMe ESP; SBM installed with an 8 s default countdown"
+arch = "x86_64"
+
+[firmware]
+vendor = "Lenovo (EDK II)"
+secure_boot = "enabled"
+ram_mib = 32768
+tpm = true
+network = true
+
+[policy]
+timeout_seconds = 8
+default = "windows"
+
+[hardware]
+hostname = "sim-dual-boot"
+vendor = "LENOVO"
+product = "ThinkPad X1 Carbon Gen 13"
+cpu = "Intel(R) Core(TM) Ultra 7 268V"
+cores = 8
+gpus = ["Intel Arc 140V (xe)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.1.42/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "Samsung SSD 990 PRO 2TB"
+size = "2TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "512MiB"
+  free = "318MiB"
+  loaders = ["windows", "ubuntu", "sbm"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  label = "Windows"
+  size = "1000GiB"
+
+  [[disk.partition]]
+  name = "Windows recovery"
+  kind = "windows_recovery"
+  size = "1GiB"
+
+  [[disk.partition]]
+  name = "ubuntu-root"
+  kind = "linux"
+  label = "ubuntu"
+  size = "800GiB"
+
+  [[disk.partition]]
+  name = "swap"
+  kind = "swap"
+  size = "16GiB"

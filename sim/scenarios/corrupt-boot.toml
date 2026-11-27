@@ -1,0 +1,51 @@
+name = "Corrupted boot files"
+summary = "Ubuntu's shim is damaged and SBM Core slot A fails its hash check; slot B still works"
+arch = "x86_64"
+
+[firmware]
+vendor = "Framework (EDK II)"
+secure_boot = "disabled"
+ram_mib = 32768
+tpm = true
+
+[hardware]
+hostname = "sim-corrupt"
+vendor = "Framework"
+product = "Laptop 13 (AMD Ryzen AI 300)"
+cpu = "AMD Ryzen AI 9 HX 370"
+cores = 12
+gpus = ["AMD Radeon 890M (amdgpu)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.1.61/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "WD_BLACK SN770 1TB"
+size = "1TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "1GiB"
+  free = "700MiB"
+  loaders = ["windows", "ubuntu", "sbm"]
+  corrupt = ["ubuntu", "sbm-slot-a"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  size = "400GiB"
+
+  [[disk.partition]]
+  name = "ubuntu-root"
+  kind = "linux"
+  size = "500GiB"

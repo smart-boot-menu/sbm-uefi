@@ -15,6 +15,5 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 sbm-boot = { path = "../sbm-boot" }
-sbm-gfx = { path = "../sbm-gfx" }
 sbm-protocol = { workspace = true }
 sbm-types = { workspace = true }

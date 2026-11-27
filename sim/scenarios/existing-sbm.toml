@@ -1,0 +1,53 @@
+name = "Existing SBM installation"
+summary = "SBM installed with A/B Core slots; Fedora is the default but has failed three boots, so policy falls back to SBM Core"
+arch = "x86_64"
+
+[firmware]
+vendor = "System76 (coreboot + EDK II)"
+secure_boot = "disabled"
+ram_mib = 65536
+tpm = true
+network = true
+
+[policy]
+timeout_seconds = 10
+default = "fedora"
+max_failed_attempts = 3
+failed_boots = 3
+
+[hardware]
+hostname = "sim-existing-sbm"
+vendor = "System76"
+product = "Lemur Pro (lemp13)"
+cpu = "Intel(R) Core(TM) Ultra 7 155H"
+cores = 16
+gpus = ["Intel Arc Graphics (i915)"]
+
+[[nic]]
+name = "enp0s31f6"
+addresses = ["192.168.10.5/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "Samsung SSD 980 PRO 1TB"
+size = "1TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "2GiB"
+  free = "1100MiB"
+  loaders = ["fedora", "debian", "sbm"]
+
+  [[disk.partition]]
+  name = "fedora"
+  kind = "luks"
+  size = "600GiB"
+
+  [[disk.partition]]
+  name = "debian"
+  kind = "linux"
+  label = "debian"
+  size = "300GiB"
+  free = "211GiB"

@@ -1,0 +1,13 @@
+[package]
+name = "sbm-menu"
+description = "Platform-independent boot menu session glue shared by the UEFI app and the native preview"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sbm-boot = { path = "../sbm-boot" }
+sbm-gfx = { path = "../sbm-gfx" }
+sbm-types = { workspace = true }

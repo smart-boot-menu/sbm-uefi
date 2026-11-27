@@ -14,20 +14,22 @@ use core::time::Duration;
 
 use sbm_boot::{
     DiscoveredTarget, LocalRequest, ResolveInput, Resolved, Volume, add_load_options, atomic_write,
-    begin_attempt, build_handoff, compare_targets, confirm_attempt, decode_attempt, decode_command,
-    decode_policy, decode_success, discover_volume, embedded_cmdline, encode_attempt,
-    encode_handoff, encode_policy, evaluate_remote, fresh_policy, handoff_sha256_hex,
-    linux_load_options, local_request, mark_one_shot_consumed, merge_load_options, normalize,
-    parse_load_option, recovery_for_slot, resolve, selectable, visible,
+    begin_attempt, build_handoff, confirm_attempt, decode_attempt, decode_command, decode_policy,
+    decode_success, discover_volume, embedded_cmdline, encode_attempt, encode_handoff,
+    encode_policy, evaluate_remote, fresh_policy, handoff_sha256_hex, linux_load_options,
+    local_request, mark_one_shot_consumed, merge_load_options, normalize, parse_load_option,
+    recovery_for_slot, resolve, selectable,
 };
-use sbm_gfx::{
-    CardView, Framebuffer, Hit, Input, MenuState, Outcome, Screen, hit_test, layout_menu,
-    paint_diagnostics, paint_error, paint_menu, paint_splash, step,
+use sbm_gfx::{Framebuffer, Input, MenuState, Outcome, Screen, layout_menu, paint_splash, step};
+use sbm_menu::{
+    DiagFacts, MenuEntry as Found, NO_RECOVERY_MESSAGE, Pointer, StartFailure, VERSION, arch_name,
+    card_position, countdown_ms, menu_input, paint_current, recovery_position, sort_entries,
+    unhealthy_message, visible_positions,
 };
 use sbm_protocol::{
     BootAttemptRecord, BootAttemptStatus, BootTimingMetrics, NetworkHandoffHint, RecoveryLaunchMode,
 };
-use sbm_types::{BootTargetId, BootTargetKind, CpuArch, OsFamily};
+use sbm_types::{BootTargetKind, CpuArch};
 use uefi::boot;
 use uefi::proto::network::snp::SimpleNetwork;
 use uefi::proto::tcg::v1::Tcg as Tcg1;
@@ -35,11 +37,10 @@ use uefi::proto::tcg::v2::Tcg as Tcg2;
 use uefi::{Status, entry, helpers};
 
 use crate::chainload::{ChainOutcome, chainload};
-use crate::firmware::{FirmwareKey, cpu_arch, firmware_unix, mark, platform, poll_key};
+use crate::firmware::{cpu_arch, firmware_unix, mark, platform, poll_key};
 use crate::present::{Mouse, Screen as Gop};
 use crate::volume::{Disk, HostImage, host_image, scan_disks};
 
-const VERSION: &str = "0.1.0";
 const POLICY_PATH: &str = "\\EFI\\sbm\\policy.json";
 const ATTEMPT_PATH: &str = "\\EFI\\sbm\\state\\last_attempt.json";
 const HANDOFF_PATH: &str = "\\EFI\\sbm\\handoff\\current.json";
@@ -51,11 +52,6 @@ const COMMAND_PATH: &str = "\\EFI\\sbm\\handoff\\requested-command.json";
 static SBAT: [u8; 148] = *b"\
 sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md\n\
 sbm,1,Smart Boot Menu,sbm,1,https://github.com/smart-boot-menu/sbm-uefi\n";
-
-struct Found {
-    disk: usize,
-    item: sbm_boot::DiscoveredTarget,
-}
 
 #[entry]
 fn main() -> Status {
@@ -234,7 +230,22 @@ fn run() -> ! {
         }
         let cards = visible_index.len();
         let cols = layout_menu(width, height, cards, 3, state.selected).cols;
-        let input = menu_input(key, &sample, width, height, cards, state.selected);
+        let pointer = Pointer {
+            x: sample.x,
+            y: sample.y,
+            moved: sample.moved,
+            clicked: sample.clicked,
+        };
+        let pressed = key.is_some();
+        let input = menu_input(key, &pointer, width, height, cards, state.selected);
+        if pressed {
+            match input {
+                Some(Input::Activate) => mark("key ret"),
+                Some(Input::Theme) => mark("key t"),
+                Some(Input::Recovery) => mark("key c"),
+                _ => {}
+            }
+        }
         let outcome = step(&mut state, input, cards, cols, dt_ms);
         match outcome {
             Outcome::Exit => {}
@@ -267,7 +278,7 @@ fn run() -> ! {
                 ),
                 None => {
                     state.screen = Screen::Error;
-                    state.message = String::from("No healthy recovery system was found");
+                    state.message = String::from(NO_RECOVERY_MESSAGE);
                 }
             },
             Outcome::Action(0) => match firmware::reboot_to_firmware_ui() {
@@ -348,10 +359,7 @@ fn launch(
         return Err(String::from("That boot entry is no longer available"));
     };
     if !selectable(&found.item) {
-        return Err(alloc::format!(
-            "{} did not pass the local health checks",
-            found.item.target.display_name
-        ));
+        return Err(unhealthy_message(&found.item.target.display_name));
     }
     let name = found.item.target.display_name.clone();
     let id = found.item.target.id.clone();
@@ -464,124 +472,16 @@ fn launch(
 }
 
 fn boot_failure(name: &str, path: &str, status: Status) -> String {
-    let hint = if status == Status::SECURITY_VIOLATION {
-        "Secure Boot rejected the file."
+    let failure = if status == Status::SECURITY_VIOLATION {
+        StartFailure::SecurityViolation
     } else if status == Status::NOT_FOUND {
-        "The file is missing."
+        StartFailure::NotFound
     } else if status == Status::UNSUPPORTED {
-        "This firmware cannot start the file."
+        StartFailure::Unsupported
     } else {
-        "The firmware returned an error."
+        StartFailure::Other
     };
-    alloc::format!("{name} ({path}) did not start. {hint} Status {status:?}.")
-}
-
-fn menu_input(
-    key: Option<FirmwareKey>,
-    sample: &present::PointerSample,
-    width: u32,
-    height: u32,
-    cards: usize,
-    selected: usize,
-) -> Option<Input> {
-    if let Some(key) = key {
-        let input = match key {
-            FirmwareKey::Up => Some(Input::Up),
-            FirmwareKey::Down => Some(Input::Down),
-            FirmwareKey::Left => Some(Input::Left),
-            FirmwareKey::Right => Some(Input::Right),
-            FirmwareKey::Activate => {
-                mark("key ret");
-                Some(Input::Activate)
-            }
-            FirmwareKey::Tab => Some(Input::Tab),
-            FirmwareKey::Escape => Some(Input::Escape),
-            FirmwareKey::Char(ch) => match ch.to_ascii_lowercase() {
-                't' => {
-                    mark("key t");
-                    Some(Input::Theme)
-                }
-                'c' => {
-                    mark("key c");
-                    Some(Input::Recovery)
-                }
-                'd' => Some(Input::Diagnostics),
-                'f' => Some(Input::Firmware),
-                'r' => Some(Input::Reboot),
-                's' => Some(Input::Shutdown),
-                ' ' => {
-                    mark("key ret");
-                    Some(Input::Activate)
-                }
-                _ => None,
-            },
-        };
-        return input;
-    }
-    let layout = layout_menu(width, height, cards, 3, selected);
-    if sample.clicked {
-        return match hit_test(&layout, sample.x, sample.y) {
-            Hit::Card(index) => Some(Input::ClickCard(index)),
-            Hit::Action(index) => Some(Input::ClickAction(index)),
-            Hit::None => None,
-        };
-    }
-    if sample.moved
-        && let Hit::Card(index) = hit_test(&layout, sample.x, sample.y)
-    {
-        return Some(Input::HoverCard(index));
-    }
-    None
-}
-
-fn paint_current(
-    fb: &mut Framebuffer,
-    entries: &[Found],
-    visible_index: &[usize],
-    state: &MenuState,
-    lines: &[String],
-) {
-    match state.screen {
-        Screen::Error => paint_error(fb, state.dark, &state.message),
-        Screen::Diagnostics => {
-            let borrowed = lines.iter().map(String::as_str).collect::<Vec<_>>();
-            paint_diagnostics(fb, state.dark, &borrowed);
-        }
-        Screen::Menu => {
-            let cards = cards(entries, visible_index);
-            paint_menu(fb, &cards, state);
-        }
-    }
-}
-
-fn cards(entries: &[Found], visible_index: &[usize]) -> Vec<CardView> {
-    visible_index
-        .iter()
-        .filter_map(|index| entries.get(*index))
-        .map(|entry| {
-            let target = &entry.item.target;
-            let file = target
-                .efi_path
-                .as_deref()
-                .and_then(|path| path.rsplit('\\').next())
-                .unwrap_or("");
-            CardView {
-                title: target.display_name.clone(),
-                subtitle: alloc::format!(
-                    "{}  {file}",
-                    if target.removable_media {
-                        "Removable"
-                    } else {
-                        family_name(target.os_family)
-                    }
-                ),
-                hint: target
-                    .icon_hint
-                    .clone()
-                    .unwrap_or_else(|| String::from("other")),
-            }
-        })
-        .collect()
+    sbm_menu::boot_failure(name, path, failure, &alloc::format!("{status:?}"))
 }
 
 fn diag_lines(
@@ -591,37 +491,21 @@ fn diag_lines(
     discovery_us: u64,
     menu_us: Option<u64>,
 ) -> Vec<String> {
-    let mut lines = Vec::new();
-    lines.push(alloc::format!("Smart Boot Menu {VERSION}"));
-    lines.push(firmware::firmware_summary());
-    lines.push(alloc::format!(
-        "arch {}  secure boot {}",
-        arch_name(cpu_arch()),
-        firmware::secure_boot_label(firmware::secure_boot_state())
-    ));
-    if let Some(screen) = gop.as_ref() {
-        lines.push(screen.describe());
-    } else {
-        lines.push(String::from("graphics output unavailable"));
-    }
-    match firmware::ram_mib() {
-        Some(mib) => lines.push(alloc::format!("memory {mib} MiB")),
-        None => lines.push(String::from("memory unknown")),
-    }
-    lines.push(alloc::format!(
-        "entries {}",
-        entries
-            .iter()
-            .filter(|entry| !entry.item.target.hidden)
-            .count()
-    ));
-    lines.push(alloc::format!("first frame {first_us} us"));
-    lines.push(alloc::format!("discovery {discovery_us} us"));
-    if let Some(menu_us) = menu_us {
-        lines.push(alloc::format!("menu {menu_us} us"));
-    }
-    lines.push(String::from("network policy is local-only in this build"));
-    lines
+    let firmware = firmware::firmware_summary();
+    let display = gop.as_ref().map(Gop::describe);
+    sbm_menu::diag_lines(
+        entries,
+        &DiagFacts {
+            firmware: &firmware,
+            arch: cpu_arch(),
+            secure_boot: firmware::secure_boot_state(),
+            display: display.as_deref(),
+            ram_mib: firmware::ram_mib(),
+            first_frame_us: first_us,
+            discovery_us,
+            menu_us,
+        },
+    )
 }
 
 fn load_policy(disks: &[Disk]) -> sbm_protocol::BootPolicy {
@@ -687,55 +571,6 @@ fn self_skip(host: &HostImage, arch: CpuArch) -> Vec<String> {
     skip
 }
 
-fn sort_entries(entries: &mut [Found]) {
-    entries.sort_by(|left, right| compare_targets(&left.item.target, &right.item.target));
-}
-
-fn visible_positions(entries: &[Found]) -> Vec<usize> {
-    visible(
-        &entries
-            .iter()
-            .map(|entry| entry.item.clone())
-            .collect::<Vec<_>>(),
-    )
-    .into_iter()
-    .filter_map(|target| {
-        entries
-            .iter()
-            .position(|entry| entry.item.target.id == target.target.id)
-    })
-    .collect()
-}
-
-fn card_position(entries: &[Found], visible_index: &[usize], id: &BootTargetId) -> Option<usize> {
-    visible_index.iter().position(|index| {
-        entries
-            .get(*index)
-            .is_some_and(|entry| &entry.item.target.id == id)
-    })
-}
-
-fn recovery_position(entries: &[Found]) -> Option<usize> {
-    let preferred = entries.iter().position(|entry| {
-        entry.item.target.kind == BootTargetKind::SbmCore
-            && entry.item.preferred
-            && selectable(&entry.item)
-    });
-    preferred.or_else(|| {
-        entries.iter().position(|entry| {
-            entry.item.target.kind == BootTargetKind::SbmCore && selectable(&entry.item)
-        })
-    })
-}
-
-fn countdown_ms(seconds: Option<u16>) -> Option<u32> {
-    match seconds {
-        Some(0) => Some(0),
-        Some(65535) | None => None,
-        Some(seconds) => Some(u32::from(seconds).saturating_mul(1000)),
-    }
-}
-
 fn apply_remote(
     resolved: &mut sbm_boot::Resolved,
     applied: &sbm_boot::Applied,
@@ -755,18 +590,6 @@ fn apply_remote(
         sbm_boot::Applied::Firmware | sbm_boot::Applied::Reboot | sbm_boot::Applied::Shutdown => {
             resolved.countdown_seconds = None;
         }
-    }
-}
-
-fn family_name(family: OsFamily) -> &'static str {
-    match family {
-        OsFamily::Windows => "Windows",
-        OsFamily::Linux => "Linux",
-        OsFamily::Bsd => "BSD",
-        OsFamily::MacOs => "macOS",
-        OsFamily::Recovery => "Recovery",
-        OsFamily::FirmwareUtility => "Firmware",
-        OsFamily::Other => "EFI",
     }
 }
 
@@ -852,15 +675,6 @@ fn read_any(disks: &[Disk], path: &str) -> Option<(usize, Vec<u8>)> {
             disk.volume.read(path).ok().map(|bytes| (index, bytes))
         }
     })
-}
-
-fn arch_name(arch: CpuArch) -> &'static str {
-    match arch {
-        CpuArch::X86_64 => "x86_64",
-        CpuArch::Aarch64 => "aarch64",
-        CpuArch::Ia32 => "ia32",
-        CpuArch::Riscv64 => "riscv64",
-    }
 }
 
 fn gop_network() -> bool {

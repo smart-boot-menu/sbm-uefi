@@ -1,0 +1,65 @@
+name = "Windows-only computer"
+summary = "Factory Windows 11 laptop; SBM boots from USB media before installation"
+arch = "x86_64"
+
+[firmware]
+vendor = "Dell Inc. (EDK II)"
+secure_boot = "enabled"
+ram_mib = 16384
+tpm = true
+
+[hardware]
+hostname = "sim-windows"
+vendor = "Dell Inc."
+product = "XPS 13 9350"
+cpu = "Intel(R) Core(TM) Ultra 7 258V"
+cores = 8
+gpus = ["Intel Arc 140V (xe)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.1.77/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "SK hynix PC801 512GB"
+size = "512GB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "260MiB"
+  free = "180MiB"
+  loaders = ["windows"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  label = "OS"
+  size = "450GiB"
+  free = "301GiB"
+
+  [[disk.partition]]
+  name = "Windows recovery"
+  kind = "windows_recovery"
+  size = "1GiB"
+
+[[disk]]
+name = "sda"
+model = "Samsung BAR Plus"
+size = "64GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "SBM"
+  kind = "esp"
+  size = "2GiB"
+  loaders = ["sbm-media"]

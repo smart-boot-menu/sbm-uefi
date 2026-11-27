@@ -1,0 +1,47 @@
+name = "Linux-only computer (aarch64)"
+summary = "Snapdragon laptop running Fedora 45 from a BLS unified kernel image; SBM installed"
+arch = "aarch64"
+
+[firmware]
+vendor = "Qualcomm (EDK II)"
+secure_boot = "disabled"
+ram_mib = 32768
+tpm = true
+
+[policy]
+timeout_seconds = 5
+default = "fedora-uki"
+
+[hardware]
+hostname = "sim-linux-arm"
+vendor = "LENOVO"
+product = "ThinkPad T14s Gen 6 (Snapdragon)"
+cpu = "Snapdragon X Elite X1E-78-100"
+cores = 12
+gpus = ["Qualcomm Adreno X1-85 (msm)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.50.11/24", "fd00::11/64"]
+
+[[disk]]
+name = "nvme0n1"
+model = "KIOXIA BG6 1TB"
+size = "1TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "1GiB"
+  free = "640MiB"
+  loaders = ["fedora-uki", "sbm"]
+
+  [[disk.partition]]
+  name = "fedora"
+  kind = "linux"
+  fs = "btrfs"
+  label = "fedora"
+  size = "900GiB"
+  free = "611GiB"

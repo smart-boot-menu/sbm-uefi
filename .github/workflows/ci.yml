@@ -16,7 +16,7 @@ jobs:
       - name: Format, host lint, and host tests
         run: |
           cargo fmt --all -- --check
-          cargo clippy -p sbm-boot -p sbm-gfx -p xtask --all-targets -- -D warnings
+          cargo clippy -p sbm-boot -p sbm-gfx -p sbm-menu -p sbm-preview -p xtask --all-targets -- -D warnings
           cargo test
       - name: UEFI release lint and build
         run: |

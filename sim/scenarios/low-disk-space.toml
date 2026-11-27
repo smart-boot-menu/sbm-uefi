@@ -1,0 +1,66 @@
+name = "Insufficient disk space"
+summary = "Nearly full 256 GB Windows SSD with a tiny ESP; not enough room to add a Linux installation"
+arch = "x86_64"
+
+[firmware]
+vendor = "HP (EDK II)"
+secure_boot = "enabled"
+ram_mib = 8192
+tpm = true
+
+[hardware]
+hostname = "sim-low-space"
+vendor = "HP"
+product = "HP 250 G10 Notebook PC"
+cpu = "Intel(R) Core(TM) i5-1335U"
+cores = 10
+gpus = ["Intel Iris Xe Graphics (i915)"]
+
+[[nic]]
+name = "wlan0"
+wireless = true
+addresses = ["192.168.0.150/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "KIOXIA BG5 256GB"
+size = "256GB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "100MiB"
+  free = "3MiB"
+  loaders = ["windows"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  label = "Windows"
+  size = "236GiB"
+  free = "4200MiB"
+
+  [[disk.partition]]
+  name = "Windows recovery"
+  kind = "windows_recovery"
+  size = "700MiB"
+  free = "80MiB"
+
+[[disk]]
+name = "sda"
+model = "Generic USB Flash Disk"
+size = "8GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "SBM"
+  kind = "esp"
+  size = "2GiB"
+  loaders = ["sbm-media"]

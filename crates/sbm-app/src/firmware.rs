@@ -146,15 +146,6 @@ pub fn secure_boot_state() -> SecureBootState {
     }
 }
 
-pub fn secure_boot_label(state: SecureBootState) -> &'static str {
-    match state {
-        SecureBootState::SetupMode => "setup",
-        SecureBootState::Enabled => "enabled",
-        SecureBootState::Disabled => "disabled",
-        SecureBootState::Unsupported => "unsupported",
-    }
-}
-
 pub fn boot_entries() -> Vec<Vec<u8>> {
     let Ok((order, _)) =
         runtime::get_variable_boxed(cstr16!("BootOrder"), &VariableVendor::GLOBAL_VARIABLE)
@@ -264,16 +255,7 @@ pub fn platform(
     }
 }
 
-pub enum FirmwareKey {
-    Up,
-    Down,
-    Left,
-    Right,
-    Activate,
-    Tab,
-    Escape,
-    Char(char),
-}
+pub use sbm_menu::Key as FirmwareKey;
 
 pub fn poll_key() -> Option<FirmwareKey> {
     let key = system::with_stdin(|input| input.read_key().ok().flatten())?;

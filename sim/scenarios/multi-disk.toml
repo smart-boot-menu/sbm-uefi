@@ -1,0 +1,128 @@
+name = "Multiple SSDs and USB drives"
+summary = "Windows on NVMe, Arch Linux with systemd-boot on SATA, a Debian installer USB, a data USB, and SBM media"
+arch = "x86_64"
+
+[firmware]
+vendor = "Micro-Star International (EDK II)"
+secure_boot = "disabled"
+ram_mib = 65536
+tpm = true
+network = true
+
+[hardware]
+hostname = "sim-workstation"
+vendor = "Micro-Star International Co., Ltd."
+product = "MAG X870 TOMAHAWK WIFI (desktop)"
+cpu = "AMD Ryzen 9 9950X"
+cores = 16
+gpus = ["NVIDIA GeForce RTX 4070 (nouveau)", "AMD Radeon Graphics (amdgpu)"]
+
+[[nic]]
+name = "enp7s0"
+addresses = ["10.0.0.50/24"]
+
+[[nic]]
+name = "wlp8s0"
+wireless = true
+state = "DOWN"
+
+[[disk]]
+name = "nvme0n1"
+model = "Samsung SSD 9100 PRO 2TB"
+size = "2TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "EFI system partition"
+  kind = "esp"
+  size = "100MiB"
+  free = "62MiB"
+  loaders = ["windows"]
+
+  [[disk.partition]]
+  name = "Microsoft reserved partition"
+  kind = "msr"
+  size = "16MiB"
+
+  [[disk.partition]]
+  name = "Basic data partition"
+  kind = "windows"
+  label = "Windows"
+  size = "1800GiB"
+
+[[disk]]
+name = "nvme1n1"
+model = "Crucial T500 1TB"
+size = "1TB"
+bus = "nvme"
+
+  [[disk.partition]]
+  name = "games"
+  kind = "data"
+  fs = "ntfs"
+  label = "Games"
+  size = "930GiB"
+
+[[disk]]
+name = "sda"
+model = "Samsung SSD 870 EVO 1TB"
+size = "1TB"
+bus = "sata"
+
+  [[disk.partition]]
+  name = "EFI"
+  kind = "esp"
+  size = "1GiB"
+  loaders = ["arch"]
+
+  [[disk.partition]]
+  name = "arch-root"
+  kind = "linux"
+  label = "arch"
+  size = "200GiB"
+
+  [[disk.partition]]
+  name = "arch-home"
+  kind = "linux_home"
+  label = "home"
+  size = "700GiB"
+
+[[disk]]
+name = "sdb"
+model = "Kingston DataTraveler Exodia"
+size = "16GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "Debian 13 installer"
+  kind = "esp"
+  size = "800MiB"
+  loaders = ["debian", "removable"]
+
+[[disk]]
+name = "sdc"
+model = "Samsung T7 Shield"
+size = "2TB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "T7"
+  kind = "data"
+  label = "T7"
+  size = "1800GiB"
+  free = "1200GiB"
+
+[[disk]]
+name = "sdd"
+model = "SanDisk Extreme Go"
+size = "64GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "SBM"
+  kind = "esp"
+  size = "2GiB"
+  loaders = ["sbm-media"]

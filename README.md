@@ -24,6 +24,15 @@ cargo run -p xtask -- qemu x86_64
 
 `cargo test` is the host suites. UEFI bins are release builds. QEMU is local; CI does not boot a guest.
 
+### Native development (SIMULATED)
+
+```
+cargo xtask sim --scenario dual-boot      # real menu code in a desktop window; Manage Computer opens real sbm-ui
+cargo xtask preview --all-scenarios       # headless screenshots
+```
+
+The simulator runs the production `sbm-boot`, `sbm-gfx` and `sbm-menu` code against scenario files in `sim/scenarios/`. It never touches host disks, NVRAM or boot settings, and it is not part of `sbm-app`. See [sim/README.md](sim/README.md).
+
 ## Canonical Documentation & Contracts
 
 - Central coordination & roadmap: [`smart-boot-menu/sbm`](https://github.com/smart-boot-menu/sbm)

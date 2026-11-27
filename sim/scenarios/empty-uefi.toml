@@ -1,0 +1,41 @@
+name = "Empty UEFI computer"
+summary = "Blank NVMe SSD with no partition table; SBM boots from removable USB media"
+arch = "x86_64"
+
+[firmware]
+vendor = "American Megatrends (EDK II)"
+secure_boot = "disabled"
+ram_mib = 16384
+tpm = true
+
+[hardware]
+hostname = "sim-empty"
+vendor = "ASUSTeK COMPUTER INC."
+product = "PRIME B650M-A (desktop)"
+cpu = "AMD Ryzen 7 7700"
+cores = 8
+gpus = ["AMD Radeon Graphics (amdgpu)"]
+
+[[nic]]
+name = "enp5s0"
+addresses = ["10.0.0.23/24"]
+
+[[disk]]
+name = "nvme0n1"
+model = "WD_BLACK SN850X 1TB"
+size = "1TB"
+bus = "nvme"
+
+[[disk]]
+name = "sda"
+model = "SanDisk Ultra Fit"
+size = "32GB"
+bus = "usb"
+removable = true
+
+  [[disk.partition]]
+  name = "SBM"
+  kind = "esp"
+  size = "2GiB"
+  free = "1GiB"
+  loaders = ["sbm-media"]

@@ -1,8 +1,8 @@
 mod esp;
 mod parse;
 mod pe;
-mod preview;
 mod qemu;
+mod sim;
 
 use std::env;
 use std::fs;
@@ -11,7 +11,6 @@ use std::process::Command;
 
 use crate::esp::assemble;
 use crate::pe::set_nx_compat;
-use crate::preview::{parse_preview_args, run_preview};
 use crate::qemu::{AARCH64, Guest, X86_64};
 
 fn main() {
@@ -71,13 +70,18 @@ fn run() -> Result<(), String> {
                 qemu_one(guest, false)?;
             }
         }
-        Some("preview") => {
-            let opts = parse_preview_args(args)?;
-            run_preview(&workspace(), &opts)?;
+        Some("preview") => sim::preview(&workspace(), args.collect())?,
+        Some("sim") => sim::sim(&workspace(), args.collect())?,
+        Some("core") => sim::core(&workspace(), args.collect())?,
+        Some("help" | "-h" | "--help") => {
+            println!(
+                "cargo xtask [build|qemu|all] [native|aarch64|x86_64|all]\n\n{}",
+                sim::HELP
+            );
         }
         Some(other) => {
             return Err(format!(
-                "unknown command {other} (expected build|qemu|preview|all)"
+                "unknown command {other} (expected build|qemu|all|preview|sim|core|help)"
             ));
         }
     }
