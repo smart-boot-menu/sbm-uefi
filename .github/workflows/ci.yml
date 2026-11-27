@@ -76,6 +76,7 @@ jobs:
           cat > "$lab/scenarios/secure-recovery-picker.toml" <<'EOF'
           [[scenario]]
           id = "secure-recovery-picker"
+          description = "An unsigned recovery fixture passes the manifest digest and is refused by firmware."
           tier = "secure"
           profile = "secure-recovery-picker"
           send_key = "c"
