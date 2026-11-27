@@ -22,8 +22,8 @@ pub struct Disk {
 
 pub struct HostImage {
     pub path: Option<String>,
-    pub fs_handle: Option<Handle>,
-    pub device: Option<Handle>,
+    fs_handle: Option<Handle>,
+    device: Option<Handle>,
 }
 
 pub struct UefiVolume {
@@ -258,7 +258,8 @@ pub fn host_image() -> HostImage {
             return None;
         };
         let mut remaining = &*path;
-        boot::locate_device_path::<SimpleFileSystem>(&mut remaining).ok()
+        let file_system = boot::locate_device_path::<SimpleFileSystem>(&mut remaining).ok()?;
+        (remaining.as_bytes() == [0x7f, 0xff, 4, 0]).then_some(file_system)
     });
     HostImage {
         path,
@@ -271,12 +272,16 @@ pub fn scan_disks(host: &HostImage) -> Vec<Disk> {
     let Ok(handles) = boot::find_handles::<SimpleFileSystem>() else {
         return Vec::new();
     };
+    let boot_handle = host
+        .device
+        .filter(|handle| handles.contains(handle))
+        .or(host.fs_handle);
     let mut disks = Vec::new();
     for handle in handles {
         let Ok(volume) = UefiVolume::open(handle) else {
             continue;
         };
-        let boot = host.fs_handle == Some(handle) || host.device == Some(handle);
+        let boot = boot_handle == Some(handle);
         disks.push(Disk { boot, volume });
     }
     // No guessing: without the picker's own ESP there is no recovery entry
@@ -514,6 +519,7 @@ fn inspect_path(bytes: &[u8]) -> Inspected {
             removable = true;
         }
         if let Ok(drive) = <&media::HardDrive>::try_from(node)
+            && drive.partition_format() == media::PartitionFormat::GPT
             && let PartitionSignature::Guid(value) = drive.partition_signature()
         {
             guid = alloc::format!("{value}");

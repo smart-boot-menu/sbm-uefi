@@ -4,7 +4,7 @@
 
 On ARM64 HVF, every measured menu-ready sample was under 27 ms across ten runs with real recovery media. The median was 16.2 ms. The selected 74,513,752-byte UKI took 393.5 ms median to stream and verify at launch. The baseline median menu-ready time under the same test configuration was 2,073.8 ms. [Raw samples and configuration](https://github.com/smart-boot-menu/research/blob/main/validation/evidence/sbm-uefi-agent15-2026-11-27.md)
 
-The ARM64 EFI is 230,912 bytes and the x86-64 EFI is 261,120 bytes. The ARM64 SHA-256 speed setting adds 5,120 bytes and reduces median launch verification from 615.5 to 393.5 ms in this configuration. Read-and-hash timings include firmware storage I/O.
+The ARM64 EFI is 230,912 bytes and the x86-64 EFI is 261,632 bytes. The ARM64 SHA-256 speed setting adds 5,120 bytes and reduces median launch verification from 615.5 to 393.5 ms in this configuration. Read-and-hash timings include firmware storage I/O.
 
 ## Earlier measurements
 
