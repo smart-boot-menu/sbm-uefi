@@ -10,6 +10,8 @@ mod font8x8;
 #[cfg(feature = "experimental-layouts")]
 pub mod hardware;
 mod layout;
+#[cfg(feature = "experimental-layouts")]
+pub mod logo;
 mod paint;
 mod state;
 mod theme;
@@ -18,6 +20,8 @@ pub mod vector;
 
 pub use draw::{Framebuffer, Rgba};
 pub use layout::{Hit, Layout, Rect, font_px, hit_test, layout_menu};
+#[cfg(feature = "experimental-layouts")]
+pub use logo::{LogoImage, draw_logo_image};
 pub use paint::{
     CardView, paint_diagnostics, paint_diagnostics_with, paint_error, paint_error_with, paint_menu,
     paint_menu_with, paint_splash, paint_splash_with,

@@ -21,6 +21,7 @@ use sbm_menu::{
 use sbm_types::{BootTargetKind, OsFamily, PlatformCapabilities};
 
 use crate::hardware::{DiscoverySchedule, build_system_spec};
+use crate::logos::ResolvedHardwareLogos;
 use crate::machine::Machine;
 use crate::overlay;
 
@@ -80,6 +81,7 @@ pub struct Session {
     pub detail: StorageDetail,
     pub overflow_drive: Option<usize>,
     pub discovery: DiscoverySchedule,
+    pub logos: ResolvedHardwareLogos,
     pub font_mode: FontMode,
     pub high_contrast: bool,
     pub scale: UiScale,
@@ -116,6 +118,10 @@ impl Session {
         let picker = Picker::start(&mut machine, &mut || false);
         let font_mode = FontMode::AtkinsonNextMono;
         let scale = UiScale::default();
+        let logos = ResolvedHardwareLogos::resolve_default(
+            &machine.scenario.hardware.cpu,
+            machine.scenario.hardware.gpus.first().map(String::as_str),
+        );
         let mut session = Self {
             machine,
             picker,
@@ -126,6 +132,7 @@ impl Session {
             detail: StorageDetail::default(),
             overflow_drive: None,
             discovery,
+            logos,
             font_mode,
             high_contrast: false,
             scale,
@@ -638,6 +645,7 @@ impl Session {
             self.elapsed_ms,
             width,
             height,
+            &self.logos,
         )
     }
 

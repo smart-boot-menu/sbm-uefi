@@ -7,6 +7,7 @@
 
 pub mod core;
 pub mod hardware;
+pub mod logos;
 pub mod machine;
 pub mod overlay;
 pub mod scenario;

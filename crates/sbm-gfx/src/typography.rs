@@ -57,15 +57,18 @@ pub enum TextRole {
     Caption,
     /// Technical identifiers, hexadecimal values, paths, and diagnostics.
     Technical,
+    /// Micro prefixes and compact domain eyebrows (~half Caption/Body size).
+    Micro,
 }
 
 impl TextRole {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Display,
         Self::Heading,
         Self::Body,
         Self::Caption,
         Self::Technical,
+        Self::Micro,
     ];
 }
 
@@ -241,10 +244,12 @@ pub fn role_pixel_size(role: TextRole, display_height: u32, scale: UiScale) -> f
         TextRole::Body => 1.00,
         TextRole::Caption => 0.84,
         TextRole::Technical => 0.90,
+        TextRole::Micro => 0.48,
     };
+    let min_px = if role == TextRole::Micro { 7.0 } else { 10.0 };
     let scaled = base_body * role_mult * (f32::from(scale.percent()) / 100.0);
     // Round to nearest 0.5 px for crisp raster alignment while remaining smooth across scales.
-    (libm::roundf(scaled * 2.0) * 0.5).clamp(10.0, 128.0)
+    (libm::roundf(scaled * 2.0) * 0.5).clamp(min_px, 128.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,7 +463,9 @@ impl<'a> TextRenderer<'a> {
         match (self.mode, role) {
             (FontMode::AtkinsonNextMono, TextRole::Technical) => FaceSlot::MonoRegular,
             (_, TextRole::Display | TextRole::Heading) => FaceSlot::NextSemiBold,
-            (_, TextRole::Body | TextRole::Caption | TextRole::Technical) => FaceSlot::NextRegular,
+            (_, TextRole::Body | TextRole::Caption | TextRole::Technical | TextRole::Micro) => {
+                FaceSlot::NextRegular
+            }
         }
     }
 

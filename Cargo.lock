@@ -578,6 +578,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "rapid-qoi"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c23c078d3704b4757979b3954ff1b52dd975fb759a08b11f85abaf1ab7eb4e22"
+
+[[package]]
 name = "raw-window-handle"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +657,7 @@ dependencies = [
  "ab_glyph_rasterizer",
  "libm",
  "qrcode",
+ "rapid-qoi",
  "ttf-parser",
 ]
 
@@ -688,6 +695,7 @@ version = "0.1.0"
 dependencies = [
  "minifb",
  "png",
+ "rapid-qoi",
  "sbm-boot",
  "sbm-gfx",
  "sbm-menu",

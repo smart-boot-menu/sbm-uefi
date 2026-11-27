@@ -10,10 +10,11 @@ repository.workspace = true
 [features]
 # Host-preview experimental hardware-bento layouts; excluded from production sbm-app builds.
 # Shares the exact same unified typography and CPU vector rasterizer as production.
-experimental-layouts = ["dep:qrcode"]
+experimental-layouts = ["dep:qrcode", "dep:rapid-qoi"]
 
 [dependencies]
 ab_glyph_rasterizer.workspace = true
 libm.workspace = true
 qrcode = { workspace = true, optional = true }
+rapid-qoi = { workspace = true, optional = true }
 ttf-parser.workspace = true

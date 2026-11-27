@@ -12,6 +12,7 @@ use sbm_gfx::hardware::{
 use sbm_menu::{MenuEntry, VERSION};
 use sbm_types::{BootTargetKind, OsFamily};
 
+use crate::logos::ResolvedHardwareLogos;
 use crate::machine::Machine;
 use crate::scenario::{Disk, PartKind, Partition, SecureBoot};
 
@@ -146,6 +147,7 @@ pub fn build_system_spec(
     elapsed_ms: u32,
     width: u32,
     height: u32,
+    logos: &ResolvedHardwareLogos,
 ) -> SystemSpec {
     let scenario = &machine.scenario;
     let [t_cpu, t_sec, t_gpu, t_net] = schedule.thresholds();
@@ -269,13 +271,24 @@ pub fn build_system_spec(
         format!("{} · {}", scenario.hardware.product, scenario.id)
     };
 
+    let cpu_logo = match &cpu {
+        ProbeState::Ready(spec) if spec.model.is_some() => logos.cpu_logo.clone(),
+        _ => None,
+    };
+    let gpu_logo = match &gpu {
+        ProbeState::Ready(gpus) if !gpus.is_empty() => logos.gpu_logo.clone(),
+        _ => None,
+    };
+
     SystemSpec {
         host_label,
         sbm_version: VERSION.into(),
         cpu,
+        cpu_logo,
         memory,
         board,
         gpu,
+        gpu_logo,
         firmware,
         display: DisplaySpec { width, height },
         security,

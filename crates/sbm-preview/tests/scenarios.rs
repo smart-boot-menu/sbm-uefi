@@ -1290,3 +1290,80 @@ fn top_hardware_grid_2d_scroll_hints_toggle_and_0sfs_version_work() {
     assert_eq!(s.key(Key::Char('?'), W, H), Effect::Redraw);
     assert!(!s.show_hints);
 }
+
+#[test]
+fn hardware_logos_match_cache_qoi_and_render_with_honest_fallbacks() {
+    use sbm_preview::logos::{LogoCache, ResolvedHardwareLogos};
+    use sbm_preview::{DiscoveryMode, DiscoverySchedule, LayoutMode};
+
+    let Some(cache) = LogoCache::discover_default() else {
+        // Offline / standalone checkout without sibling hardware-logos repo:
+        // Session must still boot and render cleanly using vector fallbacks.
+        let mut s = session("lba-stress");
+        s.set_layout(LayoutMode::Bento);
+        let fb = render(&s, 1280, 800);
+        assert_eq!(fb.px.len(), 1280 * 800);
+        return;
+    };
+
+    // Catalog specificity: Ryzen 9 7940HS -> 7000-series badge; Ryzen 9 9950X -> generic Ryzen 9.
+    assert_eq!(
+        cache
+            .catalog()
+            .match_hardware("cpu", "AMD Ryzen 9 7940HS")
+            .map(|e| e.id.as_str()),
+        Some("amd-ryzen-9-7000")
+    );
+    assert_eq!(
+        cache
+            .catalog()
+            .match_hardware("cpu", "AMD Ryzen 9 9950X")
+            .map(|e| e.id.as_str()),
+        Some("amd-ryzen-9")
+    );
+    assert_eq!(
+        cache
+            .catalog()
+            .match_hardware("gpu", "AMD Radeon RX 7700S")
+            .map(|e| e.id.as_str()),
+        Some("amd-radeon-graphics")
+    );
+
+    // End-to-end AVIF -> QOI cache roundtrip (only asserted when avifdec or cached .qoi is available).
+    let mut s = session("lba-stress");
+    s.set_layout(LayoutMode::Bento);
+    let spec = s.system_spec(1280, 800);
+    if s.logos.cpu_logo.is_some() && s.logos.gpu_logo.is_some() {
+        assert_eq!(s.logos.cpu_id.as_deref(), Some("amd-ryzen-9-7000"));
+        assert_eq!(s.logos.gpu_id.as_deref(), Some("amd-radeon-graphics"));
+        assert!(spec.cpu_logo.is_some());
+        assert!(spec.gpu_logo.is_some());
+
+        // Second resolve hits the persistent on-disk .qoi cache directly.
+        let cached_cpu = cache
+            .resolve("cpu", "AMD Ryzen 9 7940HS")
+            .expect("cached Ryzen 9 7000 QOI");
+        assert!(cached_cpu.from_cache, "second lookup should hit .qoi cache");
+        assert!(cached_cpu.qoi_path.is_file());
+        assert!(cache.cache_dir().join("manifest.json").is_file());
+
+        // Real logos render visibly distinct pixels vs vector fallback.
+        let fb_real = render(&s, 1280, 800);
+        s.logos = ResolvedHardwareLogos::default();
+        let fb_fallback = render(&s, 1280, 800);
+        assert_ne!(fb_real.px, fb_fallback.px);
+
+        // Multi-disk resolves generic Ryzen 9 (not 7000 series) and no GPU badge for RTX 4070.
+        let multi = session("multi-disk");
+        assert_eq!(multi.logos.cpu_id.as_deref(), Some("amd-ryzen-9"));
+        assert!(multi.logos.gpu_logo.is_none());
+
+        // Sparse SMBIOS mode suppresses hardware logos honestly.
+        let mut sparse = session("lba-stress");
+        sparse.set_layout(LayoutMode::Bento);
+        sparse.set_discovery(DiscoverySchedule::new(DiscoveryMode::Sparse, None));
+        let sparse_spec = sparse.system_spec(1280, 800);
+        assert!(sparse_spec.cpu_logo.is_none());
+        assert!(sparse_spec.gpu_logo.is_none());
+    }
+}

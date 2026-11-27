@@ -246,12 +246,14 @@ fn bench_experimental_layouts() {
             arch: "x86_64".into(),
             cores: Some(16),
         }),
+        cpu_logo: None,
         memory: ProbeState::Ready(MemorySpec { total_mib: 65536 }),
         board: ProbeState::Ready(BoardSpec {
             vendor: Some("ASUS".into()),
             product: Some("ProArt X870E".into()),
         }),
         gpu: ProbeState::Ready(vec!["AMD Radeon RX 9070 XT".into()]),
+        gpu_logo: None,
         firmware: ProbeState::Ready(FirmwareSpec {
             vendor: Some("American Megatrends".into()),
             version: "0.1.0".into(),

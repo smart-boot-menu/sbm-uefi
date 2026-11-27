@@ -15,6 +15,8 @@ use alloc::vec::Vec;
 use crate::disk_wrap::{WrapInput, WrappedRegion, hatch_polygon, layout_disk_wrap};
 use crate::draw::{Framebuffer, Rgba};
 use crate::layout::{Hit, Rect};
+pub use crate::logo::LogoImage;
+use crate::logo::draw_logo_image;
 use crate::state::{Focus, MenuState};
 use crate::theme::Theme;
 use crate::typography::{FontMode, TextRenderer, TextRole, UiScale};
@@ -350,9 +352,13 @@ pub struct SystemSpec {
     /// Software version displayed in the Brand/QR widget (0SFS `YY.MM.DD#N` / `YY.MM.DD LTS`).
     pub sbm_version: String,
     pub cpu: ProbeState<CpuSpec>,
+    /// Optional decoded hardware badge cached for the detected CPU (`None` falls back to vector icon).
+    pub cpu_logo: Option<LogoImage>,
     pub memory: ProbeState<MemorySpec>,
     pub board: ProbeState<BoardSpec>,
     pub gpu: ProbeState<Vec<String>>,
+    /// Optional decoded hardware badge cached for the primary GPU (`None` falls back to vector icon).
+    pub gpu_logo: Option<LogoImage>,
     pub firmware: ProbeState<FirmwareSpec>,
     pub display: DisplaySpec,
     pub security: ProbeState<SecuritySpec>,
@@ -1202,7 +1208,7 @@ fn brand_tile_min_width(
     let text_w = renderer
         .measure("Smart-Boot-Manager", TextRole::Body)
         .width
-        .max(renderer.measure("g-AI.org/", TextRole::Caption).width)
+        .max(renderer.measure("g-AI.org/", TextRole::Micro).width)
         .max(
             renderer
                 .measure(&spec.sbm_version, TextRole::Technical)
@@ -1230,7 +1236,7 @@ fn paint_bento(
     let footer_h = m.footer_h;
     let x0 = m.pad;
     let inner_w = w.saturating_sub(m.pad * 2);
-    let y0 = m.pad;
+    let y0 = (m.pad / 2).max(4);
 
     let min_tile_h = (m.cap_h + m.body_h + m.tech_h + 28).max(m.scaled(82));
     let max_tile_h = (h * 20 / 100).max(86);
@@ -1313,8 +1319,8 @@ fn draw_bento_hw_grid(
     let brand_w = brand_tile_min_width(area.h, spec, m, renderer);
     let base_widths: [u32; 7] = [
         brand_w,
-        m.scaled(228).max(180),
-        m.scaled(254).max(196),
+        m.scaled(248).max(196),
+        m.scaled(270).max(208),
         m.scaled(124).max(100),
         m.scaled(176).max(140),
         m.scaled(150).max(120),
@@ -1467,14 +1473,22 @@ fn draw_brand_tile(
         return;
     }
 
-    let gap1 = 1u32;
-    let gap2 = 4u32;
-    let block_h = m.cap_h + gap1 + m.body_h + gap2 + m.tech_h;
-    let mut y = r.y + r.h.saturating_sub(block_h) / 2;
+    let micro_h = renderer.line_metrics(TextRole::Micro).line_height;
+    let top_pad = (pad / 2).max(3);
 
-    // Small gray domain prefix: `g-AI.org/`
-    renderer.draw_truncated(fb, "g-AI.org/", tx, y, tw, TextRole::Caption, pal.muted);
-    y += m.cap_h + gap1;
+    // Half-size gray domain prefix pinned close to the top edge of the tile
+    let micro_y = r.y + top_pad;
+    renderer.draw_truncated(fb, "g-AI.org/", tx, micro_y, tw, TextRole::Micro, pal.muted);
+
+    // Center the product name + 0SFS version cleanly in the space below `g-AI.org/`
+    let body_area_y = micro_y.saturating_add(micro_h).saturating_add(2);
+    let body_area_h =
+        r.y.saturating_add(r.h)
+            .saturating_sub(top_pad)
+            .saturating_sub(body_area_y);
+    let gap2 = 5u32;
+    let main_h = m.body_h.saturating_add(gap2).saturating_add(m.tech_h);
+    let mut y = body_area_y.saturating_add(body_area_h.saturating_sub(main_h) / 2);
 
     // Normal size white (high-contrast text) product name: `Smart-Boot-Manager`
     renderer.draw_truncated(
@@ -1524,10 +1538,20 @@ fn draw_cpu_tile(
 ) {
     draw_bento_panel(fb, r, pal.tint_cpu, pal.border, m.radius, pal.border_px());
     let pad = m.pad.clamp(7, 12);
-    let logo_sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
     let lx = r.x + pad;
-    let ly = r.y + r.h.saturating_sub(logo_sz) / 2;
-    draw_vector_cpu_logo(fb, lx, ly, logo_sz, pal.accent, pal.on_accent);
+    let logo_sz = if let (ProbeState::Ready(_), Some(logo)) = (&spec.cpu, spec.cpu_logo.as_ref()) {
+        let sz = r.h.saturating_sub(pad * 2).clamp(44, 68);
+        let ly = r.y + r.h.saturating_sub(sz) / 2;
+        if !draw_logo_image(fb, logo, lx, ly, sz, sz, 6) {
+            draw_vector_cpu_logo(fb, lx, ly, sz, pal.accent, pal.on_accent);
+        }
+        sz
+    } else {
+        let sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
+        let ly = r.y + r.h.saturating_sub(sz) / 2;
+        draw_vector_cpu_logo(fb, lx, ly, sz, pal.accent, pal.on_accent);
+        sz
+    };
 
     let tx = lx + logo_sz + 10;
     let tw = r.x.saturating_add(r.w).saturating_sub(tx + pad);
@@ -1585,15 +1609,28 @@ fn draw_gpu_tile(
 ) {
     draw_bento_panel(fb, r, pal.tint_gpu, pal.border, m.radius, pal.border_px());
     let pad = m.pad.clamp(7, 12);
-    let logo_sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
     let lx = r.x + pad;
-    let ly = r.y + r.h.saturating_sub(logo_sz) / 2;
-    let badge_bg = match &spec.gpu {
-        ProbeState::Ready(gpus) if !gpus.is_empty() => pal.focus,
-        ProbeState::Pending => pal.warn,
-        _ => pal.border_strong,
+    let logo_sz = match (&spec.gpu, spec.gpu_logo.as_ref()) {
+        (ProbeState::Ready(gpus), Some(logo)) if !gpus.is_empty() => {
+            let sz = r.h.saturating_sub(pad * 2).clamp(44, 68);
+            let ly = r.y + r.h.saturating_sub(sz) / 2;
+            if !draw_logo_image(fb, logo, lx, ly, sz, sz, 6) {
+                draw_vector_gpu_logo(fb, lx, ly, sz, pal.focus, pal.on_accent);
+            }
+            sz
+        }
+        _ => {
+            let sz = r.h.saturating_sub(pad * 2 + 12).clamp(26, 44);
+            let ly = r.y + r.h.saturating_sub(sz) / 2;
+            let badge_bg = match &spec.gpu {
+                ProbeState::Ready(gpus) if !gpus.is_empty() => pal.focus,
+                ProbeState::Pending => pal.warn,
+                _ => pal.border_strong,
+            };
+            draw_vector_gpu_logo(fb, lx, ly, sz, badge_bg, pal.on_accent);
+            sz
+        }
     };
-    draw_vector_gpu_logo(fb, lx, ly, logo_sz, badge_bg, pal.on_accent);
 
     let tx = lx + logo_sz + 10;
     let tw = r.x.saturating_add(r.w).saturating_sub(tx + pad);
@@ -1889,7 +1926,7 @@ fn paint_schematic(
     let footer_h = m.footer_h;
     let x0 = m.pad;
     let inner_w = w.saturating_sub(m.pad * 2);
-    let top_y = m.pad;
+    let top_y = (m.pad / 2).max(4);
     let footer_y = h.saturating_sub(footer_h);
 
     let ic_h = (m.cap_h + m.body_h + m.tech_h + 28)
@@ -1994,8 +2031,8 @@ fn draw_schematic_ics(
     let brand_w = brand_tile_min_width(area.h, spec, m, renderer);
     let base_widths: [u32; 7] = [
         brand_w,
-        m.scaled(222).max(176),
-        m.scaled(248).max(190),
+        m.scaled(242).max(192),
+        m.scaled(264).max(204),
         m.scaled(124).max(98),
         m.scaled(172).max(138),
         m.scaled(148).max(118),
@@ -2127,7 +2164,7 @@ fn paint_storage_first(
 
     let x0 = m.pad;
     let inner_w = w.saturating_sub(m.pad * 2);
-    let strip_y = m.pad;
+    let strip_y = (m.pad / 2).max(4);
 
     let (hw_hit, strip_total_h) = draw_bento_hw_grid(
         fb,
@@ -5553,12 +5590,14 @@ mod tests {
             host_label: "ThinkPad X1 Carbon".into(),
             sbm_version: "26.11.27#12".into(),
             cpu,
+            cpu_logo: None,
             memory,
             board: ProbeState::Ready(BoardSpec {
                 vendor: Some("LENOVO".into()),
                 product: Some("ThinkPad X1".into()),
             }),
             gpu: ProbeState::Ready(vec!["Intel Arc 140V".into()]),
+            gpu_logo: None,
             firmware: ProbeState::Ready(FirmwareSpec {
                 vendor: Some("Lenovo (EDK II)".into()),
                 version: "26.11.27#12".into(),
@@ -5965,5 +6004,87 @@ mod tests {
             &mut renderer,
         );
         assert_ne!(fb_clean.px, fb_hints.px);
+    }
+
+    #[test]
+    fn cpu_and_gpu_tiles_render_cached_qoi_badges_when_ready() {
+        use rapid_qoi::{Colors, Qoi};
+
+        let make_badge = |r: u8, g: u8, b: u8| {
+            let mut rgba = Vec::with_capacity(16 * 16 * 4);
+            for _ in 0..(16 * 16) {
+                rgba.extend_from_slice(&[r, g, b, 255]);
+            }
+            let encoded = Qoi {
+                width: 16,
+                height: 16,
+                colors: Colors::SrgbLinA,
+            }
+            .encode_alloc(&rgba)
+            .expect("encode test badge");
+            LogoImage::from_qoi(&encoded).expect("decode test badge")
+        };
+
+        let base_spec = sample_spec(false, false);
+        let mut logo_spec = base_spec.clone();
+        logo_spec.cpu_logo = Some(make_badge(240, 96, 18));
+        logo_spec.gpu_logo = Some(make_badge(210, 24, 48));
+
+        let state = MenuState::new(0, true, None);
+        let mut renderer = TextRenderer::new(FontMode::AtkinsonNextMono, 800, UiScale::default());
+
+        let mut fb_vec = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_vec,
+            LayoutMode::Bento,
+            &base_spec,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+
+        let mut fb_real = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_real,
+            LayoutMode::Bento,
+            &logo_spec,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+        assert_ne!(
+            fb_vec.px, fb_real.px,
+            "real CPU/GPU badges should visibly replace fallback vector glyphs"
+        );
+
+        // When CPU/GPU probes are Pending, badges must stay hidden until Ready.
+        let mut pending_spec = sample_spec(true, false);
+        pending_spec.gpu = ProbeState::Pending;
+        let mut pending_with_logos = pending_spec.clone();
+        pending_with_logos.cpu_logo = logo_spec.cpu_logo.clone();
+        pending_with_logos.gpu_logo = logo_spec.gpu_logo.clone();
+
+        let mut fb_p1 = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_p1,
+            LayoutMode::Bento,
+            &pending_spec,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+        let mut fb_p2 = Framebuffer::new(1280, 800);
+        let _ = paint_experimental_with(
+            &mut fb_p2,
+            LayoutMode::Bento,
+            &pending_with_logos,
+            &state,
+            ExperimentalOptions::default(),
+            &mut renderer,
+        );
+        assert_eq!(
+            fb_p1.px, fb_p2.px,
+            "pending probes must not display cached hardware badges prematurely"
+        );
     }
 }
